@@ -9,11 +9,7 @@ outside a single request-scoped temp directory, and nothing is logged.
 
 from __future__ import annotations
 
-import base64
-import binascii
 import logging
-import os
-import secrets
 import tempfile
 from dataclasses import asdict
 from datetime import date as _date
@@ -21,9 +17,8 @@ from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
-from fastapi import FastAPI, File, Form, HTTPException, Request, UploadFile
+from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse
 from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
@@ -55,43 +50,6 @@ app.add_middleware(
     allow_methods=["POST", "GET"],
     allow_headers=["*"],
 )
-
-# Opt-in access gate: this app has no concept of user accounts, and is meant
-# for one person/business, not the open public — so if APP_PASSWORD is set,
-# every request (except the liveness check) must present it via HTTP Basic
-# Auth. Username is ignored; only the password is checked. Leave the env var
-# unset for local development.
-_APP_PASSWORD = os.environ.get("APP_PASSWORD", "")
-if not _APP_PASSWORD:
-    log.warning(
-        "APP_PASSWORD is not set — this instance has NO access control. "
-        "Set it before exposing this to the internet."
-    )
-
-_UNPROTECTED_PATHS = {"/api/health"}
-
-
-@app.middleware("http")
-async def _require_passcode(request: Request, call_next):
-    if not _APP_PASSWORD or request.url.path in _UNPROTECTED_PATHS:
-        return await call_next(request)
-
-    header = request.headers.get("authorization", "")
-    ok = False
-    if header.startswith("Basic "):
-        try:
-            _, _, supplied = base64.b64decode(header[6:]).decode("utf-8").partition(":")
-            ok = secrets.compare_digest(supplied, _APP_PASSWORD)
-        except (binascii.Error, UnicodeDecodeError):
-            ok = False
-    if not ok:
-        return JSONResponse(
-            {"detail": {"error_code": "UNAUTHORIZED", "message": "Password required."}},
-            status_code=401,
-            headers={"WWW-Authenticate": 'Basic realm="casparser-web"'},
-        )
-    return await call_next(request)
-
 
 def _jsonable(value: Any) -> Any:
     """Recursively make dataclass/Decimal/date values JSON-safe."""

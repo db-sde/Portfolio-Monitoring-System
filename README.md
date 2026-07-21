@@ -37,12 +37,10 @@ analytics, or a reverse-proxy config that captures request bodies.
 
 ## Access control
 
-This app has no user accounts — it's built for one person/business, not
-the general public. Set `APP_PASSWORD` and every request (except
-`/api/health`) requires it via HTTP Basic Auth (any username, that
-password). **If you leave it unset, the app runs completely open** — fine
-for local development, not for anything reachable from the internet. The
-app logs a warning on startup if it's unset.
+There isn't any — no login, no passcode. Anyone with the URL can use it.
+That was a deliberate call for this deployment; if that changes, the
+access-gate approach (env-var-driven HTTP Basic Auth in front of every
+route except `/api/health`) is straightforward to bring back.
 
 ## Run it locally
 
@@ -50,7 +48,7 @@ app logs a warning on startup if it's unset.
 cd backend
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-APP_PASSWORD=changeme uvicorn main:app --reload --port 8000
+uvicorn main:app --reload --port 8000
 ```
 
 Open http://127.0.0.1:8000 — the frontend is served from the same process.
@@ -59,7 +57,7 @@ Open http://127.0.0.1:8000 — the frontend is served from the same process.
 
 ```bash
 docker build -t casparser-web .
-docker run --rm -p 8000:8000 -e APP_PASSWORD=changeme casparser-web
+docker run --rm -p 8000:8000 casparser-web
 ```
 
 (The Dockerfile hasn't been build-tested in this environment — Docker
@@ -80,9 +78,8 @@ step, goes on Vercel.
 2. Root directory: leave blank (the `Dockerfile` is at the repo root)
 3. Instance type: Free is fine for personal/occasional use (cold starts
    after 15 min idle, ~30-50s to wake back up)
-4. Environment → add `APP_PASSWORD` = whatever passcode you want to gate it with
-5. Health Check Path: `/api/health`
-6. Deploy. Copy the `https://your-service.onrender.com` URL Render gives you.
+4. Health Check Path: `/api/health`
+5. Deploy. Copy the `https://your-service.onrender.com` URL Render gives you.
 
 **2. Point the frontend at that URL** — edit `frontend/vercel.json` and
 replace `CHANGE-ME.onrender.com` with the real Render hostname from step 1,
