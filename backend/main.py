@@ -241,8 +241,12 @@ async def parse(
     return payload
 
 
-# Serve the static frontend from the same process/port so this is a single
-# deployable service. Registered last so it doesn't shadow the /api routes.
+# Serves the frontend too when run standalone (local dev, or a single-service
+# deploy). In the Vercel+Render split, Vercel is the canonical frontend and
+# proxies /api/* here (see frontend/vercel.json) — this mount just means the
+# bare Render URL still renders something sane instead of a 404, and `uvicorn
+# main:app` alone is still enough for local testing. Registered last so it
+# doesn't shadow the /api routes.
 frontend_dir = Path(__file__).resolve().parent.parent / "frontend"
 if frontend_dir.is_dir():
     app.mount("/", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")

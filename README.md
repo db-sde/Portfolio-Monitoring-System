@@ -7,8 +7,12 @@ report.
 
 ```
 backend/    FastAPI app (main.py) — the only thing that touches your PDF
-frontend/   Static HTML/CSS/JS dashboard, served by the same process
+frontend/   Static HTML/CSS/JS dashboard
 ```
+
+Deployed as two separate services — backend on Render, frontend on Vercel
+(see "Deploying it" below) — but `backend/main.py` also serves `frontend/`
+directly, so `uvicorn main:app` alone is enough for local dev.
 
 ## How it's architected (read this before hosting it for other people)
 
@@ -63,28 +67,53 @@ wasn't installed on the machine this was written on. The underlying
 `uvicorn main:app --app-dir backend` invocation it uses *was* verified
 directly. Run `docker build` once yourself before relying on it.)
 
-## Deploying it as a public service
+## Deploying it: backend on Render, frontend on Vercel
 
-This is a single stateless container — no database, no filesystem writes
-outside a request's own temp directory — so it fits any container host's
-free/hobby tier: [Render](https://render.com), [Fly.io](https://fly.io),
-[Railway](https://railway.app), or a small VPS running the Docker image
-behind a reverse proxy (Caddy or nginx) for TLS.
+This project is split across two hosts on purpose — Vercel doesn't run
+persistent containers (this backend needs one: a native PDF-parsing
+dependency, and a request-scoped temp directory), so the backend goes on
+Render and the frontend, which is plain static HTML/CSS/JS with no build
+step, goes on Vercel.
 
-A few things worth setting at the host/proxy level rather than in app code:
+**1. Backend → Render**, from this same repo:
+1. [dashboard.render.com](https://dashboard.render.com) → **New** → **Web Service**, connect this repo
+2. Root directory: leave blank (the `Dockerfile` is at the repo root)
+3. Instance type: Free is fine for personal/occasional use (cold starts
+   after 15 min idle, ~30-50s to wake back up)
+4. Environment → add `APP_PASSWORD` = whatever passcode you want to gate it with
+5. Health Check Path: `/api/health`
+6. Deploy. Copy the `https://your-service.onrender.com` URL Render gives you.
+
+**2. Point the frontend at that URL** — edit `frontend/vercel.json` and
+replace `CHANGE-ME.onrender.com` with the real Render hostname from step 1,
+then commit and push. This is the only thing that needs your Render URL in
+it; the JS itself still just calls relative `/api/...` paths.
+
+**3. Frontend → Vercel**:
+1. [vercel.com/new](https://vercel.com/new), import this same repo
+2. Set **Root Directory** to `frontend` (this is a monorepo — Vercel needs
+   to know to serve just that folder)
+3. Framework preset: **Other** / no build command — it's static files as-is
+4. Deploy. Vercel's `vercel.json` (inside `frontend/`) rewrites `/api/*` to
+   the Render backend, so from the browser's point of view everything is
+   same-origin — no CORS wrangling, no backend URL hardcoded into `app.js`.
+
+A few things worth knowing either way:
 - **Request body size limit** — the app already rejects files over 20MB
   (`MAX_UPLOAD_BYTES` in `backend/main.py`), but a proxy-level cap (e.g.
-  nginx `client_max_body_size`) is a cheap second line of defense.
+  nginx `client_max_body_size`) is a cheap second line of defense if you
+  ever move off Render.
 - **Rate limiting** — there's none built in. If this gets real traffic,
   put a basic per-IP rate limit in front of `/api/parse` (it's the only
   CPU-heavy route) so one user can't peg the server.
-- **CORS** — `backend/main.py` currently allows all origins (`allow_origins=["*"]`)
-  since the frontend is served from the same origin by default. Tighten
-  this if you ever split the frontend onto a different domain/CDN.
+- **CORS** — `backend/main.py` allows all origins (`allow_origins=["*"]`).
+  With the Vercel rewrite proxy, the browser never actually makes a
+  cross-origin request, so this mostly matters if something calls the
+  Render URL directly instead of through Vercel.
 
-I'm not creating any hosting accounts or deploying this for you — pick a
-host above and follow their "deploy a Dockerfile" flow, or ask me to walk
-through a specific one once you've decided.
+I'm not creating any hosting accounts or deploying this for you — the
+steps above are for you to run in each dashboard. Send me the Render URL
+once you have it and I'll update and push `vercel.json` for you.
 
 ## Endpoints
 
