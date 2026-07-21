@@ -1,0 +1,159 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>casparser — parse your CAS statement</title>
+<meta name="description" content="Parse your Consolidated Account Statement (CAMS, KFintech, NSDL or CDSL) into a readable portfolio, transaction history and capital gains report.">
+<link rel="stylesheet" href="styles.css">
+</head>
+<body>
+
+<!-- ============ UPLOAD ============ -->
+<div id="screen-upload">
+  <header class="topbar">
+    <div class="brand">
+      <span class="brand-mark">
+        <svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9l-6-6H8Z"/><path d="M14 3v6h6M8.5 13.5l2 2 4-4"/></svg>
+      </span>
+      <span class="brand-name">casparser</span>
+    </div>
+    <div class="topbar-actions">
+      <span class="pill">v1.0</span>
+    </div>
+  </header>
+
+  <main class="upload-main">
+    <div class="cp-fade" style="display:flex;justify-content:center;margin-bottom:20px">
+      <span class="kicker">CAMS · KFintech · NSDL · CDSL</span>
+    </div>
+    <h1 class="upload-title cp-fade">Your Consolidated Account Statement, <em>finally readable.</em></h1>
+    <p class="upload-lead cp-fade">Upload the CAS PDF from CAMS, KFintech, NSDL or CDSL. casparser reads every folio, scheme and transaction — and computes your capital gains — on our server, for this one request only.</p>
+
+    <div class="card upload-card cp-fade">
+      <label id="dropzone" class="dropzone" for="file-input">
+        <input id="file-input" type="file" accept="application/pdf,.pdf">
+        <span class="dropzone-icon">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 16V4M7 9l5-5 5 5"/><path d="M4 15v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3"/></svg>
+        </span>
+        <span id="dropzone-label" class="dropzone-title">Drop your CAS PDF here, or <em>browse</em></span>
+        <span class="dropzone-hint">Original issuer PDF · re-printed / scanned files aren't supported</span>
+      </label>
+
+      <div class="upload-row">
+        <div class="password-wrap">
+          <input id="password-input" class="field-password" type="password" placeholder="PDF password (if protected)" autocomplete="off">
+          <button type="button" id="password-toggle" class="password-toggle" aria-label="Show password">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8Z"/><circle cx="12" cy="12" r="3"/></svg>
+          </button>
+        </div>
+        <button id="parse-btn" class="btn btn-primary btn-lg" disabled>Parse statement</button>
+      </div>
+      <p class="upload-note">// Your statement is parsed in memory for this request and is never saved to disk or a database.</p>
+      <div id="upload-error" class="upload-error" hidden>
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><circle cx="12" cy="12" r="10"/><path d="M12 8v5M12 16h.01"/></svg>
+        <div>
+          <span id="upload-error-text"></span>
+          <button type="button" id="parser-retry" class="parser-retry" hidden>Try the alternate parser instead →</button>
+        </div>
+      </div>
+    </div>
+
+    <div class="sample-row cp-fade">
+      <span>No statement handy?</span>
+      <button id="sample-cams" class="btn-sample">See a CAMS example →</button>
+      <button id="sample-nsdl" class="btn-sample">See an NSDL demat example →</button>
+    </div>
+
+    <div class="trust-row cp-fade">
+      <span class="trust-item"><span class="check-badge"><svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg></span>Nothing is stored after this request</span>
+      <span class="trust-item"><span class="check-badge"><svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg></span>Open source · MIT</span>
+    </div>
+  </main>
+</div>
+
+<!-- ============ PARSING ============ -->
+<div id="screen-parsing" class="parsing-page" hidden>
+  <div class="parsing-inner">
+    <div class="spinner"></div>
+    <h2>Parsing your statement…</h2>
+    <p id="parsing-filename" class="parsing-file"></p>
+    <div class="progress-track"><div class="progress-fill"></div></div>
+    <ul class="steps-list">
+      <li><span class="check-badge"><svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg></span>Reading PDF pages</li>
+      <li><span class="check-badge"><svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg></span>Detecting issuer &amp; statement type</li>
+      <li><span class="check-badge"><svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg></span>Extracting folios, schemes &amp; transactions</li>
+      <li><span class="check-badge"><svg viewBox="0 0 24 24"><path d="M20 6 9 17l-5-5"/></svg></span>Reconciling unit balances</li>
+    </ul>
+  </div>
+</div>
+
+<!-- ============ DASHBOARD ============ -->
+<div id="screen-dashboard" hidden>
+  <header class="dash-header">
+    <div class="topbar">
+      <div class="brand">
+        <span class="brand-mark">
+          <svg viewBox="0 0 24 24" fill="none" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"><path d="M8 3H6a2 2 0 0 0-2 2v14a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V9l-6-6H8Z"/><path d="M14 3v6h6M8.5 13.5l2 2 4-4"/></svg>
+        </span>
+        <span class="brand-name">casparser</span>
+        <span id="statement-pill" class="pill" style="margin-left:6px"></span>
+      </div>
+      <div class="topbar-actions no-print">
+        <div class="export-group">
+          <button id="download-json" class="btn btn-ghost" title="Download the full parsed JSON">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+            JSON
+          </button>
+          <button id="download-csv" class="btn btn-ghost" title="Download a full transaction/holdings CSV">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M12 3v12m0 0 4-4m-4 4-4-4M4 17v2a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-2"/></svg>
+            CSV
+          </button>
+          <button id="export-pdf" class="btn btn-ghost" title="Print / save this statement as a PDF">
+            <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round"><path d="M6 9V2h9l3 3v4M6 18H4a1 1 0 0 1-1-1v-5a1 1 0 0 1 1-1h16a1 1 0 0 1 1 1v5a1 1 0 0 1-1 1h-2M6 14h12M9 18v4h6v-4"/></svg>
+            PDF
+          </button>
+        </div>
+        <button id="reset-btn" class="btn btn-dark">New statement</button>
+      </div>
+    </div>
+  </header>
+
+  <section class="summary-band">
+    <div class="summary-band-inner">
+      <div>
+        <span class="band-eyebrow">Investor</span>
+        <div id="investor-name" class="band-investor-name"></div>
+        <div class="band-meta">
+          <span id="investor-pan"></span>
+          <span id="investor-email"></span>
+          <span id="statement-period"></span>
+        </div>
+      </div>
+      <div id="band-stats" class="band-stats"></div>
+    </div>
+  </section>
+
+  <main class="dash-main">
+    <div id="parse-warnings" style="padding-top:20px"></div>
+    <!-- MF (RTA) mode -->
+    <div id="mf-view" hidden>
+      <nav id="tabs" class="tabs">
+        <button class="tab active" data-tab="summary">Portfolio</button>
+        <button class="tab" data-tab="transactions">Transactions</button>
+        <button class="tab" data-tab="gains">Capital gains</button>
+      </nav>
+
+      <div id="panel-summary" class="tab-panel cp-fade"></div>
+      <div id="panel-transactions" class="tab-panel cp-fade" hidden></div>
+      <div id="panel-gains" class="tab-panel cp-fade" hidden></div>
+    </div>
+
+    <!-- Demat mode -->
+    <div id="demat-view" class="demat-wrap" hidden></div>
+  </main>
+</div>
+
+<script src="app.js"></script>
+</body>
+</html>
