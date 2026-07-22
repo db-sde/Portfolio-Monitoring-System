@@ -86,6 +86,17 @@ def build_scheme_records(
                 for t in transactions
                 if t.get("type") in MONEY_OUT_TYPES
             )
+            # External money only (no switch_in): switches move the same
+            # rupee between two schemes, so summing invested_value across
+            # schemes double-counts it. Anything aggregated across schemes
+            # (portfolio/advisor totals, dashboard stat cards) should use
+            # this instead; a single scheme's own invested_value stays
+            # gross on purpose (see module docstring).
+            invested_value_external = sum(
+                abs(_num(t.get("amount")))
+                for t in transactions
+                if t.get("type") in ("PURCHASE", "PURCHASE_SIP")
+            )
             absolute_gain = current_value - invested_value
             absolute_gain_pct = (
                 round(absolute_gain / invested_value * 100, 2) if invested_value else None
@@ -120,6 +131,7 @@ def build_scheme_records(
                 "current_value": current_value,
                 "cost_value": cost_value,
                 "invested_value": round(invested_value, 2),
+                "invested_value_external": round(invested_value_external, 2),
                 "absolute_gain": round(absolute_gain, 2),
                 "absolute_gain_pct": absolute_gain_pct,
                 "xirr": xirr_value,
@@ -191,7 +203,7 @@ def build_portfolio_summary(records: list[dict], config: dict) -> dict:
                 ]
                 if not arn_records:
                     continue
-                investment_value = sum(r["invested_value"] for r in arn_records)
+                investment_value = sum(r["invested_value_external"] for r in arn_records)
                 current_value = sum(r["current_value"] for r in arn_records)
                 absolute_return_pct = (
                     round((current_value - investment_value) / investment_value * 100, 2)

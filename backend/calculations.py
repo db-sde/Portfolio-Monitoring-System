@@ -336,7 +336,10 @@ def calculate_snapshot(
 
     result = {}
     for key, b in buckets.items():
-        net_addition = b["purchase"] + b["switch_in"] - b["switch_out"] - b["redemption"]
+        # div_payout is real money paid out to the investor with no offsetting
+        # unit reduction (closing_balance doesn't reflect it), so it has to be
+        # treated as an outflow here or it silently vanishes from net_gain.
+        net_addition = b["purchase"] + b["switch_in"] - b["switch_out"] - b["redemption"] - b["div_payout"]
         net_gain = b["closing_balance"] - b["opening_balance"] - net_addition
         result[key] = {
             "opening_balance": round(b["opening_balance"], 2),

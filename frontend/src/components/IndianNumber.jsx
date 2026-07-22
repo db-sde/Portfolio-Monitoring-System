@@ -14,7 +14,7 @@ export const formatIndian = (n) => {
 
 export const formatPct = (n, digits = 2) => {
   if (n == null || Number.isNaN(n)) return '—'
-  const sign = n >= 0 ? '+' : ''
+  const sign = n > 0 ? '+' : ''
   return `${sign}${n.toFixed(digits)}%`
 }
 

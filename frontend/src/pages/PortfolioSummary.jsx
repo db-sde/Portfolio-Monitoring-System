@@ -51,10 +51,10 @@ export default function PortfolioSummary({ refreshTick }) {
                         <td className="px-4 py-2.5 font-medium text-ink">{a.advisor_label}</td>
                         <td className="px-4 py-2.5 text-right tabular text-ink-2">{formatIndian(a.investment_value)}</td>
                         <td className="px-4 py-2.5 text-right tabular font-medium text-ink">{formatIndian(a.current_value)}</td>
-                        <td className={`px-4 py-2.5 text-right tabular ${a.absolute_return_pct >= 0 ? 'text-good' : 'text-bad'}`}>
+                        <td className={`px-4 py-2.5 text-right tabular ${a.absolute_return_pct == null ? 'text-ink-3' : a.absolute_return_pct >= 0 ? 'text-good' : 'text-bad'}`}>
                           {a.absolute_return_pct != null ? formatPct(a.absolute_return_pct) : '—'}
                         </td>
-                        <td className={`px-4 py-2.5 text-right tabular font-medium ${a.xirr >= 0 ? 'text-good' : 'text-bad'}`}>
+                        <td className={`px-4 py-2.5 text-right tabular font-medium ${a.xirr == null ? 'text-ink-3' : a.xirr >= 0 ? 'text-good' : 'text-bad'}`}>
                           {a.xirr != null ? formatPct(a.xirr) : '—'}
                         </td>
                         <td className="px-4 py-2.5 text-right tabular text-ink-2">

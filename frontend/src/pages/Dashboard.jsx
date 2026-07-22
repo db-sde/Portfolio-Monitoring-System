@@ -44,7 +44,10 @@ export default function Dashboard({ filters, refreshTick }) {
 
   const schemes = portfolio.schemes || []
   const currentValue = schemes.reduce((s, r) => s + r.current_value, 0)
-  const investedValue = schemes.reduce((s, r) => s + r.invested_value, 0)
+  // invested_value_external (not invested_value): summing the gross
+  // per-scheme figure would double-count money moved between schemes
+  // via switch_in.
+  const investedValue = schemes.reduce((s, r) => s + r.invested_value_external, 0)
   const gain = currentValue - investedValue
   const gainPct = investedValue ? (gain / investedValue) * 100 : null
 
