@@ -1,118 +1,104 @@
 """
-casparser-web backend.
+PortfolioIQ backend — FastAPI app, all route definitions (spec section 6).
 
-A single endpoint that wraps casparser's `read_cas_pdf`: accept an uploaded
-CAS PDF + password, parse it, optionally compute the capital gains report,
-and return plain JSON. Nothing about the request is ever written to disk
-outside a single request-scoped temp directory, and nothing is logged.
+Runs locally (optionally behind an ngrok tunnel) rather than on a cloud
+host, per the spec's own deployment target — see README for why, and
+enrichment.py's docstring for the reachability caveat that decision is
+partly driven by.
 """
 
 from __future__ import annotations
 
-import logging
+import json
+import os
 import tempfile
-from dataclasses import asdict
-from datetime import date as _date
-from decimal import Decimal
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any
+from typing import Any, Optional
 
-from fastapi import FastAPI, File, Form, HTTPException, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.staticfiles import StaticFiles
 from starlette.concurrency import run_in_threadpool
 
 from casparser import read_cas_pdf
-from casparser.analysis import CapitalGainsReport
-from casparser.enums import FileType
-from casparser.exceptions import (
-    CASParseError,
-    GainsError,
-    IncompleteCASError,
-    ParserException,
-)
+from casparser.exceptions import CASParseError, ParserException
 from casparser.types import NSDLCASData
 
-from samples import SAMPLE_DEMAT, SAMPLE_MF, SAMPLE_MF_GAINS
+import calculations as calc
+import config_manager as cfgm
+import enrichment
+import portfolio as pf
+
+app = FastAPI(title="PortfolioIQ")
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20MB — real CAS PDFs are a few MB at most
-GAINS_ELIGIBLE = {FileType.CAMS.value, FileType.KFINTECH.value}
 
-# We never want the uploaded filename, password, or parsed contents to reach
-# a log line — only that a request happened and how it resolved.
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(message)s")
-log = logging.getLogger("casparser-web")
-
-app = FastAPI(title="casparser-web", docs_url="/api/docs", openapi_url="/api/openapi.json")
+_default_origins = "http://localhost:5173"
+_cors_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", _default_origins).split(",") if o.strip()]
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["*"],
-    allow_methods=["POST", "GET"],
+    allow_origins=_cors_origins,
+    allow_methods=["*"],
     allow_headers=["*"],
 )
 
-def _jsonable(value: Any) -> Any:
-    """Recursively make dataclass/Decimal/date values JSON-safe."""
-    if isinstance(value, Decimal):
-        return float(value)
-    if hasattr(value, "isoformat"):
-        return value.isoformat()
-    if isinstance(value, dict):
-        return {k: _jsonable(v) for k, v in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_jsonable(v) for v in value]
-    return value
+# In-memory only — a restart re-triggers enrichment on startup (mostly
+# cache hits, so it's quick) rather than persisting this separately from
+# enrichment_cache.json itself.
+_enrichment_map: dict[str, dict] = {}
+_enrichment_state: dict[str, Any] = {
+    "total_schemes": 0, "enriched": 0, "failed": 0, "pending": 0, "last_run": None,
+}
 
 
-# Finance Act 2023 (Sec 50AA): debt-oriented mutual funds acquired on or
-# after this date lose indexation and LTCG treatment entirely - every gain
-# on them is short-term, taxed at slab rate, regardless of holding period.
-# casparser's own GainEntry.gain_type still applies the pre-2023 flat
-# 3-year LTCG rule to every debt fund uniformly, so it's corrected here
-# rather than upstream, since that's a real tax-methodology call, not a
-# parsing bug.
-DEBT_STCG_ONLY_FROM = _date(2023, 4, 1)
+def _config() -> dict:
+    return cfgm.load_config()
 
 
-def _to_date(value) -> _date:
-    return value if isinstance(value, _date) else _date.fromisoformat(str(value))
+def _require_cas_data() -> dict:
+    cas_data = pf.load_cas_data()
+    if cas_data is None:
+        raise HTTPException(404, "No CAS data uploaded yet — POST a file to /api/upload-cas first.")
+    return cas_data
 
 
-def _serialize_gain(entry) -> dict:
-    d = asdict(entry)
-    fund = d.pop("fund")
-    d["scheme"] = fund["scheme"]
-    d["folio"] = fund["folio"]
-    d["isin"] = fund["isin"]
-    d["fund_type"] = fund["type"]
-    d["acquisition_value"] = entry.acquisition_value
-
-    gain = entry.gain
-    d["gain"] = gain
-    if fund["type"] == "DEBT" and _to_date(entry.purchase_date) >= DEBT_STCG_ONLY_FROM:
-        d["gain_type"] = "STCG"
-        d["stcg"] = gain
-        d["ltcg"] = Decimal(0)
-        d["ltcg_taxable"] = Decimal(0)
-    else:
-        d["gain_type"] = entry.gain_type.name
-        d["ltcg"] = entry.ltcg
-        d["stcg"] = entry.stcg
-        d["ltcg_taxable"] = entry.ltcg_taxable
-    return _jsonable(d)
+def _records() -> list[dict]:
+    cas_data = _require_cas_data()
+    return pf.build_scheme_records(cas_data, _config(), _enrichment_map)
 
 
-def _serialize_gift(entry) -> dict:
-    d = asdict(entry)
-    fund = d.pop("fund")
-    d["scheme"] = fund["scheme"]
-    d["folio"] = fund["folio"]
-    d["isin"] = fund["isin"]
-    return _jsonable(d)
+def _public_scheme(r: dict) -> dict:
+    d = dict(r)
+    d.pop("_nav_history", None)
+    return d
 
 
-def _error(status: int, code: str, message: str) -> HTTPException:
-    return HTTPException(status_code=status, detail={"error_code": code, "message": message})
+async def _run_enrichment() -> None:
+    global _enrichment_map
+    cas_data = pf.load_cas_data()
+    if cas_data is None:
+        return
+    targets = pf.enrichment_targets(cas_data)
+    _enrichment_state.update({
+        "total_schemes": len(targets), "enriched": 0, "failed": 0, "pending": len(targets),
+    })
+    _enrichment_map = await enrichment.enrich_schemes(targets)
+    enriched_count = sum(1 for d in _enrichment_map.values() if d.get("enrichment_source") != "failed")
+    _enrichment_state.update({
+        "enriched": enriched_count,
+        "failed": len(_enrichment_map) - enriched_count,
+        "pending": 0,
+        "last_run": datetime.now(timezone.utc).isoformat(),
+    })
+
+
+@app.on_event("startup")
+async def _on_startup() -> None:
+    # Re-populate in-memory enrichment state from cas_data.json + the
+    # on-disk cache on every restart, so /api/portfolio isn't blank right
+    # after a server restart just because it's a fresh process.
+    if pf.load_cas_data() is not None:
+        await _run_enrichment()
 
 
 @app.get("/api/health")
@@ -120,91 +106,149 @@ def health():
     return {"status": "ok"}
 
 
-@app.get("/api/sample")
-def sample(mode: str = "mf"):
-    """Fully-fictitious demo data — no upload, no parsing, no real PAN/PII."""
-    if mode == "demat":
-        return {"ok": True, "mode": "demat", "data": SAMPLE_DEMAT, "gains": None, "gifts": None, "gains_error": None}
-    return {"ok": True, "mode": "mf", "data": SAMPLE_MF, "gains": SAMPLE_MF_GAINS, "gifts": [], "gains_error": None}
-
-
-@app.post("/api/parse")
-async def parse(
+@app.post("/api/upload-cas")
+async def upload_cas(
+    background_tasks: BackgroundTasks,
     file: UploadFile = File(...),
     password: str = Form(default=""),
-    include_gains: bool = Form(default=False),
-    force_pdfminer: bool = Form(default=False),
 ):
-    if not file.filename or not file.filename.lower().endswith(".pdf"):
-        raise _error(400, "NOT_A_PDF", "Please upload the original CAS PDF file.")
-
+    """Accepts the CAS PDF directly (the primary, intended flow — this is
+    the "just upload your statement" experience) and parses it in-process
+    via casparser, the same library casparser-web wraps. A pre-parsed CAS
+    JSON is still accepted too (useful for testing, or if you already have
+    one), detected purely by file extension."""
+    filename = (file.filename or "").lower()
     content = await file.read()
-    if not content:
-        raise _error(400, "EMPTY_FILE", "That file came through empty. Try uploading it again.")
     if len(content) > MAX_UPLOAD_BYTES:
-        raise _error(413, "FILE_TOO_LARGE", "That file is larger than we accept (20MB max).")
+        raise HTTPException(413, "That file is larger than we accept (20MB max).")
 
-    with tempfile.TemporaryDirectory(prefix="casparser-") as tmp:
-        pdf_path = Path(tmp) / "statement.pdf"
-        pdf_path.write_bytes(content)
-        del content  # don't keep a second copy of the statement around in memory
+    if filename.endswith(".pdf"):
+        with tempfile.TemporaryDirectory(prefix="portfolioiq-") as tmp:
+            pdf_path = Path(tmp) / "statement.pdf"
+            pdf_path.write_bytes(content)
+            del content  # don't keep a second copy of the statement in memory
+            try:
+                parsed = await run_in_threadpool(read_cas_pdf, str(pdf_path), password)
+            except CASParseError as exc:
+                message = str(exc)
+                if "password" in message.lower():
+                    raise HTTPException(401, "That password didn't work. Double check it and try again.")
+                raise HTTPException(
+                    422,
+                    "We couldn't read this as a CAS statement. Make sure it's the unmodified "
+                    "PDF from CAMS or KFintech.",
+                )
+            except ParserException:
+                raise HTTPException(422, "This statement couldn't be parsed.")
 
-        try:
-            data = await run_in_threadpool(
-                read_cas_pdf, str(pdf_path), password, force_pdfminer=force_pdfminer
-            )
-        except CASParseError as exc:
-            message = str(exc)
-            if "password" in message.lower():
-                raise _error(401, "WRONG_PASSWORD", "That password didn't work. Double check it and try again.")
-            raise _error(
+        if isinstance(parsed, NSDLCASData):
+            raise HTTPException(
                 422,
-                "UNREADABLE_FILE",
-                "We couldn't read this as a CAS statement. Make sure it's the unmodified "
-                "PDF from CAMS, KFintech, NSDL or CDSL.",
+                "This looks like an NSDL/CDSL demat statement. PortfolioIQ currently analyses "
+                "CAMS/KFintech mutual-fund statements only — casparser-web can still parse this "
+                "one for you, just not with portfolio analytics on top.",
             )
-        except ParserException as exc:
-            log.warning("parse failed: %s", type(exc).__name__)
-            raise _error(422, "PARSE_FAILED", "This statement couldn't be parsed.")
+        cas_data = parsed.model_dump(mode="json", by_alias=True)
+    elif filename.endswith(".json"):
+        try:
+            cas_data = json.loads(content)
+        except json.JSONDecodeError:
+            raise HTTPException(400, "That doesn't look like valid JSON.")
+    else:
+        raise HTTPException(400, "Upload the CAS PDF from CAMS/KFintech (or a previously-parsed CAS JSON file).")
 
-    is_demat = isinstance(data, NSDLCASData)
-    payload: dict[str, Any] = {
-        "ok": True,
-        "mode": "demat" if is_demat else "mf",
-        "data": data.model_dump(mode="json", by_alias=True),
-        "gains": None,
-        "gifts": None,
-        "gains_error": None,
+    pf.save_cas_data(cas_data)
+    records = pf.build_scheme_records(cas_data, _config(), {})
+    active = sum(1 for r in records if r["current_value"] > 0)
+    advisors = sorted({r["advisor"] for r in records if r.get("advisor")})
+
+    background_tasks.add_task(_run_enrichment)
+
+    return {
+        "status": "ok",
+        "investor_name": (cas_data.get("investor_info") or {}).get("name"),
+        "statement_period": cas_data.get("statement_period"),
+        "total_schemes": len(records),
+        "active_schemes": active,
+        "zero_value_schemes": len(records) - active,
+        "advisors_detected": advisors,
     }
 
-    if include_gains and not is_demat and data.file_type in GAINS_ELIGIBLE:
-        try:
-            report = await run_in_threadpool(CapitalGainsReport, data)
-            payload["gains"] = [_serialize_gain(g) for g in report.gains]
-            payload["gifts"] = [_serialize_gift(g) for g in report.gifts]
-            if report.has_error():
-                payload["gains_error"] = (
-                    "Some schemes couldn't be included: "
-                    + "; ".join(f"{name} — {msg}" for name, msg in report.errors)
-                )
-        except IncompleteCASError:
-            payload["gains_error"] = (
-                "This looks like a Summary statement rather than a Detailed one — gains "
-                "need the full transaction history. Re-download the Detailed CAS and try again."
-            )
-        except GainsError as exc:
-            payload["gains_error"] = f"Couldn't compute gains: {exc}"
 
-    log.info("parsed statement ok (mode=%s, gains=%s)", payload["mode"], include_gains)
-    return payload
+@app.get("/api/portfolio")
+def get_portfolio(
+    include_zero_value: bool = Query(False),
+    level: Optional[str] = Query(None),
+    group_name: Optional[str] = Query(None),
+    investor_name: Optional[str] = Query(None),
+    arn: Optional[str] = Query(None),
+):
+    cas_data = _require_cas_data()
+    filtered = pf.filter_schemes(_records(), include_zero_value, level, group_name, investor_name, arn)
+    return {
+        "investor_info": {"name": (cas_data.get("investor_info") or {}).get("name")},
+        "statement_period": cas_data.get("statement_period"),
+        "last_enriched": _enrichment_state["last_run"],
+        "schemes": [_public_scheme(r) for r in filtered],
+    }
 
 
-# Serves the frontend too when run standalone (local dev, or a single-service
-# deploy). In the Vercel+Render split, Vercel is the canonical frontend and
-# proxies /api/* here (see frontend/vercel.json) — this mount just means the
-# bare Render URL still renders something sane instead of a 404, and `uvicorn
-# main:app` alone is still enough for local testing. Registered last so it
-# doesn't shadow the /api routes.
-frontend_dir = Path(__file__).resolve().parent.parent / "frontend"
-if frontend_dir.is_dir():
-    app.mount("/", StaticFiles(directory=str(frontend_dir), html=True), name="frontend")
+@app.get("/api/portfolio/snapshot")
+def get_snapshot(
+    start_date: Optional[str] = Query(None),
+    end_date: Optional[str] = Query(None),
+    level: Optional[str] = Query(None),
+    group_name: Optional[str] = Query(None),
+    investor_name: Optional[str] = Query(None),
+    arn: Optional[str] = Query(None),
+):
+    _require_cas_data()
+    filtered = pf.filter_schemes(_records(), True, level, group_name, investor_name, arn)
+    end = end_date or datetime.now().date().isoformat()
+    nav_history_by_amfi = {r["amfi"]: r["_nav_history"] for r in filtered if r.get("amfi")}
+
+    return {
+        "given_period": calc.calculate_snapshot(filtered, start_date, end, nav_history_by_amfi),
+        "since_inception": calc.calculate_snapshot(filtered, None, end, nav_history_by_amfi),
+    }
+
+
+@app.get("/api/portfolio/summary")
+def get_portfolio_summary():
+    _require_cas_data()
+    return pf.build_portfolio_summary(_records(), _config())
+
+
+@app.get("/api/portfolio/fund-summary")
+def get_fund_summary(
+    level: Optional[str] = Query(None),
+    group_name: Optional[str] = Query(None),
+    investor_name: Optional[str] = Query(None),
+    arn: Optional[str] = Query(None),
+    include_zero_value: bool = Query(False),
+):
+    _require_cas_data()
+    filtered = pf.filter_schemes(_records(), include_zero_value, level, group_name, investor_name, arn)
+    return pf.build_fund_summary(filtered)
+
+
+@app.get("/api/portfolio/exposure")
+def get_exposure():
+    _require_cas_data()
+    return pf.build_exposure(_records())
+
+
+@app.get("/api/config")
+def get_config():
+    return _config()
+
+
+@app.post("/api/config")
+def post_config(config: dict):
+    cfgm.save_config(config)
+    return {"status": "ok"}
+
+
+@app.get("/api/enrich/status")
+def get_enrich_status():
+    return _enrichment_state

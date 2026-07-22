@@ -1,124 +1,146 @@
-# casparser-web
+# PortfolioIQ
 
-A small web app around [casparser](https://github.com/codereverser/casparser):
-upload a CAMS / KFintech / NSDL / CDSL Consolidated Account Statement (CAS)
-PDF, get back a readable portfolio, transaction history and capital gains
-report.
+A personal mutual fund portfolio analysis tool, and the product this
+repo deploys. Upload your CAS PDF (CAMS or KFintech) and its password —
+that's the whole input — and it parses it in-process via `casparser`
+(the same library the retired [`casparser-web`](archive/casparser-web/README.md)
+tool wraps, kept in `archive/` for reference, not deployed anymore),
+enriches every fund with live market data, computes XIRR/returns/risk
+metrics, and gives you a dashboard broken down by group / investor /
+advisor. No separate parsing step, no intermediate JSON file to
+generate yourself — one upload, one dashboard.
+
+(A pre-parsed CAS JSON is still accepted too, if you already have one —
+`/api/upload-cas` detects which by file extension. Only CAMS/KFintech
+mutual-fund statements are analysed; an NSDL/CDSL demat statement is
+rejected with a clear message, since the analytics here — XIRR, cap
+allocation, advisor comparison — are all built around the folio/scheme
+shape those two RTAs produce.)
 
 ```
-backend/    FastAPI app (main.py) — the only thing that touches your PDF
-frontend/   Static HTML/CSS/JS dashboard
+backend/            FastAPI app — calculations, enrichment, config, all routes
+frontend/            React + Vite + Tailwind dashboard
+archive/casparser-web/  Retired — the PDF-parser-only tool this replaced
 ```
 
-Deployed as two separate services — backend on Render, frontend on Vercel
-(see "Deploying it" below) — but `backend/main.py` also serves `frontend/`
-directly, so `uvicorn main:app` alone is enough for local dev.
+## Deployment
 
-## How it's architected (read this before hosting it for other people)
+This is what's actually live, on the same two services that used to run
+casparser-web — nothing was recreated, the code underneath them just
+changed:
 
-Parsing happens **server-side**, one request at a time:
+- **Backend** → Render, building `Dockerfile` at this repo's root (unchanged path/config from before)
+- **Frontend** → Vercel, Root Directory `frontend` (unchanged setting from before), now building a real Vite app instead of serving static files — see the Vite-build note in `frontend/vercel.json`'s comments if a push doesn't pick that up automatically
 
-1. The browser posts the PDF + password to `POST /api/parse`.
-2. The backend writes it to a request-scoped temp directory, calls
-   `casparser.read_cas_pdf`, and deletes the temp directory the moment
-   parsing finishes (success or failure) — see the `with tempfile.TemporaryDirectory()`
-   block in `backend/main.py`.
-3. The parsed JSON goes straight back in the response. Nothing is written
-   to a database, nothing is logged except "a request happened" and whether
-   it succeeded — never the filename, password, or statement contents.
+One real tradeoff worth knowing: **Render's filesystem is ephemeral across deploys**. `config.json` is checked into the repo so it survives fine, but `cas_data.json` and the enrichment cache are written at runtime and get wiped on every redeploy — after each push that triggers a new Render build, you'll need to re-upload your statement once. Within a single running deploy (i.e. between your own visits, no new push in between), it persists exactly like running locally would.
 
-This is the same architecture the upstream author uses for their own
-[casparser-web](https://github.com/codereverser/casparser-web) (FastAPI +
-uvicorn). It is **not** the same as running fully client-side — the PDF
-does cross the network to your server for the duration of one request.
-If you deploy this publicly, put it behind HTTPS (any of the hosts below
-do this for you) so that transit is encrypted, and don't add logging,
-analytics, or a reverse-proxy config that captures request bodies.
+If you'd rather run it entirely on your own machine instead (e.g. to avoid that redeploy-wipe behavior, or if `mfdata.in` turns out to only be reachable from a residential IP — see below), the local + optional `ngrok` tunnel path below still works unchanged.
 
-## Access control
+## The enrichment reachability caveat (read this first)
 
-There isn't any — no login, no passcode. Anyone with the URL can use it.
-That was a deliberate call for this deployment; if that changes, the
-access-gate approach (env-var-driven HTTP Basic Auth in front of every
-route except `/api/health`) is straightforward to bring back.
+Three external data sources feed the "enriched" fields (spec section 7):
 
-## Run it locally
+| Source | What it's for | Status while building this |
+|---|---|---|
+| **mfdata.in** | AUM, cap-allocation %, benchmark, category, expense ratio, fund manager, trailing returns, risk ratios (sharpe/alpha/beta/std dev) — almost everything | **Unreachable from every network path tried** while building this (direct request, docs page, different User-Agents — all failed, not with a 404 but a flat connection failure/403 consistent with bot-protection on datacenter IPs) |
+| **mfapi.in** | NAV history + basic category | Confirmed working reliably |
+| **captnemo** (Kuvera) | Category + scheme rules, by ISIN | Confirmed working, but doesn't carry cap-allocation/risk data at all |
+
+Since this runs on **your own machine** rather than a cloud host, mfdata.in
+may well work fine for you — the kind of protection that blocked every
+attempt here usually isn't aimed at residential IPs. Test it yourself:
 
 ```bash
+curl https://mfdata.in/api/v1/schemes/117560
+```
+
+If that returns real JSON, enrichment will pick up cap-allocation, risk
+ratios, and trailing returns automatically — nothing to change. If it
+doesn't, the app still works: those specific fields show as empty/"—"
+rather than breaking anything (`enrichment.py`'s whole design is to
+degrade field-by-field, never to fail the request), and you still get
+real NAV history (for the snapshot's opening/closing balance math) and
+category from the two working fallbacks.
+
+`enrichment.py`'s field-name mapping for mfdata.in's response is taken
+from the spec's own documented schema, not from a live response this
+build actually saw — if your real responses use different field names,
+`_extract_mfdata_fields()` in that file is the one place to adjust.
+
+## Known simplifications vs. the full spec
+
+- **Benchmark XIRR** (`benchmark_xirr`, `beating_benchmark` in the
+  Portfolio Summary view) is always `null`. Computing it needs a real
+  benchmark NAV history (e.g. Nifty 500 TRI) from a verified source —
+  building that in speculatively felt worse than being honest that it's
+  not there yet. `calculate_benchmark_xirr()` in `calculations.py` is
+  fully implemented and unit-tested; it just needs a real data feed
+  wired into `portfolio.py` to call it with.
+- **Fund Summary** only lists funds you actually hold (`is_held: true`
+  for everything). A fuller version comparing against funds you *don't*
+  hold would need a broader fund catalog beyond what's in one statement.
+- **Phase 2 endpoints** (`/api/portfolio/risk-reward`, `/api/portfolio/overlap`)
+  aren't built — the spec marks these as Phase 2 explicitly.
+
+## Running it locally instead (optional alternative to the deployed version above)
+
+```bash
+# Backend
 cd backend
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
 uvicorn main:app --reload --port 8000
+
+# Frontend (separate terminal)
+cd frontend
+npm install
+npm run dev
+# opens at http://localhost:5173
 ```
 
-Open http://127.0.0.1:8000 — the frontend is served from the same process.
+Click "Upload CAS PDF" in the top bar, pick your statement, enter its
+password when prompted, and hit Parse. First upload kicks off enrichment
+in the background — the top bar shows progress, and pages refresh once
+it's done.
 
-## Run it with Docker
+### config.json — attributing folios to a group/investor
+
+Every distinct `advisor` (ARN code) your CAS shows folios under needs to
+be listed in `config.json` to be attributed to a group/investor in the
+Portfolio Summary view — an ARN not listed there just won't show up in
+that one view (it's still visible everywhere else, unfiltered). Edit it
+directly, or through the Settings page in the app.
+
+### Exposing it via ngrok (optional)
 
 ```bash
-docker build -t casparser-web .
-docker run --rm -p 8000:8000 casparser-web
+ngrok http 8000
 ```
 
-(The Dockerfile hasn't been build-tested in this environment — Docker
-wasn't installed on the machine this was written on. The underlying
-`uvicorn main:app --app-dir backend` invocation it uses *was* verified
-directly. Run `docker build` once yourself before relying on it.)
+Take the `https://....ngrok.io` URL ngrok gives you and set it as
+`VITE_API_BASE_URL` in the frontend's Vercel project (Environment
+Variables → redeploy), and add that same ngrok URL to the backend's
+`CORS_ORIGINS` env var (comma-separated) so the browser is allowed to
+call it:
 
-## Deploying it: backend on Render, frontend on Vercel
+```bash
+CORS_ORIGINS="http://localhost:5173,https://your-app.vercel.app" uvicorn main:app --port 8000
+```
 
-This project is split across two hosts on purpose — Vercel doesn't run
-persistent containers (this backend needs one: a native PDF-parsing
-dependency, and a request-scoped temp directory), so the backend goes on
-Render and the frontend, which is plain static HTML/CSS/JS with no build
-step, goes on Vercel.
-
-**1. Backend → Render**, from this same repo:
-1. [dashboard.render.com](https://dashboard.render.com) → **New** → **Web Service**, connect this repo
-2. Root directory: leave blank (the `Dockerfile` is at the repo root)
-3. Instance type: Free is fine for personal/occasional use (cold starts
-   after 15 min idle, ~30-50s to wake back up)
-4. Health Check Path: `/api/health`
-5. Deploy. Copy the `https://your-service.onrender.com` URL Render gives you.
-
-**2. Point the frontend at that URL** — edit `frontend/vercel.json` and
-replace `CHANGE-ME.onrender.com` with the real Render hostname from step 1,
-then commit and push. This is the only thing that needs your Render URL in
-it; the JS itself still just calls relative `/api/...` paths.
-
-**3. Frontend → Vercel**:
-1. [vercel.com/new](https://vercel.com/new), import this same repo
-2. Set **Root Directory** to `frontend` (this is a monorepo — Vercel needs
-   to know to serve just that folder)
-3. Framework preset: **Other** / no build command — it's static files as-is
-4. Deploy. Vercel's `vercel.json` (inside `frontend/`) rewrites `/api/*` to
-   the Render backend, so from the browser's point of view everything is
-   same-origin — no CORS wrangling, no backend URL hardcoded into `app.js`.
-
-A few things worth knowing either way:
-- **Request body size limit** — the app already rejects files over 20MB
-  (`MAX_UPLOAD_BYTES` in `backend/main.py`), but a proxy-level cap (e.g.
-  nginx `client_max_body_size`) is a cheap second line of defense if you
-  ever move off Render.
-- **Rate limiting** — there's none built in. If this gets real traffic,
-  put a basic per-IP rate limit in front of `/api/parse` (it's the only
-  CPU-heavy route) so one user can't peg the server.
-- **CORS** — `backend/main.py` allows all origins (`allow_origins=["*"]`).
-  With the Vercel rewrite proxy, the browser never actually makes a
-  cross-origin request, so this mostly matters if something calls the
-  Render URL directly instead of through Vercel.
-
-I'm not creating any hosting accounts or deploying this for you — the
-steps above are for you to run in each dashboard. Send me the Render URL
-once you have it and I'll update and push `vercel.json` for you.
+Note ngrok's free tier URL changes every time you restart the tunnel —
+you'll need to update `VITE_API_BASE_URL` on Vercel each time unless
+you're on a paid ngrok plan with a reserved domain.
 
 ## Endpoints
 
-- `POST /api/parse` — multipart form: `file` (the PDF), `password`,
-  `include_gains` (`"true"`/`"false"`). Returns `{ok, mode, data, gains,
-  gifts, gains_error}`.
-- `GET /api/sample?mode=mf|demat` — static, fully-fictitious demo data
-  (no upload, no parsing) so the UI has something to show before a real
-  statement is uploaded.
-- `GET /api/health` — liveness check.
-- `GET /api/docs` — interactive FastAPI/Swagger docs.
+See spec section 6 for full request/response shapes. Quick reference:
+
+- `POST /api/upload-cas` — upload the CAS PDF + password (or a pre-parsed CAS JSON), kicks off enrichment
+- `GET /api/portfolio` — per-scheme data, filterable by level/group/investor/arn
+- `GET /api/portfolio/snapshot` — opening/closing balance + XIRR for a date window
+- `GET /api/portfolio/summary` — advisor-level comparison table
+- `GET /api/portfolio/fund-summary` — returns heatmap for held funds
+- `GET /api/portfolio/exposure` — top AMCs/funds + cap allocation
+- `GET`/`POST /api/config` — read/write config.json
+- `GET /api/enrich/status` — enrichment progress
+- `GET /api/health` — liveness check
