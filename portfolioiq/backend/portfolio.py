@@ -34,8 +34,12 @@ def _num(value: Any) -> float:
         return 0.0
 
 
+_DEFAULT_CAS_DATA_PATH = Path(__file__).resolve().parent / "cas_data.json"
+
+
 def _cas_data_path() -> Path:
-    return Path(os.environ.get("CAS_DATA_PATH", "./cas_data.json"))
+    # See config_manager._config_path — same cwd-independence reasoning.
+    return Path(os.environ.get("CAS_DATA_PATH", str(_DEFAULT_CAS_DATA_PATH)))
 
 
 def load_cas_data() -> Optional[dict]:

@@ -23,8 +23,15 @@ DEFAULT_CONFIG = {
 }
 
 
+_DEFAULT_PATH = Path(__file__).resolve().parent / "config.json"
+
+
 def _config_path() -> Path:
-    return Path(os.environ.get("CONFIG_PATH", "./config.json"))
+    # Default resolves relative to this file, not the process's cwd —
+    # a bare "./config.json" would silently look in the wrong place
+    # depending on how/where uvicorn was launched from (e.g. a container
+    # WORKDIR that doesn't match this file's own directory).
+    return Path(os.environ.get("CONFIG_PATH", str(_DEFAULT_PATH)))
 
 
 def load_config() -> dict:

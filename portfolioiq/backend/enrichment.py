@@ -54,8 +54,12 @@ ENRICHED_FIELD_DEFAULTS = {
 
 # ---------------------------------------------------------------- cache ----
 
+_DEFAULT_CACHE_PATH = Path(__file__).resolve().parent / "enrichment_cache.json"
+
+
 def _cache_path() -> Path:
-    return Path(os.environ.get("CACHE_PATH", "./enrichment_cache.json"))
+    # See config_manager._config_path — same cwd-independence reasoning.
+    return Path(os.environ.get("CACHE_PATH", str(_DEFAULT_CACHE_PATH)))
 
 
 def _load_cache() -> dict:
