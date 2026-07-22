@@ -25,9 +25,10 @@ function qs(params = {}) {
 }
 
 export const api = {
-  uploadCas(file) {
+  uploadCas(file, password = '') {
     const form = new FormData()
     form.append('file', file)
+    form.append('password', password)
     return request('/api/upload-cas', { method: 'POST', body: form })
   },
   getPortfolio(params) {

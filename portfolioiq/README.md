@@ -1,10 +1,20 @@
 # PortfolioIQ
 
-A personal mutual fund portfolio analysis tool. Upload a parsed CAS JSON
-(the output of `casparser`, see the sibling [`casparser-web`](../README.md)
-project), and it enriches every fund with live market data, computes
-XIRR/returns/risk metrics, and gives you a dashboard broken down by
-group / investor / advisor.
+A personal mutual fund portfolio analysis tool. Upload your CAS PDF
+(CAMS or KFintech) and its password — that's the whole input — and it
+parses it in-process via `casparser` (the same library
+[`casparser-web`](../README.md) wraps), enriches every fund with live
+market data, computes XIRR/returns/risk metrics, and gives you a
+dashboard broken down by group / investor / advisor. No separate
+parsing step, no intermediate JSON file to generate yourself — one
+upload, one dashboard.
+
+(A pre-parsed CAS JSON is still accepted too, if you already have one —
+`/api/upload-cas` detects which by file extension. Only CAMS/KFintech
+mutual-fund statements are analysed; an NSDL/CDSL demat statement is
+rejected with a clear message, since the analytics here — XIRR, cap
+allocation, advisor comparison — are all built around the folio/scheme
+shape those two RTAs produce.)
 
 ```
 backend/    FastAPI app — calculations, enrichment, config, all routes
@@ -84,7 +94,8 @@ npm run dev
 # opens at http://localhost:5173
 ```
 
-Upload your CAS JSON from the top bar. First upload kicks off enrichment
+Click "Upload CAS PDF" in the top bar, pick your statement, enter its
+password when prompted, and hit Parse. First upload kicks off enrichment
 in the background — the top bar shows progress, and pages refresh once
 it's done.
 
@@ -120,7 +131,7 @@ you're on a paid ngrok plan with a reserved domain.
 
 See spec section 6 for full request/response shapes. Quick reference:
 
-- `POST /api/upload-cas` — upload a parsed CAS JSON, kicks off enrichment
+- `POST /api/upload-cas` — upload the CAS PDF + password (or a pre-parsed CAS JSON), kicks off enrichment
 - `GET /api/portfolio` — per-scheme data, filterable by level/group/investor/arn
 - `GET /api/portfolio/snapshot` — opening/closing balance + XIRR for a date window
 - `GET /api/portfolio/summary` — advisor-level comparison table

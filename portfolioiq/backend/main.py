@@ -11,11 +11,18 @@ from __future__ import annotations
 
 import json
 import os
+import tempfile
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Optional
 
-from fastapi import BackgroundTasks, FastAPI, File, HTTPException, Query, UploadFile
+from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from starlette.concurrency import run_in_threadpool
+
+from casparser import read_cas_pdf
+from casparser.exceptions import CASParseError, ParserException
+from casparser.types import NSDLCASData
 
 import calculations as calc
 import config_manager as cfgm
@@ -23,6 +30,8 @@ import enrichment
 import portfolio as pf
 
 app = FastAPI(title="PortfolioIQ")
+
+MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20MB — real CAS PDFs are a few MB at most
 
 _default_origins = "http://localhost:5173"
 _cors_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", _default_origins).split(",") if o.strip()]
@@ -98,12 +107,55 @@ def health():
 
 
 @app.post("/api/upload-cas")
-async def upload_cas(background_tasks: BackgroundTasks, file: UploadFile = File(...)):
+async def upload_cas(
+    background_tasks: BackgroundTasks,
+    file: UploadFile = File(...),
+    password: str = Form(default=""),
+):
+    """Accepts the CAS PDF directly (the primary, intended flow — this is
+    the "just upload your statement" experience) and parses it in-process
+    via casparser, the same library casparser-web wraps. A pre-parsed CAS
+    JSON is still accepted too (useful for testing, or if you already have
+    one), detected purely by file extension."""
+    filename = (file.filename or "").lower()
     content = await file.read()
-    try:
-        cas_data = json.loads(content)
-    except json.JSONDecodeError:
-        raise HTTPException(400, "That doesn't look like valid JSON.")
+    if len(content) > MAX_UPLOAD_BYTES:
+        raise HTTPException(413, "That file is larger than we accept (20MB max).")
+
+    if filename.endswith(".pdf"):
+        with tempfile.TemporaryDirectory(prefix="portfolioiq-") as tmp:
+            pdf_path = Path(tmp) / "statement.pdf"
+            pdf_path.write_bytes(content)
+            del content  # don't keep a second copy of the statement in memory
+            try:
+                parsed = await run_in_threadpool(read_cas_pdf, str(pdf_path), password)
+            except CASParseError as exc:
+                message = str(exc)
+                if "password" in message.lower():
+                    raise HTTPException(401, "That password didn't work. Double check it and try again.")
+                raise HTTPException(
+                    422,
+                    "We couldn't read this as a CAS statement. Make sure it's the unmodified "
+                    "PDF from CAMS or KFintech.",
+                )
+            except ParserException:
+                raise HTTPException(422, "This statement couldn't be parsed.")
+
+        if isinstance(parsed, NSDLCASData):
+            raise HTTPException(
+                422,
+                "This looks like an NSDL/CDSL demat statement. PortfolioIQ currently analyses "
+                "CAMS/KFintech mutual-fund statements only — casparser-web can still parse this "
+                "one for you, just not with portfolio analytics on top.",
+            )
+        cas_data = parsed.model_dump(mode="json", by_alias=True)
+    elif filename.endswith(".json"):
+        try:
+            cas_data = json.loads(content)
+        except json.JSONDecodeError:
+            raise HTTPException(400, "That doesn't look like valid JSON.")
+    else:
+        raise HTTPException(400, "Upload the CAS PDF from CAMS/KFintech (or a previously-parsed CAS JSON file).")
 
     pf.save_cas_data(cas_data)
     records = pf.build_scheme_records(cas_data, _config(), {})

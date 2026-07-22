@@ -66,11 +66,11 @@ export default function App() {
     }).catch(() => {})
   }, [loadConfig])
 
-  const handleUpload = async (file) => {
+  const handleUpload = async (file, password = '') => {
     setUploading(true)
     setUploadError(null)
     try {
-      const result = await api.uploadCas(file)
+      const result = await api.uploadCas(file, password)
       setUploadInfo({ investor_name: result.investor_name, statement_period: result.statement_period })
       setRefreshTick((t) => t + 1)
       pollEnrichStatus()
