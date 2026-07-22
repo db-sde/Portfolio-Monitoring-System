@@ -1,4 +1,10 @@
-const BASE = import.meta.env.VITE_API_BASE_URL || 'http://localhost:8000'
+// Relative by default: in production this is same-origin (Vercel's
+// vercel.json rewrites /api/* to the Render backend), and in local dev
+// the Vite dev server proxies /api itself (see vite.config.js) — so the
+// backend's actual URL never needs to be baked into the built bundle.
+// VITE_API_BASE_URL is still available as an override (e.g. pointing a
+// local frontend at an ngrok tunnel instead of the dev proxy).
+const BASE = import.meta.env.VITE_API_BASE_URL || ''
 
 async function request(path, options = {}) {
   const res = await fetch(`${BASE}${path}`, options)
