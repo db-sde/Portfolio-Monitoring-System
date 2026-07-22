@@ -6,3 +6,4 @@ __pycache__/
 # portfolioiq/backend — auto-generated, never the source of truth
 cas_data.json
 enrichment_cache.json
+gains_data.json

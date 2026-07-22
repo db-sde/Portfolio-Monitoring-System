@@ -5,6 +5,9 @@ import TopBar from './components/TopBar'
 import LevelSelector from './components/LevelSelector'
 import WelcomeUpload from './components/WelcomeUpload'
 import Dashboard from './pages/Dashboard'
+import Portfolio from './pages/Portfolio'
+import Transactions from './pages/Transactions'
+import CapitalGains from './pages/CapitalGains'
 import PortfolioSnapshot from './pages/PortfolioSnapshot'
 import FundSummary from './pages/FundSummary'
 import PortfolioSummary from './pages/PortfolioSummary'
@@ -13,6 +16,9 @@ import Settings from './pages/Settings'
 
 const PAGES = {
   dashboard: Dashboard,
+  portfolio: Portfolio,
+  transactions: Transactions,
+  'capital-gains': CapitalGains,
   snapshot: PortfolioSnapshot,
   'fund-summary': FundSummary,
   'portfolio-summary': PortfolioSummary,

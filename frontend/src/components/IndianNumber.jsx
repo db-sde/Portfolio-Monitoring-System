@@ -18,6 +18,18 @@ export const formatPct = (n, digits = 2) => {
   return `${sign}${n.toFixed(digits)}%`
 }
 
+export const formatUnits = (n) => {
+  if (n == null || Number.isNaN(n)) return '—'
+  return Number(n).toLocaleString('en-IN', { minimumFractionDigits: 3, maximumFractionDigits: 3 })
+}
+
+export const formatDate = (iso) => {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
+}
+
 export default function IndianNumber({ value, className = '' }) {
   return <span className={className}>{formatIndian(value)}</span>
 }

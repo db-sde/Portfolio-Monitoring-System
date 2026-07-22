@@ -27,6 +27,7 @@ from casparser.types import NSDLCASData
 import calculations as calc
 import config_manager as cfgm
 import enrichment
+import gains_service
 import portfolio as pf
 
 app = FastAPI(title="PortfolioIQ")
@@ -149,11 +150,17 @@ async def upload_cas(
                 "one for you, just not with portfolio analytics on top.",
             )
         cas_data = parsed.model_dump(mode="json", by_alias=True)
+        gains_error = gains_service.compute_and_save_gains(parsed, cas_data)
     elif filename.endswith(".json"):
         try:
             cas_data = json.loads(content)
         except json.JSONDecodeError:
             raise HTTPException(400, "That doesn't look like valid JSON.")
+        # No live pydantic object to compute gains from, and any gains
+        # persisted from a previous PDF upload would now describe the
+        # wrong statement.
+        gains_service.clear_gains()
+        gains_error = None
     else:
         raise HTTPException(400, "Upload the CAS PDF from CAMS/KFintech (or a previously-parsed CAS JSON file).")
 
@@ -172,6 +179,7 @@ async def upload_cas(
         "active_schemes": active,
         "zero_value_schemes": len(records) - active,
         "advisors_detected": advisors,
+        "gains_error": gains_error,
     }
 
 
@@ -236,6 +244,58 @@ def get_fund_summary(
 def get_exposure():
     _require_cas_data()
     return pf.build_exposure(_records())
+
+
+@app.get("/api/transactions")
+def get_transactions(
+    include_zero_value: bool = Query(True),
+    level: Optional[str] = Query(None),
+    group_name: Optional[str] = Query(None),
+    investor_name: Optional[str] = Query(None),
+    arn: Optional[str] = Query(None),
+):
+    # Zero-value (fully redeemed) schemes default to included here — their
+    # transaction history is still real and worth seeing, unlike the
+    # current-holdings views where they'd just clutter a "what do I own
+    # right now" table.
+    _require_cas_data()
+    filtered = pf.filter_schemes(_records(), include_zero_value, level, group_name, investor_name, arn)
+    return {"transactions": pf.build_transactions(filtered)}
+
+
+def _gain_matches(entry: dict, config: dict, level, group_name, investor_name, arn) -> bool:
+    if level in (None, ""):
+        return True
+    advisor = entry.get("advisor")
+    if level == "arn":
+        return advisor == arn
+    entry_group, entry_investor = cfgm.find_owner_for_arn(config, advisor) if advisor else (None, None)
+    if level == "group":
+        return entry_group == group_name
+    if level == "investor":
+        return entry_investor == investor_name
+    return True
+
+
+@app.get("/api/capital-gains")
+def get_capital_gains(
+    level: Optional[str] = Query(None),
+    group_name: Optional[str] = Query(None),
+    investor_name: Optional[str] = Query(None),
+    arn: Optional[str] = Query(None),
+):
+    _require_cas_data()
+    stored = gains_service.load_gains()
+    if stored is None:
+        return {"gains": [], "gifts": [], "gains_error": None, "fys": []}
+
+    config = _config()
+    gains = [g for g in stored["gains"] if _gain_matches(g, config, level, group_name, investor_name, arn)]
+    gifts = [g for g in stored["gifts"] if _gain_matches(g, config, level, group_name, investor_name, arn)]
+    for g in gains:
+        g["advisor_label"] = cfgm.find_arn_label(config, g.get("advisor")) if g.get("advisor") else None
+    fys = sorted({g["fy"] for g in gains}, reverse=True)
+    return {"gains": gains, "gifts": gifts, "gains_error": stored.get("gains_error"), "fys": fys}
 
 
 @app.get("/api/config")

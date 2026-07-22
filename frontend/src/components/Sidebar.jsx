@@ -1,14 +1,20 @@
 const ICONS = {
   dashboard: <path d="M3 3h8v8H3V3Zm10 0h8v5h-8V3ZM3 13h8v8H3v-8Zm10 3h8v5h-8v-5Z" />,
+  portfolio: <path d="M3 3v18h18M7 15l4-6 4 3 5-8" />,
   snapshot: <path d="M3 17V9m6 8V5m6 12v-6m6 6V3" />,
   'fund-summary': <path d="M4 4h16v4H4zM4 10h7v10H4zm9 0h7v4h-7zm0 6h7v4h-7z" />,
   'portfolio-summary': <path d="M17 21v-2a4 4 0 0 0-4-4H7a4 4 0 0 0-4 4v2M9 11a4 4 0 1 0 0-8 4 4 0 0 0 0 8Zm11 9v-1.5a3.5 3.5 0 0 0-2.5-3.36M15.5 3.13a4 4 0 0 1 0 7.75" />,
   exposure: <path d="M21.21 15.89A10 10 0 1 1 8 2.83M22 12A10 10 0 0 0 12 2v10z" />,
+  transactions: <path d="M17 1l4 4-4 4M3 11V9a4 4 0 0 1 4-4h14M7 23l-4-4 4-4M21 13v2a4 4 0 0 1-4 4H3" />,
+  'capital-gains': <path d="M12 1v22M17 5H9.5a3.5 3.5 0 0 0 0 7h5a3.5 3.5 0 0 1 0 7H6" />,
   settings: <path d="M12 15a3 3 0 1 0 0-6 3 3 0 0 0 0 6Zm9-3a1.65 1.65 0 0 0 .33-1.82 1.65 1.65 0 0 0-1.51-1H19.4a1.65 1.65 0 0 1-1.51-1 1.65 1.65 0 0 1 .33-1.82l.06-.06a2 2 0 1 0-2.83-2.83l-.06.06a1.65 1.65 0 0 1-1.82.33 1.65 1.65 0 0 1-1-1.51V4a2 2 0 1 0-4 0v.09a1.65 1.65 0 0 1-1 1.51 1.65 1.65 0 0 1-1.82-.33l-.06-.06a2 2 0 1 0-2.83 2.83l.06.06a1.65 1.65 0 0 1 .33 1.82 1.65 1.65 0 0 1-1.51 1H4a2 2 0 1 0 0 4h.09a1.65 1.65 0 0 1 1.51 1 1.65 1.65 0 0 1-.33 1.82l-.06.06a2 2 0 1 0 2.83 2.83l.06-.06a1.65 1.65 0 0 1 1.82-.33 1.65 1.65 0 0 1 1 1.51V20a2 2 0 1 0 4 0v-.09a1.65 1.65 0 0 1 1-1.51 1.65 1.65 0 0 1 1.82.33l.06.06a2 2 0 1 0 2.83-2.83l-.06-.06a1.65 1.65 0 0 1-.33-1.82 1.65 1.65 0 0 1 1.51-1H20a2 2 0 1 0 0-4h-.09a1.65 1.65 0 0 1-1.51-1Z" />,
 }
 
 const NAV_ITEMS = [
   { key: 'dashboard', label: 'Dashboard' },
+  { key: 'portfolio', label: 'Portfolio' },
+  { key: 'transactions', label: 'Transactions' },
+  { key: 'capital-gains', label: 'Capital Gains' },
   { key: 'snapshot', label: 'Portfolio Snapshot' },
   { key: 'fund-summary', label: 'Fund Summary' },
   { key: 'portfolio-summary', label: 'Portfolio Summary' },

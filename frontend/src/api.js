@@ -52,6 +52,12 @@ export const api = {
   getExposure() {
     return request('/api/portfolio/exposure')
   },
+  getTransactions(params) {
+    return request(`/api/transactions${qs(params)}`)
+  },
+  getCapitalGains(params) {
+    return request(`/api/capital-gains${qs(params)}`)
+  },
   getConfig() {
     return request('/api/config')
   },

@@ -287,6 +287,34 @@ def build_fund_summary(records: list[dict]) -> dict:
     return {"funds": list(seen.values())}
 
 
+def build_transactions(records: list[dict]) -> list[dict]:
+    """Flat transaction ledger across every scheme in `records`, each row
+    tagged with the scheme/folio/advisor context needed to filter or group
+    it in the UI without a second lookup. Newest first."""
+    out: list[dict] = []
+    for r in records:
+        for t in r["transactions"]:
+            out.append({
+                "date": t.get("date"),
+                "type": t.get("type"),
+                "description": t.get("description"),
+                "amount": _num(t.get("amount")) if t.get("amount") is not None else None,
+                "units": _num(t.get("units")) if t.get("units") is not None else None,
+                "nav": _num(t.get("nav")) if t.get("nav") is not None else None,
+                "balance": _num(t.get("balance")) if t.get("balance") is not None else None,
+                "folio": r["folio"],
+                "scheme_name": r["scheme_name"],
+                "isin": r["isin"],
+                "amfi": r["amfi"],
+                "advisor": r["advisor"],
+                "advisor_label": r["advisor_label"],
+                "group_name": r["group_name"],
+                "investor_name": r["investor_name"],
+            })
+    out.sort(key=lambda x: x["date"] or "", reverse=True)
+    return out
+
+
 def build_exposure(records: list[dict]) -> dict:
     held = [r for r in records if r["current_value"] > 0]
     total_value = sum(r["current_value"] for r in held) or 1.0
