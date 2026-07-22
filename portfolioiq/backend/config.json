@@ -1,0 +1,26 @@
+{
+  "groups": [
+    {
+      "group_name": "Swanand Family",
+      "investors": [
+        {
+          "investor_name": "Swanand",
+          "arns": ["ARN-13549", "HDFCWMS", "DIRECT", "ARN-0005", "INZ000305337", "INZ000031633"],
+          "arn_labels": {
+            "ARN-13549": "HDFC Wealth",
+            "HDFCWMS": "HDFC WMS",
+            "DIRECT": "Direct",
+            "ARN-0005": "Axis ARN",
+            "INZ000305337": "Direct Axis",
+            "INZ000031633": "Direct BNP"
+          }
+        }
+      ]
+    }
+  ],
+  "preferences": {
+    "show_zero_value_funds": false,
+    "primary_benchmark": "Nifty 500",
+    "show_benchmark_comparison": true
+  }
+}

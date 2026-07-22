@@ -2,3 +2,7 @@ backend/venv/
 __pycache__/
 *.pyc
 .DS_Store
+
+# portfolioiq/backend — auto-generated, never the source of truth
+cas_data.json
+enrichment_cache.json
