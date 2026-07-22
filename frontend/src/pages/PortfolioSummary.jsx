@@ -14,53 +14,53 @@ export default function PortfolioSummary({ refreshTick }) {
     api.getPortfolioSummary().then(setData).catch((err) => setError(err.message)).finally(() => setLoading(false))
   }, [refreshTick])
 
-  if (error) return <div className="text-sm text-red-600">{error}</div>
+  if (error) return <div className="text-sm text-bad">{error}</div>
   if (loading) return <SkeletonTable rows={6} cols={7} />
 
   const groups = data?.groups || []
 
   return (
-    <div className="space-y-6">
+    <div className="space-y-6 animate-fade-up">
       {groups.map((group) => (
         <div key={group.group_name} className="space-y-4">
-          <h2 className="text-sm font-semibold text-gray-800">{group.group_name}</h2>
+          <h2 className="font-display font-semibold text-ink">{group.group_name}</h2>
           {group.investors.map((investor) => (
-            <div key={investor.investor_name} className="rounded-xl border border-gray-200 bg-white overflow-hidden">
-              <div className="px-4 py-3 border-b border-gray-100 flex items-center justify-between">
-                <span className="font-medium text-gray-900">{investor.investor_name}</span>
-                <span className="text-sm">
-                  Blended XIRR: <span className="font-semibold tabular-nums">{investor.all_advisor_xirr != null ? formatPct(investor.all_advisor_xirr) : '—'}</span>
+            <div key={investor.investor_name} className="rounded-xl border border-line-soft bg-card overflow-hidden">
+              <div className="px-4 py-3 border-b border-line-soft flex items-center justify-between bg-paper-soft/40">
+                <span className="font-semibold text-ink">{investor.investor_name}</span>
+                <span className="text-sm text-ink-2">
+                  Blended XIRR: <span className="font-semibold tabular text-ink">{investor.all_advisor_xirr != null ? formatPct(investor.all_advisor_xirr) : '—'}</span>
                 </span>
               </div>
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
-                    <tr className="text-xs uppercase tracking-wide text-gray-500 bg-gray-50">
-                      <th className="text-left px-4 py-2">Advisor</th>
-                      <th className="text-right px-4 py-2">Invested</th>
-                      <th className="text-right px-4 py-2">Current</th>
-                      <th className="text-right px-4 py-2">Abs. return</th>
-                      <th className="text-right px-4 py-2">XIRR</th>
-                      <th className="text-right px-4 py-2">L/M/S cap</th>
-                      <th className="text-right px-4 py-2">Benchmark XIRR</th>
+                    <tr className="text-xs uppercase tracking-wide text-ink-3 bg-paper-soft">
+                      <th className="text-left px-4 py-2.5">Advisor</th>
+                      <th className="text-right px-4 py-2.5">Invested</th>
+                      <th className="text-right px-4 py-2.5">Current</th>
+                      <th className="text-right px-4 py-2.5">Abs. return</th>
+                      <th className="text-right px-4 py-2.5">XIRR</th>
+                      <th className="text-right px-4 py-2.5">L/M/S cap</th>
+                      <th className="text-right px-4 py-2.5">Benchmark XIRR</th>
                     </tr>
                   </thead>
                   <tbody>
                     {investor.advisors.map((a) => (
-                      <tr key={a.arn} className="border-t border-gray-100">
-                        <td className="px-4 py-2 font-medium text-gray-900">{a.advisor_label}</td>
-                        <td className="px-4 py-2 text-right tabular-nums">{formatIndian(a.investment_value)}</td>
-                        <td className="px-4 py-2 text-right tabular-nums font-medium">{formatIndian(a.current_value)}</td>
-                        <td className={`px-4 py-2 text-right tabular-nums ${a.absolute_return_pct >= 0 ? 'text-emerald-700' : 'text-red-700'}`}>
+                      <tr key={a.arn} className="border-t border-line-soft hover:bg-paper-soft/40 transition-colors">
+                        <td className="px-4 py-2.5 font-medium text-ink">{a.advisor_label}</td>
+                        <td className="px-4 py-2.5 text-right tabular text-ink-2">{formatIndian(a.investment_value)}</td>
+                        <td className="px-4 py-2.5 text-right tabular font-medium text-ink">{formatIndian(a.current_value)}</td>
+                        <td className={`px-4 py-2.5 text-right tabular ${a.absolute_return_pct >= 0 ? 'text-good' : 'text-bad'}`}>
                           {a.absolute_return_pct != null ? formatPct(a.absolute_return_pct) : '—'}
                         </td>
-                        <td className={`px-4 py-2 text-right tabular-nums font-medium ${a.xirr >= 0 ? 'text-emerald-700' : 'text-red-700'}`}>
+                        <td className={`px-4 py-2.5 text-right tabular font-medium ${a.xirr >= 0 ? 'text-good' : 'text-bad'}`}>
                           {a.xirr != null ? formatPct(a.xirr) : '—'}
                         </td>
-                        <td className="px-4 py-2 text-right tabular-nums text-gray-600">
+                        <td className="px-4 py-2.5 text-right tabular text-ink-2">
                           {a.largecap_pct != null ? `${a.largecap_pct}/${a.midcap_pct}/${a.smallcap_pct}` : '—'}
                         </td>
-                        <td className="px-4 py-2 text-right tabular-nums text-gray-400">
+                        <td className="px-4 py-2.5 text-right tabular text-ink-3">
                           {a.benchmark_xirr != null ? formatPct(a.benchmark_xirr) : '—'}
                         </td>
                       </tr>
@@ -73,7 +73,7 @@ export default function PortfolioSummary({ refreshTick }) {
         </div>
       ))}
       {groups.length === 0 && (
-        <div className="text-sm text-gray-400 py-10 text-center">No groups configured yet — add one under Settings.</div>
+        <div className="text-sm text-ink-3 py-10 text-center">No groups configured yet — add one under Settings.</div>
       )}
     </div>
   )

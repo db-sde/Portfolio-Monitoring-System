@@ -26,13 +26,13 @@ export default function LevelSelector({ config, level, groupName, investorName, 
 
   return (
     <div className="flex flex-wrap items-center gap-3">
-      <div className="inline-flex rounded-lg border border-gray-200 bg-white p-0.5">
+      <div className="inline-flex rounded-lg border border-line bg-card p-0.5">
         {tabs.map((t) => (
           <button
             key={t.key}
             onClick={() => setLevel(t.key)}
-            className={`px-3 py-1.5 text-sm font-medium rounded-md transition-colors ${
-              active === t.key ? 'bg-emerald-700 text-white' : 'text-gray-600 hover:bg-gray-50'
+            className={`px-3.5 py-1.5 text-sm font-medium rounded-md transition-colors ${
+              active === t.key ? 'bg-band text-band-ink' : 'text-ink-2 hover:bg-paper-soft'
             }`}
           >
             {t.label}
@@ -42,7 +42,7 @@ export default function LevelSelector({ config, level, groupName, investorName, 
 
       {level === 'group' && (
         <select
-          className="rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm"
+          className="rounded-lg border border-line bg-card px-3 py-1.5 text-sm outline-none focus:border-accent"
           value={groupName || ''}
           onChange={(e) => onChange({ level, groupName: e.target.value || null, investorName: null, arn: null })}
         >
@@ -55,7 +55,7 @@ export default function LevelSelector({ config, level, groupName, investorName, 
 
       {level === 'investor' && (
         <select
-          className="rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm"
+          className="rounded-lg border border-line bg-card px-3 py-1.5 text-sm outline-none focus:border-accent"
           value={investorName || ''}
           onChange={(e) => onChange({ level, groupName: null, investorName: e.target.value || null, arn: null })}
         >
@@ -68,7 +68,7 @@ export default function LevelSelector({ config, level, groupName, investorName, 
 
       {level === 'arn' && (
         <select
-          className="rounded-lg border border-gray-200 bg-white px-3 py-1.5 text-sm"
+          className="rounded-lg border border-line bg-card px-3 py-1.5 text-sm outline-none focus:border-accent"
           value={arn || ''}
           onChange={(e) => onChange({ level, groupName: null, investorName: null, arn: e.target.value || null })}
         >

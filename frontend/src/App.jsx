@@ -3,6 +3,7 @@ import { api } from './api'
 import Sidebar from './components/Sidebar'
 import TopBar from './components/TopBar'
 import LevelSelector from './components/LevelSelector'
+import WelcomeUpload from './components/WelcomeUpload'
 import Dashboard from './pages/Dashboard'
 import PortfolioSnapshot from './pages/PortfolioSnapshot'
 import FundSummary from './pages/FundSummary'
@@ -27,10 +28,12 @@ export default function App() {
   const [page, setPage] = useState('dashboard')
   const [config, setConfig] = useState(null)
   const [uploadInfo, setUploadInfo] = useState(null)
+  const [checkingInitial, setCheckingInitial] = useState(true)
   const [enrichStatus, setEnrichStatus] = useState(null)
   const [uploading, setUploading] = useState(false)
   const [uploadError, setUploadError] = useState(null)
   const [refreshTick, setRefreshTick] = useState(0)
+  const [sidebarOpen, setSidebarOpen] = useState(false)
 
   const [filters, setFilters] = useState({
     includeZeroValue: false,
@@ -63,7 +66,7 @@ export default function App() {
     api.getEnrichStatus().then(setEnrichStatus).catch(() => {})
     api.getPortfolio({}).then((p) => {
       setUploadInfo({ investor_name: p.investor_info?.name, statement_period: p.statement_period })
-    }).catch(() => {})
+    }).catch(() => {}).finally(() => setCheckingInitial(false))
   }, [loadConfig])
 
   const handleUpload = async (file, password = '') => {
@@ -81,11 +84,19 @@ export default function App() {
     }
   }
 
+  if (checkingInitial) {
+    return <div className="min-h-screen" />
+  }
+
+  if (!uploadInfo) {
+    return <WelcomeUpload onUpload={handleUpload} uploading={uploading} error={uploadError} />
+  }
+
   const PageComponent = PAGES[page]
 
   return (
     <div className="flex min-h-screen">
-      <Sidebar active={page} onNavigate={setPage} />
+      <Sidebar active={page} open={sidebarOpen} onClose={() => setSidebarOpen(false)} onNavigate={(k) => { setPage(k); setSidebarOpen(false) }} />
       <div className="flex-1 flex flex-col min-w-0">
         <TopBar
           investorName={uploadInfo?.investor_name}
@@ -94,13 +105,14 @@ export default function App() {
           enrichStatus={enrichStatus}
           onUpload={handleUpload}
           uploading={uploading}
+          onMenuClick={() => setSidebarOpen(true)}
         />
         {uploadError && (
-          <div className="mx-6 mt-4 rounded-lg border border-red-200 bg-red-50 text-red-700 text-sm px-4 py-2">
+          <div className="mx-4 md:mx-6 mt-4 rounded-lg border border-bad/20 bg-bad-tint text-bad text-sm px-4 py-2.5">
             {uploadError}
           </div>
         )}
-        <main className="flex-1 p-6 max-w-[1400px] w-full">
+        <main className="flex-1 p-4 md:p-6 max-w-[1400px] w-full">
           {!NO_FILTER_BAR.has(page) && (
             <div className="mb-5">
               <LevelSelector
@@ -113,7 +125,7 @@ export default function App() {
               />
             </div>
           )}
-          <PageComponent filters={filters} setFilters={setFilters} config={config} refreshTick={refreshTick} />
+          <PageComponent filters={filters} setFilters={setFilters} config={config} refreshTick={refreshTick} onConfigSaved={loadConfig} />
         </main>
       </div>
     </div>

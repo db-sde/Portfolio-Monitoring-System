@@ -1,15 +1,69 @@
+@import url('https://fonts.googleapis.com/css2?family=Manrope:wght@500;600;700;800&display=swap');
 @import "tailwindcss";
 
 @theme {
-  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", Inter, sans-serif;
+  /* ---- Surfaces ---- */
+  --color-paper: #f5f4ef;
+  --color-paper-soft: #ece9e0;
+  --color-card: #ffffff;
+  --color-line: #e3e0d6;
+  --color-line-soft: #ece9e0;
+
+  /* ---- Ink (near-navy, not pure black) ---- */
+  --color-ink: #171d2e;
+  --color-ink-2: #4b5163;
+  --color-ink-3: #8a8e9c;
+
+  /* ---- Accent: burnished gold, used as a fill, sparingly ---- */
+  --color-accent: #a9762f;
+  --color-accent-strong: #8a5f22;
+  --color-accent-tint: #f4ead6;
+  --color-accent-ink: #fffaf0;
+
+  /* ---- Dark band (deep navy) ---- */
+  --color-band: #12172a;
+  --color-band-ink: #eef0f6;
+  --color-band-line: rgba(238, 240, 246, 0.14);
+
+  /* ---- Semantic (kept separate from the accent hue) ---- */
+  --color-good: #1f7a4d;
+  --color-good-tint: #e4f2ea;
+  --color-bad: #b23b2e;
+  --color-bad-tint: #fbeae7;
+  --color-warn: #96691a;
+  --color-warn-tint: #f7edd9;
+
+  --font-display: 'Manrope', ui-sans-serif, system-ui, sans-serif;
+  --font-sans: -apple-system, BlinkMacSystemFont, "Segoe UI", system-ui, sans-serif;
   --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
 }
 
 body {
   font-family: var(--font-sans);
-  background: #f7f8f6;
-  color: #14201a;
+  background: var(--color-paper);
+  color: var(--color-ink);
+  -webkit-font-smoothing: antialiased;
+}
+
+h1, h2, h3, .font-display {
+  font-family: var(--font-display);
+  letter-spacing: -0.01em;
+}
+
+.tabular {
+  font-variant-numeric: tabular-nums;
 }
 
 ::-webkit-scrollbar { height: 8px; width: 8px; }
-::-webkit-scrollbar-thumb { background: #d7dcd3; border-radius: 4px; }
+::-webkit-scrollbar-thumb { background: var(--color-line); border-radius: 4px; }
+::-webkit-scrollbar-thumb:hover { background: var(--color-ink-3); }
+
+@keyframes fade-up {
+  from { opacity: 0; transform: translateY(8px); }
+  to { opacity: 1; transform: none; }
+}
+.animate-fade-up { animation: fade-up 0.4s cubic-bezier(.2,.7,.3,1) both; }
+
+@media (prefers-reduced-motion: reduce) {
+  .animate-fade-up { animation: none; }
+}

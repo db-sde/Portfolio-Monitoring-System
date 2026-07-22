@@ -5,7 +5,14 @@
       "investors": [
         {
           "investor_name": "Swanand",
-          "arns": ["ARN-13549", "HDFCWMS", "DIRECT", "ARN-0005", "INZ000305337", "INZ000031633"],
+          "arns": [
+            "ARN-13549",
+            "HDFCWMS",
+            "DIRECT",
+            "ARN-0005",
+            "INZ000305337",
+            "INZ000031633"
+          ],
           "arn_labels": {
             "ARN-13549": "HDFC Wealth",
             "HDFCWMS": "HDFC WMS",

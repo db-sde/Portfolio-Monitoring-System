@@ -4,23 +4,23 @@ import { formatIndian, formatPct } from '../components/IndianNumber'
 import SkeletonTable from '../components/SkeletonTable'
 import { PieChart, Pie, Cell, ResponsiveContainer, Tooltip, Legend } from 'recharts'
 
-const CAP_COLORS = ['#0f6e3f', '#4fa876', '#a8d5b8', '#d8ddd3']
+const CAP_COLORS = ['#12172a', '#a9762f', '#c9b08a', '#e3e0d6']
 
 function ExposureTable({ title, rows, nameKey }) {
   return (
-    <div className="rounded-xl border border-gray-200 bg-white overflow-hidden">
-      <div className="text-sm font-semibold text-gray-800 px-4 py-3 border-b border-gray-100">{title}</div>
+    <div className="rounded-xl border border-line-soft bg-card overflow-hidden">
+      <div className="font-display font-semibold text-ink px-4 py-3 border-b border-line-soft">{title}</div>
       <table className="w-full text-sm">
         <tbody>
           {rows.map((r, i) => (
-            <tr key={i} className="border-t border-gray-100 first:border-0">
-              <td className="px-4 py-2 font-medium text-gray-900">{r[nameKey]}</td>
-              <td className="px-4 py-2 text-right tabular-nums">{formatIndian(r.current_value)}</td>
-              <td className="px-4 py-2 text-right tabular-nums text-gray-500 w-24">{formatPct(r.pct_of_portfolio, 1)}</td>
+            <tr key={i} className="border-t border-line-soft first:border-0 hover:bg-paper-soft/40 transition-colors">
+              <td className="px-4 py-2.5 font-medium text-ink">{r[nameKey]}</td>
+              <td className="px-4 py-2.5 text-right tabular text-ink-2">{formatIndian(r.current_value)}</td>
+              <td className="px-4 py-2.5 text-right tabular text-ink-3 w-24">{formatPct(r.pct_of_portfolio, 1)}</td>
             </tr>
           ))}
           {rows.length === 0 && (
-            <tr><td colSpan={3} className="px-4 py-6 text-center text-gray-400">Nothing to show.</td></tr>
+            <tr><td colSpan={3} className="px-4 py-6 text-center text-ink-3">Nothing to show.</td></tr>
           )}
         </tbody>
       </table>
@@ -39,7 +39,7 @@ export default function Exposure({ refreshTick }) {
     api.getExposure().then(setData).catch((err) => setError(err.message)).finally(() => setLoading(false))
   }, [refreshTick])
 
-  if (error) return <div className="text-sm text-red-600">{error}</div>
+  if (error) return <div className="text-sm text-bad">{error}</div>
   if (loading) return <SkeletonTable rows={6} cols={3} />
   if (!data) return null
 
@@ -52,11 +52,11 @@ export default function Exposure({ refreshTick }) {
   ].filter((d) => d.value != null && d.value > 0)
 
   return (
-    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6">
+    <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 animate-fade-up">
       <ExposureTable title="Top AMCs" rows={data.top_amcs || []} nameKey="amc_name" />
       <ExposureTable title="Top funds" rows={data.top_funds || []} nameKey="scheme_name" />
-      <div className="rounded-xl border border-gray-200 bg-white p-4 lg:col-span-2">
-        <div className="text-sm font-semibold text-gray-800 mb-3">Cap allocation across held equity funds</div>
+      <div className="rounded-xl border border-line-soft bg-card p-4 lg:col-span-2">
+        <div className="font-display font-semibold text-ink mb-3">Cap allocation across held equity funds</div>
         {pieData.length ? (
           <ResponsiveContainer width="100%" height={260}>
             <PieChart>
@@ -68,7 +68,7 @@ export default function Exposure({ refreshTick }) {
             </PieChart>
           </ResponsiveContainer>
         ) : (
-          <div className="text-sm text-gray-400 py-10 text-center">
+          <div className="text-sm text-ink-3 py-10 text-center">
             No cap-allocation data available (needs mfdata.in enrichment on the held funds).
           </div>
         )}
