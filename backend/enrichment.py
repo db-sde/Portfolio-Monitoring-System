@@ -5,26 +5,39 @@ Enriches a scheme (by AMFI code / ISIN / name) with fund-level analytics:
 AUM, cap allocation, benchmark, category, expense ratio, fund manager,
 trailing returns, risk ratios, and NAV history.
 
-Source priority (spec section 7):
-  1. mfdata.in  - primary; the only source with cap-allocation % and risk
-                  ratios (sharpe/alpha/beta/std dev).
-  2. mfapi.in   - fallback for NAV history + basic scheme metadata.
-  3. captnemo   - fallback for category + scheme rules, by ISIN.
+Source priority (spec section 7), re-verified live and adjusted below:
+  1. mfdata.in  - would be primary (the only source with cap-allocation %
+                  and sharpe/alpha/beta), but see the caveat below: it is
+                  not just "occasionally down", it is actively
+                  unreachable, so nothing here depends on it succeeding.
+  2. mfapi.in   - NAV history + basic scheme metadata, AND (since mfdata
+                  never returns the pre-computed returns the spec expects)
+                  the source of every trailing-return figure this module
+                  produces: computed here directly from the NAV history,
+                  point-to-point for <1y windows and CAGR for 1y/2y/3y —
+                  see RETURN_PERIODS / _compute_trailing_returns.
+  3. captnemo   - queried unconditionally (by ISIN), not just as a
+                  category fallback: it actually carries expense ratio,
+                  fund manager(s), and a volatility figure per scheme, on
+                  top of category. Its own AUM field is deliberately not
+                  used — see the corpus_cr comment in _enrich_one.
 
-IMPORTANT CAVEAT: while building this, mfdata.in was unreachable from
-every network path tried (direct request, docs page, different User-
-Agents) — not a 404 or a clean error, a flat connection failure/403
-consistent with bot-protection on datacenter IPs. mfapi.in and captnemo
-were both reachable and worked as documented. Since this app's own spec
-has the backend running on your own machine (with an optional ngrok
-tunnel) rather than a cloud host, mfdata.in may well work fine for you —
-residential IPs are usually not what that kind of protection targets —
-but it could not be verified here, and the exact field names below are
-taken from the spec's own documented schema (section 7), not from a
-response this code actually saw. If your real responses use different
-field names, `_extract_mfdata_fields` is the one place to adjust; every
-field defaults to None rather than raising, so a schema mismatch just
-means less enrichment, not a crash.
+IMPORTANT CAVEAT, confirmed with a live connectivity test (not just
+inference from failed requests): mfdata.in's DNS resolves fine (it's
+behind Cloudflare) and a TCP+TLS handshake gets partway through — client
+hello, server hello, certificate — before going silent, no response, no
+clean TLS alert. That pattern (as opposed to a fast 403) is consistent
+with fingerprint-based bot mitigation (e.g. JA3) rather than a simple
+IP block, which means retrying with different headers/User-Agents won't
+help, and it will almost certainly behave the same from Render's
+datacenter IPs as it did from this sandbox. Cap-allocation % and
+sharpe/alpha/beta specifically have NO other free source currently wired
+in here — mfapi.in doesn't have them and neither does captnemo — so
+those fields staying null is an honest gap, not a bug; getting them for
+real would need a paid data vendor. Everything else this module claims
+to provide (returns, expense ratio, fund manager, category, a volatility
+figure standing in for std_dev) now comes from mfapi.in/captnemo, both
+confirmed reachable, and works regardless of mfdata.in's availability.
 """
 
 from __future__ import annotations
@@ -144,13 +157,81 @@ def _extract_mfapi_nav_history(raw: dict) -> list[dict]:
     """mfapi.in dates are DD-MM-YYYY; normalise to ISO for the rest of
     the app (calculations.py expects YYYY-MM-DD / DD-MM-YYYY / DD-Mon-YYYY,
     all of which _parse_date already handles, so this is mostly passthrough
-    plus dropping unparseable rows)."""
+    plus dropping unparseable rows). Sorted oldest-first so
+    _compute_trailing_returns can treat the last entry as "latest" — by
+    *parsed* date, not the raw DD-MM-YYYY string: e.g. "05-01-2024" sorts
+    before "28-06-2020" lexicographically even though it's nearly 4 years
+    later, which would have silently pinned every trailing-return
+    calculation to whatever date happened to have the lexicographically
+    largest string (in practice, the latest 31-Dec in the whole history)
+    instead of the actual most recent NAV.
+    """
     out = []
     for row in raw.get("data", []):
         nav = _num(row.get("nav"))
         date_str = row.get("date")
-        if nav is not None and date_str:
+        if nav is not None and date_str and _parse_nav_date(date_str) is not None:
             out.append({"date": date_str, "nav": nav})
+    out.sort(key=lambda r: _parse_nav_date(r["date"]))
+    return out
+
+
+# Period -> (days-back, whether to annualise as CAGR). Point-to-point %
+# for sub-1-year windows, CAGR for 1y+, matching the convention every
+# mainstream fund tracker (Value Research, Groww, ET Money) uses — a raw
+# 3-year point-to-point % would read as roughly 3x too big next to a 1y
+# figure on the same table.
+RETURN_PERIODS: dict[str, tuple[int, bool]] = {
+    "1m": (30, False), "3m": (91, False), "6m": (182, False),
+    "1y": (365, True), "2y": (730, True), "3y": (1095, True),
+}
+
+
+def _parse_nav_date(s: str):
+    for fmt in ("%Y-%m-%d", "%d-%m-%Y", "%d-%b-%Y"):
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _nav_on_or_before(nav_history: list[dict], target) -> Optional[tuple[Any, float]]:
+    """Latest (date, nav) at or before the `target` date object."""
+    best = None
+    for row in nav_history:
+        d = _parse_nav_date(row["date"])
+        if d is not None and d <= target and (best is None or d > best[0]):
+            best = (d, row["nav"])
+    return best
+
+
+def _compute_trailing_returns(nav_history: list[dict]) -> dict[str, Optional[float]]:
+    """Real trailing returns computed directly from mfapi.in's own NAV
+    history — reachable and correct, unlike mfdata.in (see module
+    docstring) or trying to reuse a third party's own return figures
+    which may use different period boundaries or rounding."""
+    out: dict[str, Optional[float]] = {k: None for k in RETURN_PERIODS}
+    if not nav_history:
+        return out
+    latest = nav_history[-1]
+    latest_date = _parse_nav_date(latest["date"])
+    if latest_date is None or not latest["nav"]:
+        return out
+    for period, (days_back, annualize) in RETURN_PERIODS.items():
+        target = latest_date - timedelta(days=days_back)
+        past = _nav_on_or_before(nav_history, target)
+        if not past or not past[1]:
+            continue
+        past_date, past_nav = past
+        actual_days = (latest_date - past_date).days
+        if actual_days <= 0:
+            continue
+        ratio = latest["nav"] / past_nav
+        if annualize:
+            out[period] = round((ratio ** (365.0 / actual_days) - 1) * 100, 2)
+        else:
+            out[period] = round((ratio - 1) * 100, 2)
     return out
 
 
@@ -173,14 +254,30 @@ async def _enrich_one(client: httpx.AsyncClient, amfi_code: str, isin: Optional[
             fields["category"] = meta.get("scheme_category")
         nav_history = _extract_mfapi_nav_history(mfapi_raw)
         sources_used.append("mfapi.in")
+        # mfdata.in is the only source with pre-computed returns and it is
+        # unreachable in practice (see module docstring) — compute our own
+        # from the NAV history we just fetched rather than leave every
+        # fund summary row blank.
+        if not any(fields["returns"].values()):
+            fields["returns"] = _compute_trailing_returns(nav_history)
 
-    if not fields.get("category") and isin:
+    # captnemo (Kuvera's backing API) turns out to carry real per-scheme
+    # analytics keyed by ISIN — category, expense ratio, fund manager(s),
+    # and a volatility figure — that this module previously only used as
+    # a last-resort category fallback. Queried unconditionally (not just
+    # when mfdata failed) since mfdata practically never succeeds. AUM is
+    # deliberately NOT taken from here: its units couldn't be confirmed
+    # against a known fund's real AUM, and a wrong number dressed up as
+    # "corpus_cr" is worse than a blank field.
+    if isin:
         cn_raw = await _fetch_json(client, f"{CAPTNEMO_BASE}/{isin}", follow_redirects=True)
         cn_entry = cn_raw[0] if isinstance(cn_raw, list) and cn_raw else cn_raw
         if isinstance(cn_entry, dict):
-            fields["category"] = fields.get("category") or cn_entry.get("category")
+            fields["category"] = fields.get("category") or cn_entry.get("fund_category") or cn_entry.get("category")
             fields["expense_ratio"] = fields.get("expense_ratio") or _num(cn_entry.get("expense_ratio"))
-            fields["corpus_cr"] = fields.get("corpus_cr") or _num(cn_entry.get("aum"))
+            fields["fund_manager"] = fields.get("fund_manager") or cn_entry.get("fund_manager")
+            if fields["risk"].get("std_dev") is None:
+                fields["risk"]["std_dev"] = _num(cn_entry.get("volatility"))
             sources_used.append("captnemo")
 
     fields["enriched_at"] = datetime.now(timezone.utc).isoformat()

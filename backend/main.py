@@ -21,8 +21,9 @@ from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
 
 from casparser import read_cas_pdf
+from casparser.enums import TransactionType
 from casparser.exceptions import CASParseError, ParserException
-from casparser.types import NSDLCASData
+from casparser.types import CASData, NSDLCASData
 
 import calculations as calc
 import config_manager as cfgm
@@ -33,6 +34,24 @@ import portfolio as pf
 app = FastAPI(title="PortfolioIQ")
 
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024  # 20MB — real CAS PDFs are a few MB at most
+
+
+def _fix_segregation_classification(parsed: CASData) -> None:
+    """Same correction as portfolio.fix_segregation_classification, applied
+    to the live pydantic object instead of the serialised dict — this has
+    to run before `read_cas_pdf`'s result reaches either model_dump() (the
+    persisted cas_data.json) or CapitalGainsReport (which reads straight
+    off this object, not off cas_data.json), or the capital-gains FIFO
+    matcher still sees the uncorrected REDEMPTION label and generates a
+    phantom taxable gain. See portfolio.py for the full explanation."""
+    for folio in parsed.folios:
+        for scheme in folio.schemes:
+            for txn in scheme.transactions:
+                if (
+                    txn.type == TransactionType.REDEMPTION
+                    and "segregat" in (txn.description or "").lower()
+                ):
+                    txn.type = TransactionType.SEGREGATION
 
 _default_origins = "http://localhost:5173"
 _cors_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", _default_origins).split(",") if o.strip()]
@@ -149,6 +168,7 @@ async def upload_cas(
                 "CAMS/KFintech mutual-fund statements only — casparser-web can still parse this "
                 "one for you, just not with portfolio analytics on top.",
             )
+        _fix_segregation_classification(parsed)
         cas_data = parsed.model_dump(mode="json", by_alias=True)
         gains_error = gains_service.compute_and_save_gains(parsed, cas_data)
     elif filename.endswith(".json"):
@@ -156,6 +176,7 @@ async def upload_cas(
             cas_data = json.loads(content)
         except json.JSONDecodeError:
             raise HTTPException(400, "That doesn't look like valid JSON.")
+        cas_data = pf.fix_segregation_classification(cas_data)
         # No live pydantic object to compute gains from, and any gains
         # persisted from a previous PDF upload would now describe the
         # wrong statement.

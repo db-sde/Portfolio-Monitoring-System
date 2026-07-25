@@ -4,12 +4,27 @@ PortfolioIQ — portfolio.py
 Ties the raw parsed CAS JSON, config.json (group/investor/ARN labels),
 and enrichment data together into the shapes main.py's endpoints return.
 
-`invested_value` (per scheme) is the gross total ever contributed —
-sum of every PURCHASE/PURCHASE_SIP/SWITCH_IN(_MERGER) amount, not netted
-against redemptions already taken out. That's deliberate: it's what lets
-a fully-redeemed, zero-value scheme still show "you put in ₹X, this is
-what happened to it" instead of just disappearing into a 0/0 line, which
-is the whole point of keeping the 14 zero-value schemes visible at all.
+Two different "invested" numbers are exposed per scheme, and mixing them
+up is exactly the bug this comment exists to prevent:
+
+- `invested_value` is the gross total ever contributed — sum of every
+  PURCHASE/PURCHASE_SIP/SWITCH_IN(_MERGER) amount, never netted against
+  money already taken back out via redemption/switch-out. It answers
+  "how much have I put into this scheme across its whole life" and is
+  purely historical context — it does NOT belong in any gain/return
+  calculation, because for a partially- or fully-redeemed scheme it
+  massively overstates the capital actually still at risk (put in 92k,
+  redeemed 90k, and this would still say "92k invested" against a
+  current value that only reflects the remaining 2k).
+- `net_invested_value` is the cost basis of the units *still held* —
+  sourced from the CAS statement's own "Total Cost Value" line
+  (`valuation.cost`, already net of every redemption/switch-out the RTA
+  itself accounted for) when available, falling back to gross only for
+  the rare template that omits that line while units are still held.
+  For a fully-redeemed scheme this is correctly 0 — nothing is at risk
+  there anymore, so absolute_gain/absolute_gain_pct should be 0/None,
+  not "-100%". This is the field every gain/return calculation and every
+  cross-scheme sum (portfolio/advisor/dashboard totals) should use.
 """
 
 from __future__ import annotations
@@ -61,6 +76,34 @@ def _mode_from_name(scheme_name: str) -> str:
     return "Direct" if "direct" in (scheme_name or "").lower() else "Regular"
 
 
+def fix_segregation_classification(cas_data: dict) -> dict:
+    """Runtime correction for a real upstream casparser bug: its
+    transaction classifier (casparser/parsers/_classify.py) only checks
+    for "segregat" in the description on the *positive*-units leg of a
+    segregation event (units credited to the new side-pocket scheme). The
+    matching negative-units leg — units removed from the original scheme —
+    isn't checked at all and falls through to REDEMPTION, which sends it
+    into the capital-gains FIFO matcher as a real disposal, generating a
+    phantom taxable gain for units that were reclassified, not sold (e.g.
+    Franklin Templeton's 2020 debt-fund segregation).
+
+    casparser is installed from PyPI (see requirements.txt), not from a
+    local fork, so patching the library's own source doesn't reach this
+    app's deployment — the fix has to live here, applied once at upload
+    time to every transaction, the same way the debt-fund Sec 50AA
+    correction lives in gains_service.py rather than in gains.py itself.
+    """
+    for folio in cas_data.get("folios", []):
+        for scheme in folio.get("schemes", []):
+            for txn in scheme.get("transactions", []):
+                if (
+                    txn.get("type") == "REDEMPTION"
+                    and "segregat" in (txn.get("description") or "").lower()
+                ):
+                    txn["type"] = "SEGREGATION"
+    return cas_data
+
+
 def build_scheme_records(
     cas_data: dict,
     config: dict,
@@ -86,20 +129,27 @@ def build_scheme_records(
                 for t in transactions
                 if t.get("type") in MONEY_OUT_TYPES
             )
-            # External money only (no switch_in): switches move the same
-            # rupee between two schemes, so summing invested_value across
-            # schemes double-counts it. Anything aggregated across schemes
-            # (portfolio/advisor totals, dashboard stat cards) should use
-            # this instead; a single scheme's own invested_value stays
-            # gross on purpose (see module docstring).
-            invested_value_external = sum(
-                abs(_num(t.get("amount")))
-                for t in transactions
-                if t.get("type") in ("PURCHASE", "PURCHASE_SIP")
-            )
-            absolute_gain = current_value - invested_value
+            # Cost basis of units still held (see module docstring). The RTA's
+            # own "Total Cost Value" is already net of every redemption and
+            # switch-out for this scheme, and — because a switch's cost basis
+            # simply moves from the source scheme's cost_value to the
+            # destination's — summing this across schemes never double-counts
+            # a switch the way summing gross invested_value would.
+            if current_units > 0 and cost_value > 0:
+                net_invested_value = cost_value
+            elif current_units > 0:
+                # Units are still held but this template didn't print a
+                # "Total Cost Value" line — gross is the least-bad estimate
+                # available, better than reporting 0 invested against a
+                # nonzero current_value.
+                net_invested_value = invested_value
+            else:
+                # Fully redeemed: nothing of the original investment is still
+                # at risk here, regardless of how much was ever put in.
+                net_invested_value = 0.0
+            absolute_gain = current_value - net_invested_value
             absolute_gain_pct = (
-                round(absolute_gain / invested_value * 100, 2) if invested_value else None
+                round(absolute_gain / net_invested_value * 100, 2) if net_invested_value else None
             )
 
             xirr_value = None
@@ -131,7 +181,7 @@ def build_scheme_records(
                 "current_value": current_value,
                 "cost_value": cost_value,
                 "invested_value": round(invested_value, 2),
-                "invested_value_external": round(invested_value_external, 2),
+                "net_invested_value": round(net_invested_value, 2),
                 "absolute_gain": round(absolute_gain, 2),
                 "absolute_gain_pct": absolute_gain_pct,
                 "xirr": xirr_value,
@@ -203,7 +253,7 @@ def build_portfolio_summary(records: list[dict], config: dict) -> dict:
                 ]
                 if not arn_records:
                     continue
-                investment_value = sum(r["invested_value_external"] for r in arn_records)
+                investment_value = sum(r["net_invested_value"] for r in arn_records)
                 current_value = sum(r["current_value"] for r in arn_records)
                 absolute_return_pct = (
                     round((current_value - investment_value) / investment_value * 100, 2)

@@ -44,10 +44,11 @@ export default function Dashboard({ filters, refreshTick }) {
 
   const schemes = portfolio.schemes || []
   const currentValue = schemes.reduce((s, r) => s + r.current_value, 0)
-  // invested_value_external (not invested_value): summing the gross
-  // per-scheme figure would double-count money moved between schemes
-  // via switch_in.
-  const investedValue = schemes.reduce((s, r) => s + r.invested_value_external, 0)
+  // net_invested_value (not invested_value): the gross per-scheme figure
+  // never nets out redemptions, so a scheme where 92k went in and 90k came
+  // back out would still count as "92k invested" here. net_invested_value
+  // is the cost basis of units still held (0 for a fully-redeemed scheme).
+  const investedValue = schemes.reduce((s, r) => s + r.net_invested_value, 0)
   const gain = currentValue - investedValue
   const gainPct = investedValue ? (gain / investedValue) * 100 : null
 
@@ -129,7 +130,7 @@ export default function Dashboard({ filters, refreshTick }) {
                     <div className="text-xs text-ink-3 font-mono">{s.folio}</div>
                   </td>
                   <td className="px-4 py-2.5 text-ink-2">{s.advisor_label || s.advisor || '—'}</td>
-                  <td className="px-4 py-2.5 text-right tabular text-ink-2">{formatIndian(s.invested_value)}</td>
+                  <td className="px-4 py-2.5 text-right tabular text-ink-2">{formatIndian(s.net_invested_value)}</td>
                   <td className="px-4 py-2.5 text-right tabular font-medium text-ink">{formatIndian(s.current_value)}</td>
                   <td className={`px-4 py-2.5 text-right tabular font-medium ${s.absolute_gain >= 0 ? 'text-good' : 'text-bad'}`}>
                     {formatIndian(s.absolute_gain)}
