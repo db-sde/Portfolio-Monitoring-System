@@ -3,6 +3,11 @@ __pycache__/
 *.pyc
 .DS_Store
 
+# Local secrets (Neon DATABASE_URL, etc.) — Render gets these as real
+# environment variables in its dashboard, never from a committed file.
+.env
+.env.local
+
 # portfolioiq/backend — auto-generated, never the source of truth
 cas_data.json
 enrichment_cache.json

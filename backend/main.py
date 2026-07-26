@@ -16,9 +16,18 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
+from dotenv import load_dotenv
 from fastapi import BackgroundTasks, FastAPI, File, Form, HTTPException, Query, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
 from starlette.concurrency import run_in_threadpool
+
+# Loads backend/.env into os.environ for local dev (DATABASE_URL, etc.) —
+# a no-op if the file doesn't exist, which is the normal case in
+# production: Render injects real environment variables directly, it
+# doesn't read a .env file. Must run before anything below reads
+# os.environ (config_manager/portfolio/enrichment's *_PATH overrides,
+# and the DATABASE_URL the upcoming Postgres migration will read).
+load_dotenv()
 
 from casparser import read_cas_pdf
 from casparser.enums import TransactionType

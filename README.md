@@ -32,9 +32,28 @@ changed:
 - **Backend** → Render, building `Dockerfile` at this repo's root (unchanged path/config from before)
 - **Frontend** → Vercel, Root Directory `frontend` (unchanged setting from before), now building a real Vite app instead of serving static files — see the Vite-build note in `frontend/vercel.json`'s comments if a push doesn't pick that up automatically
 
-One real tradeoff worth knowing: **Render's filesystem is ephemeral across deploys**. `config.json` is checked into the repo so it survives fine, but `cas_data.json` and the enrichment cache are written at runtime and get wiped on every redeploy — after each push that triggers a new Render build, you'll need to re-upload your statement once. Within a single running deploy (i.e. between your own visits, no new push in between), it persists exactly like running locally would.
+One real tradeoff worth knowing: **Render's filesystem is ephemeral across deploys**. `config.json` is checked into the repo so it survives fine, but `cas_data.json`, `gains_data.json`, and the enrichment cache are written at runtime and get wiped on every redeploy — after each push that triggers a new Render build, you'll need to re-upload your statement once. Groups/investors/ARNs saved through the Settings page at runtime hit the same wall (they're written to the same `config.json` path but outside of a git commit, so a redeploy reverts them to whatever's checked in). Within a single running deploy (i.e. between your own visits, no new push in between), it persists exactly like running locally would.
 
 If you'd rather run it entirely on your own machine instead (e.g. to avoid that redeploy-wipe behavior, or if `mfdata.in` turns out to only be reachable from a residential IP — see below), the local + optional `ngrok` tunnel path below still works unchanged.
+
+**Migrating off the ephemeral disk (in progress):** moving persistence to
+a real database — [Neon](https://neon.tech) Postgres, free tier — so
+none of the above gets wiped on redeploy, and so multiple people's
+statements can accumulate instead of the latest upload overwriting the
+last one. The app doesn't read from Postgres yet; this is the connection
+plumbing landing first.
+
+To set it up:
+1. Create a free project at [neon.tech](https://neon.tech) and copy its
+   connection string (Neon console → your project → **Connect** → the
+   `psql`/pooled connection string, looks like
+   `postgresql://<user>:<password>@<host>.neon.tech/<database>?sslmode=require`).
+2. **Render** → this service → *Environment* → add an environment
+   variable named `DATABASE_URL` with that value.
+3. **Local dev**: `cp backend/.env.example backend/.env` and paste the
+   same connection string in as `DATABASE_URL` — `main.py` loads `.env`
+   automatically via `python-dotenv` (already a dependency). `.env` is
+   gitignored; never commit it.
 
 ## The enrichment reachability caveat (read this first)
 
