@@ -77,6 +77,15 @@ MFDATA_BASE = "https://mfdata.in/api/v1"
 MFAPI_BASE = "https://api.mfapi.in/mf"
 CAPTNEMO_BASE = "https://mf.captnemo.in/kuvera"
 REQUEST_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
+# mfdata.in doesn't fail fast — it holds the connection open and goes
+# silent rather than erroring (see module docstring: Cloudflare 522,
+# origin down), so REQUEST_TIMEOUT's normal 10s is spent waiting on a
+# call that has never once succeeded, for every single scheme, on every
+# enrichment run. A short, dedicated timeout here just means giving up
+# sooner on something already confirmed dead, not treating it as gone
+# for good — if mfdata.in ever comes back, a quick successful response
+# is still well within 3s.
+MFDATA_TIMEOUT = httpx.Timeout(3.0, connect=2.0)
 
 # Risk-free rate for Sharpe/Sortino. 6% reproduces fundlens.lovable.app's
 # displayed Sharpe/Sortino for a real fund (#122639) almost to the second
@@ -173,14 +182,40 @@ def _is_fresh(entry: dict) -> bool:
 
 # ------------------------------------------------------------ fetchers ----
 
-async def _fetch_json(client: httpx.AsyncClient, url: str, **kwargs) -> Optional[Any]:
+async def _fetch_json(
+    client: httpx.AsyncClient, url: str, timeout: httpx.Timeout = REQUEST_TIMEOUT, **kwargs
+) -> Optional[Any]:
     try:
-        resp = await client.get(url, timeout=REQUEST_TIMEOUT, **kwargs)
+        resp = await client.get(url, timeout=timeout, **kwargs)
         if resp.status_code != 200:
             return None
         return resp.json()
     except (httpx.HTTPError, ValueError):
         return None
+
+
+FETCH_RETRY_ATTEMPTS = 3
+FETCH_RETRY_DELAY_SECONDS = 1.0
+
+
+async def _fetch_json_retrying(client: httpx.AsyncClient, url: str, **kwargs) -> Optional[Any]:
+    """Like _fetch_json, but retries a few times on failure. For mfapi.in
+    and captnemo specifically — both confirmed reachable in general, but
+    observed live to intermittently fail or return partial data when hit
+    concurrently for several schemes at once (a portfolio's whole
+    enrichment batch fires every scheme's requests via asyncio.gather).
+    Deliberately NOT used for the mfdata.in probe in _enrich_one: that
+    host is confirmed permanently down (Cloudflare 522, see module
+    docstring), so retrying it would just add latency to every single
+    scheme for a call that's never going to succeed."""
+    result = None
+    for attempt in range(FETCH_RETRY_ATTEMPTS):
+        result = await _fetch_json(client, url, **kwargs)
+        if result is not None:
+            return result
+        if attempt < FETCH_RETRY_ATTEMPTS - 1:
+            await asyncio.sleep(FETCH_RETRY_DELAY_SECONDS)
+    return result
 
 
 def _num(value: Any) -> Optional[float]:
@@ -293,14 +328,14 @@ async def _find_fresh_alternate(
     query = _search_query_from_name(scheme_name)
     if not query:
         return None
-    candidates = await _fetch_json(client, f"{MFAPI_BASE}/search", params={"q": query})
+    candidates = await _fetch_json_retrying(client, f"{MFAPI_BASE}/search", params={"q": query})
     if not candidates:
         return None
     for candidate in candidates[:MAX_ALTERNATE_CANDIDATES]:
         code = candidate.get("schemeCode")
         if code is None:
             continue
-        raw = await _fetch_json(client, f"{MFAPI_BASE}/{code}")
+        raw = await _fetch_json_retrying(client, f"{MFAPI_BASE}/{code}")
         if not raw:
             continue
         meta = raw.get("meta", {})
@@ -513,7 +548,7 @@ async def _enrich_one(
 ) -> dict:
     sources_used = []
 
-    mfdata_raw = await _fetch_json(client, f"{MFDATA_BASE}/schemes/{amfi_code}")
+    mfdata_raw = await _fetch_json(client, f"{MFDATA_BASE}/schemes/{amfi_code}", timeout=MFDATA_TIMEOUT)
     fields = dict(ENRICHED_FIELD_DEFAULTS)
     fields["returns"] = dict(ENRICHED_FIELD_DEFAULTS["returns"])
     fields["risk"] = dict(ENRICHED_FIELD_DEFAULTS["risk"])
@@ -521,7 +556,7 @@ async def _enrich_one(
         fields.update(_extract_mfdata_fields(mfdata_raw))
         sources_used.append("mfdata.in")
 
-    mfapi_raw = await _fetch_json(client, f"{MFAPI_BASE}/{amfi_code}")
+    mfapi_raw = await _fetch_json_retrying(client, f"{MFAPI_BASE}/{amfi_code}")
     nav_history = _extract_mfapi_nav_history(mfapi_raw) if mfapi_raw else []
     if not nav_history or _is_stale(nav_history[-1]["date"]):
         # The AMFI code the CAS statement embeds has stopped publishing
@@ -573,7 +608,7 @@ async def _enrich_one(
     # against a known fund's real AUM, and a wrong number dressed up as
     # "corpus_cr" is worse than a blank field.
     if isin:
-        cn_raw = await _fetch_json(client, f"{CAPTNEMO_BASE}/{isin}", follow_redirects=True)
+        cn_raw = await _fetch_json_retrying(client, f"{CAPTNEMO_BASE}/{isin}", follow_redirects=True)
         cn_entry = cn_raw[0] if isinstance(cn_raw, list) and cn_raw else cn_raw
         if isinstance(cn_entry, dict):
             fields["category"] = fields.get("category") or cn_entry.get("fund_category") or cn_entry.get("category")
@@ -592,6 +627,36 @@ async def _enrich_one(
     fields["enrichment_source"] = "+".join(sources_used) if sources_used else "failed"
     fields["_nav_history"] = nav_history  # not part of the public `enriched` shape; consumed by portfolio.py
     return fields
+
+
+BENCHMARK_CACHE_KEY = "__benchmark_nav_history__"
+
+
+async def _get_benchmark_nav_history(client: httpx.AsyncClient, cache: dict) -> list[dict]:
+    """The shared benchmark series (see BENCHMARK_AMFI_CODE) is one
+    request that every scheme's alpha/beta in this batch depends on —
+    confirmed live (not hypothetical): the exact same fetch, run seconds
+    apart, failed once and succeeded once, because mfapi.in is a free
+    best-effort API with no uptime guarantee. Without this fallback, that
+    one blip nulled out alpha/beta for every fund in the batch, and
+    because the per-scheme cache has its own 24h TTL, the null result
+    stuck around for a full day instead of just retrying next time.
+    _fetch_json_retrying already covers the "retry a few times" part;
+    this adds the next layer down — falling back to whatever was cached
+    from the last successful fetch, regardless of its own age, since a
+    day-old benchmark series is still far better for beta/alpha than
+    none at all (the index barely moves day to day relative to the 3y
+    window these ratios use anyway)."""
+    raw = await _fetch_json_retrying(client, f"{MFAPI_BASE}/{BENCHMARK_AMFI_CODE}")
+    history = _extract_mfapi_nav_history(raw) if raw else []
+    if history:
+        cache[BENCHMARK_CACHE_KEY] = {
+            "cached_at": datetime.now(timezone.utc).isoformat(),
+            "data": history,
+        }
+        return history
+    stale = cache.get(BENCHMARK_CACHE_KEY)
+    return stale["data"] if stale else []
 
 
 async def enrich_schemes(schemes: list[dict]) -> dict[str, dict]:
@@ -617,8 +682,7 @@ async def enrich_schemes(schemes: list[dict]) -> dict[str, dict]:
             # Fetched once per batch, not once per scheme: it's the same
             # series for every fund, and this way a portfolio with 20
             # holdings costs 1 extra request, not 20.
-            benchmark_raw = await _fetch_json(client, f"{MFAPI_BASE}/{BENCHMARK_AMFI_CODE}")
-            benchmark_nav_history = _extract_mfapi_nav_history(benchmark_raw) if benchmark_raw else []
+            benchmark_nav_history = await _get_benchmark_nav_history(client, cache)
             fetched = await asyncio.gather(*[
                 _enrich_one(client, s["amfi"], s.get("isin"), s.get("scheme", ""), benchmark_nav_history)
                 for s in to_fetch
