@@ -49,6 +49,25 @@ def _num(value: Any) -> float:
         return 0.0
 
 
+def _latest_nav(nav_history: Optional[list[dict]]) -> tuple[Optional[str], Optional[float]]:
+    """(iso_date, nav) for the most recent entry in a scheme's NAV
+    history (enrichment.py's mfapi.in-sourced series) — picked by parsed
+    date rather than trusting list order, same reasoning as
+    enrichment.py's own NAV-history sort. Returned as ISO regardless of
+    mfapi.in's own DD-MM-YYYY format, same reasoning as enrichment.py's
+    nav_as_of: one unambiguous shape for every downstream consumer.
+    (None, None) if there's nothing usable, e.g. enrichment hasn't run
+    yet for this scheme."""
+    best_date = None
+    best_nav = None
+    for row in nav_history or []:
+        d = calc._parse_date(row.get("date"))
+        nav = _num(row.get("nav")) or None
+        if d is not None and nav and (best_date is None or d > best_date):
+            best_date, best_nav = d, nav
+    return (best_date.isoformat() if best_date else None), best_nav
+
+
 _DEFAULT_CAS_DATA_PATH = Path(__file__).resolve().parent / "cas_data.json"
 
 
@@ -124,6 +143,11 @@ def build_scheme_records(
             current_units = _num(scheme.get("close"))
             valuation_date = valuation.get("date")
 
+            amfi = scheme.get("amfi")
+            enriched_raw = dict(enrichment_map.get(amfi, {}))
+            nav_history = enriched_raw.pop("_nav_history", None)
+            enriched = enriched_raw or None
+
             invested_value = sum(
                 abs(_num(t.get("amount")))
                 for t in transactions
@@ -159,10 +183,29 @@ def build_scheme_records(
             advisor = scheme.get("advisor")
             group_name, investor_name = cfgm.find_owner_for_arn(config, advisor) if advisor else (None, None)
 
-            amfi = scheme.get("amfi")
-            enriched_raw = dict(enrichment_map.get(amfi, {}))
-            nav_history = enriched_raw.pop("_nav_history", None)
-            enriched = enriched_raw or None
+            # "Live" value: the CAS statement's own current_value is only
+            # as fresh as its valuation_date, which can be months old by
+            # the time someone's looking at the dashboard. If units are
+            # still held and enrichment has a newer NAV than that (via
+            # mfapi.in — the same series build_fund_summary uses), value
+            # those same units at today's NAV instead — units held don't
+            # change between the statement and today unless there's been
+            # a transaction we don't know about, which this can't detect.
+            # Falls back to the statement's own figures when there's
+            # nothing fresher to use, so the frontend can always read the
+            # live_* fields without a None-check for "not enriched yet".
+            live_nav_date, live_nav = _latest_nav(nav_history)
+            if current_units > 0 and live_nav is not None:
+                live_value = round(current_units * live_nav, 2)
+                live_gain = round(live_value - net_invested_value, 2)
+                live_gain_pct = round(live_gain / net_invested_value * 100, 2) if net_invested_value else None
+                live_xirr = calc.calculate_xirr(transactions, live_value, live_nav_date)
+            else:
+                live_nav = live_nav_date = None
+                live_value = current_value
+                live_gain = round(absolute_gain, 2)
+                live_gain_pct = absolute_gain_pct
+                live_xirr = xirr_value
 
             records.append({
                 "folio": folio.get("folio"),
@@ -186,6 +229,12 @@ def build_scheme_records(
                 "absolute_gain_pct": absolute_gain_pct,
                 "xirr": xirr_value,
                 "valuation_date": valuation_date,
+                "live_nav": live_nav,
+                "live_nav_date": live_nav_date,
+                "live_value": live_value,
+                "live_gain": live_gain,
+                "live_gain_pct": live_gain_pct,
+                "live_xirr": live_xirr,
                 "transactions": transactions,
                 "enriched": enriched,
                 "_nav_history": nav_history or [],
