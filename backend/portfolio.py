@@ -334,6 +334,7 @@ def build_fund_summary(records: list[dict]) -> dict:
             "smallcap_pct": enriched.get("smallcap_pct"),
             "returns": enriched.get("returns") or {"1m": None, "3m": None, "6m": None, "1y": None, "2y": None, "3y": None},
             "risk": enriched.get("risk") or {"std_dev": None, "sharpe": None, "sortino": None, "max_drawdown": None, "alpha": None, "beta": None},
+            "nav_as_of": enriched.get("nav_as_of"),
         }
     return {"funds": list(seen.values())}
 

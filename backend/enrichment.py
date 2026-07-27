@@ -65,6 +65,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -108,9 +109,24 @@ MIN_RISK_RATIO_DAYS = 30  # below this, an "annualised" figure is just noise
 BENCHMARK_AMFI_CODE = "120716"  # UTI Nifty 50 Index Fund - Direct - Growth
 BENCHMARK_LABEL = "Nifty 50 (via UTI Nifty 50 Index Fund - Direct Growth)"
 
+# AMC mergers/renames (HSBC absorbing L&T's schemes in Nov 2022 is a
+# confirmed real example — verified live: AMFI code 120069 froze at its
+# Nov-2022 NAV while the same fund kept trading under new code 151130)
+# routinely leave the OLD AMFI code sitting in mfapi.in's database,
+# still returning 200 with real-looking history, just permanently frozen
+# on whatever date the recode happened. A CAS statement's own embedded
+# AMFI code can point at that frozen code, silently pinning every
+# "current" return/risk figure to a multi-year-old snapshot instead of
+# today. STALE_NAV_DAYS is deliberately generous (a long weekend plus one
+# holiday is ~4 days) so this only fires for a code that's genuinely gone
+# quiet, not one that's merely a few days behind a slow mfapi.in update.
+STALE_NAV_DAYS = 10
+MAX_ALTERNATE_CANDIDATES = 10
+
 ENRICHED_FIELD_DEFAULTS = {
     "corpus_cr": None, "largecap_pct": None, "midcap_pct": None, "smallcap_pct": None,
     "benchmark": None, "category": None, "expense_ratio": None, "fund_manager": None,
+    "nav_as_of": None,
     "returns": {"1m": None, "3m": None, "6m": None, "1y": None, "2y": None, "3y": None},
     "risk": {"std_dev": None, "sharpe": None, "sortino": None, "max_drawdown": None, "alpha": None, "beta": None},
 }
@@ -244,6 +260,55 @@ def _parse_nav_date(s: str):
             return datetime.strptime(s, fmt).date()
         except ValueError:
             continue
+    return None
+
+
+def _is_stale(latest_date_str: Optional[str]) -> bool:
+    d = _parse_nav_date(latest_date_str) if latest_date_str else None
+    if d is None:
+        return True
+    return (datetime.now(timezone.utc).date() - d).days > STALE_NAV_DAYS
+
+
+def _search_query_from_name(scheme_name: str) -> str:
+    """Truncate a CAS scheme name down to the fund-family name mfapi.in's
+    own search matches against — "HSBC Small Cap Fund - Direct Plan -
+    Growth" -> "HSBC Small Cap Fund". Stopping at the first "-"/"(" strips
+    every plan/option qualifier (Direct/Regular/Growth/IDCW/...) without
+    having to enumerate them all."""
+    return re.split(r"\s*-\s*|\(", scheme_name or "")[0].strip()
+
+
+async def _find_fresh_alternate(
+    client: httpx.AsyncClient, scheme_name: str, isin: Optional[str]
+) -> Optional[dict]:
+    """Recovery path for a scheme whose CAS-embedded AMFI code has gone
+    stale (see STALE_NAV_DAYS): search mfapi.in by fund name for
+    candidates, then accept only the one whose own ISIN — the one
+    identifier that survives an AMC recode — matches what the CAS
+    statement actually says for this holding. Returns the full mfapi.in
+    payload for the fresh candidate, or None if nothing matched."""
+    if not isin:
+        return None
+    query = _search_query_from_name(scheme_name)
+    if not query:
+        return None
+    candidates = await _fetch_json(client, f"{MFAPI_BASE}/search", params={"q": query})
+    if not candidates:
+        return None
+    for candidate in candidates[:MAX_ALTERNATE_CANDIDATES]:
+        code = candidate.get("schemeCode")
+        if code is None:
+            continue
+        raw = await _fetch_json(client, f"{MFAPI_BASE}/{code}")
+        if not raw:
+            continue
+        meta = raw.get("meta", {})
+        if isin not in (meta.get("isin_growth"), meta.get("isin_div_reinvestment")):
+            continue
+        history = _extract_mfapi_nav_history(raw)
+        if history and not _is_stale(history[-1]["date"]):
+            return raw
     return None
 
 
@@ -457,14 +522,28 @@ async def _enrich_one(
         sources_used.append("mfdata.in")
 
     mfapi_raw = await _fetch_json(client, f"{MFAPI_BASE}/{amfi_code}")
-    nav_history: list[dict] = []
+    nav_history = _extract_mfapi_nav_history(mfapi_raw) if mfapi_raw else []
+    if not nav_history or _is_stale(nav_history[-1]["date"]):
+        # The AMFI code the CAS statement embeds has stopped publishing
+        # NAVs — almost always an old code an AMC merger/rename retired
+        # (see STALE_NAV_DAYS docstring). Try to recover the fund's real,
+        # currently-updating code via its ISIN before giving up on it.
+        alt_raw = await _find_fresh_alternate(client, scheme_name, isin)
+        if alt_raw:
+            mfapi_raw = alt_raw
+            nav_history = _extract_mfapi_nav_history(mfapi_raw)
+
     computed_std_dev: Optional[float] = None
     if mfapi_raw:
         meta = mfapi_raw.get("meta", {})
         if not fields.get("category"):
             fields["category"] = meta.get("scheme_category")
-        nav_history = _extract_mfapi_nav_history(mfapi_raw)
         sources_used.append("mfapi.in")
+        # Stored as ISO regardless of mfapi.in's own DD-MM-YYYY format —
+        # every consumer (frontend date parsing, JSON) can rely on one
+        # unambiguous shape rather than re-detecting it downstream.
+        latest_parsed = _parse_nav_date(nav_history[-1]["date"]) if nav_history else None
+        fields["nav_as_of"] = latest_parsed.isoformat() if latest_parsed else None
         # mfdata.in is the only source with pre-computed returns and it is
         # unreachable in practice (see module docstring) — compute our own
         # from the NAV history we just fetched rather than leave every
