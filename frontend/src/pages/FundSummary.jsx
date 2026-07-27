@@ -2,8 +2,11 @@ import { useEffect, useState } from 'react'
 import { api } from '../api'
 import HeatCell from '../components/HeatCell'
 import SkeletonTable from '../components/SkeletonTable'
+import { formatPct } from '../components/IndianNumber'
 
 const PERIODS = ['1m', '3m', '6m', '1y', '2y', '3y']
+
+const formatRatio = (n) => (n == null || Number.isNaN(n) ? '—' : n.toFixed(2))
 
 export default function FundSummary({ filters }) {
   const [data, setData] = useState(null)
@@ -41,6 +44,12 @@ export default function FundSummary({ filters }) {
               <th className="text-right px-3 py-2">Corpus (₹Cr)</th>
               <th className="text-right px-3 py-2">Large/Mid/Small</th>
               {PERIODS.map((p) => <th key={p} className="text-right px-3 py-2">{p}</th>)}
+              <th className="text-right px-3 py-2">Vol (3Y)</th>
+              <th className="text-right px-3 py-2">Sharpe (3Y)</th>
+              <th className="text-right px-3 py-2">Sortino (3Y)</th>
+              <th className="text-right px-3 py-2">Max DD</th>
+              <th className="text-right px-3 py-2">Beta</th>
+              <th className="text-right px-3 py-2">Alpha</th>
             </tr>
           </thead>
           <tbody>
@@ -52,16 +61,22 @@ export default function FundSummary({ filters }) {
                   {f.largecap_pct != null ? `${f.largecap_pct}/${f.midcap_pct}/${f.smallcap_pct}` : '—'}
                 </td>
                 {PERIODS.map((p) => <HeatCell key={p} value={f.returns?.[p]} />)}
+                <td className="px-3 py-2 text-right tabular text-ink-2">{formatPct(f.risk?.std_dev)}</td>
+                <td className="px-3 py-2 text-right tabular text-ink-2">{formatRatio(f.risk?.sharpe)}</td>
+                <td className="px-3 py-2 text-right tabular text-ink-2">{formatRatio(f.risk?.sortino)}</td>
+                <HeatCell value={f.risk?.max_drawdown} />
+                <td className="px-3 py-2 text-right tabular text-ink-2">{formatRatio(f.risk?.beta)}</td>
+                <HeatCell value={f.risk?.alpha} />
               </tr>
             ))}
             {funds.length === 0 && (
-              <tr><td colSpan={3 + PERIODS.length} className="px-4 py-8 text-center text-ink-3">No held funds match these filters.</td></tr>
+              <tr><td colSpan={9 + PERIODS.length} className="px-4 py-8 text-center text-ink-3">No held funds match these filters.</td></tr>
             )}
           </tbody>
         </table>
       </div>
       <div className="px-4 py-3 text-xs text-ink-3 border-t border-line-soft">
-        Returns and cap-allocation data come from mfdata.in — if that source isn't reachable, these cells show "—" rather than a guess.
+        Returns, volatility, Sharpe, Sortino, max drawdown, and alpha/beta are computed from mfapi.in's NAV history (mfdata.in has been unreachable) — beta/alpha use a Nifty 50 index fund as a benchmark proxy, since no free source publishes raw index values. Cap-allocation still needs a source we don't have, so those cells show "—" rather than a guess.
       </div>
     </div>
   )

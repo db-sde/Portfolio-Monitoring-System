@@ -30,14 +30,34 @@ clean TLS alert. That pattern (as opposed to a fast 403) is consistent
 with fingerprint-based bot mitigation (e.g. JA3) rather than a simple
 IP block, which means retrying with different headers/User-Agents won't
 help, and it will almost certainly behave the same from Render's
-datacenter IPs as it did from this sandbox. Cap-allocation % and
-sharpe/alpha/beta specifically have NO other free source currently wired
-in here — mfapi.in doesn't have them and neither does captnemo — so
-those fields staying null is an honest gap, not a bug; getting them for
-real would need a paid data vendor. Everything else this module claims
-to provide (returns, expense ratio, fund manager, category, a volatility
-figure standing in for std_dev) now comes from mfapi.in/captnemo, both
-confirmed reachable, and works regardless of mfdata.in's availability.
+datacenter IPs as it did from this sandbox. Re-confirmed again later via
+a real browser load: Cloudflare itself returns error 522 ("connection
+timed out") — the origin behind Cloudflare is down, not just blocking
+bots, so this isn't expected to self-resolve on retry.
+
+Cap-allocation % is still an honest gap — checked directly against
+captnemo/Kuvera's own documented OpenAPI schema for fund_schemes.json,
+no cap/sector/holdings field exists there either, and no other free
+source has it. Getting real cap-allocation would need actual portfolio
+holdings (stock-by-stock), which no free API publishes — the only path
+would be scraping each AMC's own monthly SEBI-mandated portfolio
+disclosure (~40 different sites/formats) or a paid data vendor.
+
+Sharpe/sortino/max-drawdown/volatility/alpha/beta are NOT a gap, as of
+this revision: fundlens.lovable.app (an independent NAV-analytics site,
+confirmed via its own footer credit to run entirely off mfapi.in) had
+its displayed risk figures for two real funds reproduced closely by
+computing them straight from NAV history mfapi.in already gives us for
+free — see _compute_risk_ratios. Alpha/beta specifically need a
+benchmark *index* return series, which no free source publishes raw
+either (checked directly against Kuvera's own OpenAPI spec — no index
+data field there survives to a public, no-auth endpoint); the workaround
+is BENCHMARK_AMFI_CODE, a NIFTY 50 index *fund*'s own NAV history via
+the same mfapi.in call already used for everything else — the same trick
+fundlens.lovable.app itself offers as a selectable benchmark. Everything
+this module provides (returns, expense ratio, fund manager, category,
+risk ratios) now comes from mfapi.in/captnemo, both confirmed reachable,
+and works regardless of mfdata.in's availability.
 """
 
 from __future__ import annotations
@@ -57,11 +77,42 @@ MFAPI_BASE = "https://api.mfapi.in/mf"
 CAPTNEMO_BASE = "https://mf.captnemo.in/kuvera"
 REQUEST_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 
+# Risk-free rate for Sharpe/Sortino. 6% reproduces fundlens.lovable.app's
+# displayed Sharpe/Sortino for a real fund (#122639) almost to the second
+# decimal place — verified against its live figures, not just picked as a
+# plausible G-Sec proxy. Configurable since it's a moving target regardless.
+RISK_FREE_RATE = float(os.environ.get("RISK_FREE_RATE_PCT", "6.0")) / 100
+TRADING_DAYS_PER_YEAR = 252
+# Sharpe/Sortino/volatility use a trailing window, same convention as
+# RETURN_PERIODS["3y"] below — long enough to smooth out noise, short
+# enough to reflect the fund's current risk profile rather than its whole
+# history. Max drawdown deliberately does NOT use this window (see
+# _max_drawdown_pct) — a fund's worst-ever decline is the useful figure.
+RISK_RATIO_WINDOW_DAYS = 1095
+MIN_RISK_RATIO_DAYS = 30  # below this, an "annualised" figure is just noise
+
+# Alpha/beta need a benchmark *index* return series, and no free source
+# here (mfapi.in, captnemo/Kuvera's own documented fund_schemes response —
+# checked directly against its OpenAPI spec, no index/holdings field
+# exists) actually publishes raw NIFTY index values for free. The
+# workaround, same one fundlens.lovable.app itself offers as a selectable
+# benchmark ("Nifty 50 TRI (UTI Nifty 50 Index Direct)"): a NIFTY 50
+# *index fund* is itself just another AMFI scheme, so its own NAV history
+# is available through the exact same mfapi.in call already used for
+# every other fund — no new integration, no new failure mode. It's a
+# proxy (tracking error, TER drag) rather than the raw index, but it's
+# the only free option that actually exists, and it's the same
+# proxy a working reference site relies on. UTI's Direct plan chosen for
+# its long history (back to 2013), giving a real trailing window even
+# for schemes needing a full 3y lookback.
+BENCHMARK_AMFI_CODE = "120716"  # UTI Nifty 50 Index Fund - Direct - Growth
+BENCHMARK_LABEL = "Nifty 50 (via UTI Nifty 50 Index Fund - Direct Growth)"
+
 ENRICHED_FIELD_DEFAULTS = {
     "corpus_cr": None, "largecap_pct": None, "midcap_pct": None, "smallcap_pct": None,
     "benchmark": None, "category": None, "expense_ratio": None, "fund_manager": None,
     "returns": {"1m": None, "3m": None, "6m": None, "1y": None, "2y": None, "3y": None},
-    "risk": {"std_dev": None, "sharpe": None, "alpha": None, "beta": None},
+    "risk": {"std_dev": None, "sharpe": None, "sortino": None, "max_drawdown": None, "alpha": None, "beta": None},
 }
 
 
@@ -235,7 +286,166 @@ def _compute_trailing_returns(nav_history: list[dict]) -> dict[str, Optional[flo
     return out
 
 
-async def _enrich_one(client: httpx.AsyncClient, amfi_code: str, isin: Optional[str], scheme_name: str) -> dict:
+def _daily_returns(nav_history: list[dict]) -> list[float]:
+    """Day-over-day simple returns between consecutive published NAVs
+    (already sorted oldest-first). Consecutive-*row* based rather than
+    consecutive-*calendar-day*: a gap in the series (weekends, holidays —
+    mfapi.in only has rows for days the AMC actually published a NAV) just
+    means that pair's return spans a couple of days, same as every other
+    fund tracker's daily-return series."""
+    returns = []
+    prev = None
+    for row in nav_history:
+        nav = row["nav"]
+        if prev and prev > 0 and nav > 0:
+            returns.append(nav / prev - 1)
+        prev = nav
+    return returns
+
+
+def _std_dev(values: list[float]) -> Optional[float]:
+    """Sample standard deviation (n-1 denominator)."""
+    n = len(values)
+    if n < 2:
+        return None
+    mean = sum(values) / n
+    variance = sum((v - mean) ** 2 for v in values) / (n - 1)
+    return variance ** 0.5
+
+
+def _downside_deviation(daily_returns: list[float]) -> Optional[float]:
+    """RMS of daily returns below a 0% target, denominator = count of
+    negative days only. (Sortino's own original definition divides by the
+    total period count instead — the choice here isn't textbook-purest,
+    it's "verified to reproduce fundlens.lovable.app's live Sortino
+    figure for a real fund almost exactly," which matters more for a
+    number users will eyeball next to that site.)"""
+    negative = [r for r in daily_returns if r < 0]
+    if len(negative) < 2:
+        return None
+    return (sum(r ** 2 for r in negative) / len(negative)) ** 0.5
+
+
+def _max_drawdown_pct(nav_history: list[dict]) -> Optional[float]:
+    """Largest peak-to-trough decline across the *full* available NAV
+    history (since inception), not just the trailing risk-ratio window —
+    a fund's worst historical drawdown is the useful figure, and limiting
+    it to 3y would hide anything before that."""
+    if len(nav_history) < 2:
+        return None
+    peak = nav_history[0]["nav"]
+    worst = 0.0
+    for row in nav_history:
+        nav = row["nav"]
+        if nav > peak:
+            peak = nav
+        elif peak > 0:
+            worst = min(worst, (nav - peak) / peak)
+    return round(worst * 100, 2)
+
+
+def _paired_daily_returns(a_history: list[dict], b_history: list[dict]) -> tuple[list[float], list[float]]:
+    """Daily returns for two NAV series, aligned to dates present in BOTH
+    (inner join) and kept strictly paired index-for-index — a fund and
+    its benchmark index fund don't necessarily publish NAVs on exactly
+    the same set of days, and beta/covariance is meaningless if the two
+    lists drift out of alignment with each other."""
+    a_by_date = {_parse_nav_date(r["date"]): r["nav"] for r in a_history}
+    b_by_date = {_parse_nav_date(r["date"]): r["nav"] for r in b_history}
+    common_dates = sorted(d for d in a_by_date if d is not None and d in b_by_date)
+    a_ret: list[float] = []
+    b_ret: list[float] = []
+    prev_a = prev_b = None
+    for d in common_dates:
+        a, b = a_by_date[d], b_by_date[d]
+        if prev_a and prev_a > 0 and a > 0 and prev_b and prev_b > 0 and b > 0:
+            a_ret.append(a / prev_a - 1)
+            b_ret.append(b / prev_b - 1)
+        prev_a, prev_b = a, b
+    return a_ret, b_ret
+
+
+def _beta(fund_daily: list[float], bench_daily: list[float]) -> Optional[float]:
+    n = len(fund_daily)
+    if n < MIN_RISK_RATIO_DAYS or len(bench_daily) != n:
+        return None
+    mean_f = sum(fund_daily) / n
+    mean_b = sum(bench_daily) / n
+    covariance = sum((f - mean_f) * (b - mean_b) for f, b in zip(fund_daily, bench_daily)) / (n - 1)
+    variance_b = sum((b - mean_b) ** 2 for b in bench_daily) / (n - 1)
+    if not variance_b:
+        return None
+    return covariance / variance_b
+
+
+def _compute_risk_ratios(
+    nav_history: list[dict], benchmark_nav_history: Optional[list[dict]] = None
+) -> dict[str, Optional[float]]:
+    """Sharpe, Sortino, annualised volatility (std_dev), max drawdown, and
+    (when a benchmark series is supplied) beta/alpha — all derived purely
+    from NAV history mfapi.in already gives us for free. Sharpe/Sortino/
+    volatility approach is the same fundlens.lovable.app uses (confirmed
+    via its own "Data from MFAPI.in" footer credit and by reproducing its
+    displayed figures for two real funds); beta/alpha use an index *fund*
+    as a stand-in benchmark for the same reason (see BENCHMARK_AMFI_CODE).
+    No dedicated ratios endpoint exists on any free source, so all of
+    this is computed with standard formulas instead of staying null."""
+    out: dict[str, Optional[float]] = {
+        "std_dev": None, "sharpe": None, "sortino": None, "max_drawdown": None,
+        "alpha": None, "beta": None,
+    }
+    if len(nav_history) < 2:
+        return out
+
+    out["max_drawdown"] = _max_drawdown_pct(nav_history)
+
+    latest_date = _parse_nav_date(nav_history[-1]["date"])
+    if latest_date is None:
+        return out
+    window_start = latest_date - timedelta(days=RISK_RATIO_WINDOW_DAYS)
+    window = [r for r in nav_history if _parse_nav_date(r["date"]) >= window_start]
+    daily = _daily_returns(window)
+    if len(daily) < MIN_RISK_RATIO_DAYS:
+        return out
+
+    vol = _std_dev(daily)
+    if not vol:
+        return out
+    annual_vol_pct = vol * (TRADING_DAYS_PER_YEAR ** 0.5) * 100
+    out["std_dev"] = round(annual_vol_pct, 2)
+
+    # Reuse the 3y CAGR already computed for the `returns` block rather
+    # than deriving a second, possibly-inconsistent annualised return
+    # figure from the daily series here.
+    trailing_return = _compute_trailing_returns(nav_history).get("3y")
+    if trailing_return is None:
+        return out
+    excess = trailing_return / 100 - RISK_FREE_RATE
+    out["sharpe"] = round(excess / (annual_vol_pct / 100), 2)
+
+    downside_dev = _downside_deviation(daily)
+    if downside_dev:
+        annual_downside_pct = downside_dev * (TRADING_DAYS_PER_YEAR ** 0.5) * 100
+        out["sortino"] = round(excess / (annual_downside_pct / 100), 2)
+
+    if benchmark_nav_history:
+        bench_window = [r for r in benchmark_nav_history if _parse_nav_date(r["date"]) >= window_start]
+        fund_paired, bench_paired = _paired_daily_returns(window, bench_window)
+        beta = _beta(fund_paired, bench_paired)
+        if beta is not None:
+            out["beta"] = round(beta, 2)
+            bench_return = _compute_trailing_returns(benchmark_nav_history).get("3y")
+            if bench_return is not None:
+                expected = RISK_FREE_RATE + beta * (bench_return / 100 - RISK_FREE_RATE)
+                out["alpha"] = round((trailing_return / 100 - expected) * 100, 2)
+
+    return out
+
+
+async def _enrich_one(
+    client: httpx.AsyncClient, amfi_code: str, isin: Optional[str], scheme_name: str,
+    benchmark_nav_history: Optional[list[dict]] = None,
+) -> dict:
     sources_used = []
 
     mfdata_raw = await _fetch_json(client, f"{MFDATA_BASE}/schemes/{amfi_code}")
@@ -248,6 +458,7 @@ async def _enrich_one(client: httpx.AsyncClient, amfi_code: str, isin: Optional[
 
     mfapi_raw = await _fetch_json(client, f"{MFAPI_BASE}/{amfi_code}")
     nav_history: list[dict] = []
+    computed_std_dev: Optional[float] = None
     if mfapi_raw:
         meta = mfapi_raw.get("meta", {})
         if not fields.get("category"):
@@ -260,6 +471,19 @@ async def _enrich_one(client: httpx.AsyncClient, amfi_code: str, isin: Optional[
         # fund summary row blank.
         if not any(fields["returns"].values()):
             fields["returns"] = _compute_trailing_returns(nav_history)
+        # Same story for sharpe/sortino/max_drawdown: nothing else here
+        # provides them, so they always come from this computation.
+        # std_dev is held back here rather than applied straight away —
+        # captnemo's own volatility figure (below) should win over this
+        # approximation when it's available; computed_std_dev is only
+        # applied as the last-resort fallback, after that block runs.
+        computed_risk = _compute_risk_ratios(nav_history, benchmark_nav_history)
+        computed_std_dev = computed_risk.get("std_dev")
+        for key in ("sharpe", "sortino", "max_drawdown", "alpha", "beta"):
+            if fields["risk"].get(key) is None:
+                fields["risk"][key] = computed_risk.get(key)
+        if fields["risk"].get("beta") is not None and not fields.get("benchmark"):
+            fields["benchmark"] = BENCHMARK_LABEL
 
     # captnemo (Kuvera's backing API) turns out to carry real per-scheme
     # analytics keyed by ISIN — category, expense ratio, fund manager(s),
@@ -279,6 +503,11 @@ async def _enrich_one(client: httpx.AsyncClient, amfi_code: str, isin: Optional[
             if fields["risk"].get("std_dev") is None:
                 fields["risk"]["std_dev"] = _num(cn_entry.get("volatility"))
             sources_used.append("captnemo")
+
+    # Last-resort std_dev fallback: mfdata (never) > captnemo's real
+    # figure (above) > our own NAV-derived approximation.
+    if fields["risk"].get("std_dev") is None:
+        fields["risk"]["std_dev"] = computed_std_dev
 
     fields["enriched_at"] = datetime.now(timezone.utc).isoformat()
     fields["enrichment_source"] = "+".join(sources_used) if sources_used else "failed"
@@ -306,8 +535,13 @@ async def enrich_schemes(schemes: list[dict]) -> dict[str, dict]:
 
     if to_fetch:
         async with httpx.AsyncClient() as client:
+            # Fetched once per batch, not once per scheme: it's the same
+            # series for every fund, and this way a portfolio with 20
+            # holdings costs 1 extra request, not 20.
+            benchmark_raw = await _fetch_json(client, f"{MFAPI_BASE}/{BENCHMARK_AMFI_CODE}")
+            benchmark_nav_history = _extract_mfapi_nav_history(benchmark_raw) if benchmark_raw else []
             fetched = await asyncio.gather(*[
-                _enrich_one(client, s["amfi"], s.get("isin"), s.get("scheme", ""))
+                _enrich_one(client, s["amfi"], s.get("isin"), s.get("scheme", ""), benchmark_nav_history)
                 for s in to_fetch
             ])
         for scheme, data in zip(to_fetch, fetched):
