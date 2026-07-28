@@ -15,7 +15,7 @@ Source priority (spec section 7), re-verified live and adjusted below:
                   the source of every trailing-return figure this module
                   produces: computed here directly from the NAV history,
                   point-to-point for <1y windows and CAGR for 1y/2y/3y —
-                  see RETURN_PERIODS / _compute_trailing_returns.
+                  see RETURN_DAY_PERIODS/RETURN_YEAR_PERIODS / _compute_trailing_returns.
   3. captnemo   - queried unconditionally (by ISIN), not just as a
                   category fallback: it actually carries expense ratio,
                   fund manager(s), and a volatility figure per scheme, on
@@ -93,11 +93,14 @@ MFDATA_TIMEOUT = httpx.Timeout(3.0, connect=2.0)
 # plausible G-Sec proxy. Configurable since it's a moving target regardless.
 RISK_FREE_RATE = float(os.environ.get("RISK_FREE_RATE_PCT", "6.0")) / 100
 TRADING_DAYS_PER_YEAR = 252
-# Sharpe/Sortino/volatility use a trailing window, same convention as
-# RETURN_PERIODS["3y"] below — long enough to smooth out noise, short
-# enough to reflect the fund's current risk profile rather than its whole
-# history. Max drawdown deliberately does NOT use this window (see
-# _max_drawdown_pct) — a fund's worst-ever decline is the useful figure.
+# Sharpe/Sortino/volatility use a trailing ~3y window (a flat day count
+# is fine here — unlike RETURN_YEAR_PERIODS below, this is an internal
+# window size, not a return figure being compared against another
+# tracker's exact-calendar-date convention) — long enough to smooth out
+# noise, short enough to reflect the fund's current risk profile rather
+# than its whole history. Max drawdown deliberately does NOT use this
+# window (see _max_drawdown_pct) — a fund's worst-ever decline is the
+# useful figure.
 RISK_RATIO_WINDOW_DAYS = 1095
 MIN_RISK_RATIO_DAYS = 30  # below this, an "annualised" figure is just noise
 
@@ -278,15 +281,34 @@ def _extract_mfapi_nav_history(raw: dict) -> list[dict]:
     return out
 
 
-# Period -> (days-back, whether to annualise as CAGR). Point-to-point %
-# for sub-1-year windows, CAGR for 1y+, matching the convention every
-# mainstream fund tracker (Value Research, Groww, ET Money) uses — a raw
-# 3-year point-to-point % would read as roughly 3x too big next to a 1y
-# figure on the same table.
-RETURN_PERIODS: dict[str, tuple[int, bool]] = {
-    "1m": (30, False), "3m": (91, False), "6m": (182, False),
-    "1y": (365, True), "2y": (730, True), "3y": (1095, True),
-}
+# Sub-year periods: a fixed day-count approximation, since "1 month" /
+# "3 months" / "6 months" doesn't have one true length anyway — this
+# already matches every reference tracker checked (cleartax.in, exact to
+# the basis point for 1m/3m/6m/1y on two different funds).
+RETURN_DAY_PERIODS: dict[str, int] = {"1m": 30, "3m": 91, "6m": 182}
+# Year periods: anchored to the *exact same calendar date* N years back,
+# not a fixed days count (e.g. 3*365=1095) — those aren't the same thing
+# whenever a leap day falls inside the window. Verified live against
+# cleartax.in: a 1095-day offset was landing one day later than "3 years
+# ago today" whenever Feb 29 fell in between (confirmed for both SBI
+# Contra and Nippon India Power & Infra, ~0.2pp off in the direction and
+# magnitude the leap-day date-selection alone predicts) — a difference
+# invisible at 1y (no leap day in a recent 1-year window) but real at
+# 2y/3y, since CAGR's exponent amplifies a shifted start date more the
+# longer and larger the compounded return is.
+RETURN_YEAR_PERIODS: dict[str, int] = {"1y": 1, "2y": 2, "3y": 3}
+
+
+def _years_back(d, years: int):
+    """Same calendar month/day, `years` years earlier — the convention
+    every mainstream tracker (Value Research, Groww, ET Money) actually
+    anchors "1Y"/"3Y" returns to, not a fixed days count."""
+    try:
+        return d.replace(year=d.year - years)
+    except ValueError:
+        # d is Feb 29 and (d.year - years) isn't a leap year — Feb 28 is
+        # the standard equivalent for this edge case.
+        return d.replace(month=2, day=28, year=d.year - years)
 
 
 def _parse_nav_date(s: str):
@@ -362,15 +384,26 @@ def _compute_trailing_returns(nav_history: list[dict]) -> dict[str, Optional[flo
     history — reachable and correct, unlike mfdata.in (see module
     docstring) or trying to reuse a third party's own return figures
     which may use different period boundaries or rounding."""
-    out: dict[str, Optional[float]] = {k: None for k in RETURN_PERIODS}
+    out: dict[str, Optional[float]] = {k: None for k in (*RETURN_DAY_PERIODS, *RETURN_YEAR_PERIODS)}
     if not nav_history:
         return out
     latest = nav_history[-1]
     latest_date = _parse_nav_date(latest["date"])
     if latest_date is None or not latest["nav"]:
         return out
-    for period, (days_back, annualize) in RETURN_PERIODS.items():
+
+    for period, days_back in RETURN_DAY_PERIODS.items():
         target = latest_date - timedelta(days=days_back)
+        past = _nav_on_or_before(nav_history, target)
+        if not past or not past[1]:
+            continue
+        past_date, past_nav = past
+        if (latest_date - past_date).days <= 0:
+            continue
+        out[period] = round((latest["nav"] / past_nav - 1) * 100, 2)
+
+    for period, years in RETURN_YEAR_PERIODS.items():
+        target = _years_back(latest_date, years)
         past = _nav_on_or_before(nav_history, target)
         if not past or not past[1]:
             continue
@@ -379,10 +412,8 @@ def _compute_trailing_returns(nav_history: list[dict]) -> dict[str, Optional[flo
         if actual_days <= 0:
             continue
         ratio = latest["nav"] / past_nav
-        if annualize:
-            out[period] = round((ratio ** (365.0 / actual_days) - 1) * 100, 2)
-        else:
-            out[period] = round((ratio - 1) * 100, 2)
+        out[period] = round((ratio ** (365.0 / actual_days) - 1) * 100, 2)
+
     return out
 
 
