@@ -21,12 +21,6 @@ export default function Dashboard({ filters, refreshTick }) {
   const [exposure, setExposure] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
-  // 'statement': exactly what the uploaded CAS PDF says, as of its own
-  // valuation date. 'live': same units held, valued at today's NAV
-  // instead (see backend/portfolio.py's live_value) — the two can differ
-  // a lot if the statement is months old, since NAV moves but the CAS
-  // obviously can't know that.
-  const [basis, setBasis] = useState('statement')
 
   useEffect(() => {
     setLoading(true)
@@ -49,17 +43,13 @@ export default function Dashboard({ filters, refreshTick }) {
   if (!portfolio) return null
 
   const schemes = portfolio.schemes || []
-  const isLive = basis === 'live'
-  // live_value falls back to current_value itself (backend/portfolio.py)
-  // whenever there's no fresher NAV to use, so this switch never needs a
-  // null-check for "not enriched yet" — it just quietly equals the
-  // statement figure in that case.
-  const currentValue = schemes.reduce((s, r) => s + (isLive ? r.live_value : r.current_value), 0)
-  // net_invested_value (not invested_value): the gross per-scheme figure
-  // never nets out redemptions, so a scheme where 92k went in and 90k came
-  // back out would still count as "92k invested" here. net_invested_value
-  // is the cost basis of units still held (0 for a fully-redeemed scheme).
-  const investedValue = schemes.reduce((s, r) => s + r.net_invested_value, 0)
+  // current_value/absolute_gain/xirr are ALWAYS live now (CAS units x
+  // current MFAPI NAV) — there is no "as of statement" figure anymore.
+  // The CAS statement's own valuation.value is never read for this.
+  const currentValue = schemes.reduce((s, r) => s + Number(r.current_value || 0), 0)
+  // net_invested_value: cost basis of units still held (open FIFO lots),
+  // 0 for a fully-redeemed holding — never the gross lifetime-invested figure.
+  const investedValue = schemes.reduce((s, r) => s + Number(r.net_invested_value || 0), 0)
   const gain = currentValue - investedValue
   const gainPct = investedValue ? (gain / investedValue) * 100 : null
 
@@ -76,32 +66,13 @@ export default function Dashboard({ filters, refreshTick }) {
 
   return (
     <div className="space-y-6 animate-fade-up">
-      <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="inline-flex rounded-lg border border-line bg-card p-0.5">
-          {[
-            { key: 'statement', label: 'As of statement' },
-            { key: 'live', label: "Live (today's NAV)" },
-          ].map((opt) => (
-            <button
-              key={opt.key}
-              onClick={() => setBasis(opt.key)}
-              className={`px-3.5 py-1.5 text-sm font-medium rounded-md transition-colors ${
-                basis === opt.key ? 'bg-band text-band-ink' : 'text-ink-2 hover:bg-paper-soft'
-              }`}
-            >
-              {opt.label}
-            </button>
-          ))}
-        </div>
-        {isLive && (
-          <div className="text-xs text-ink-3">
-            Values units still held at today's NAV — assumes no purchases/redemptions since the statement's own valuation date.
-          </div>
-        )}
+      <div className="text-xs text-ink-3">
+        Holdings include CAS transactions through {formatDate(portfolio.holdings_coverage_through)}. Valued using NAV
+        available on or before {formatDate(portfolio.requested_valuation_date)}.
       </div>
 
       <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
-        <StatCard label={isLive ? 'Current value (live)' : 'Current value'} value={formatIndian(currentValue)} />
+        <StatCard label="Current value" value={formatIndian(currentValue)} />
         <StatCard label="Invested value" value={formatIndian(investedValue)} />
         <StatCard label="Overall gain" value={formatIndian(gain)} tone={gain >= 0 ? 'good' : 'bad'} />
         <StatCard label="Absolute return" value={formatPct(gainPct)} tone={gain >= 0 ? 'good' : 'bad'} />
@@ -120,7 +91,9 @@ export default function Dashboard({ filters, refreshTick }) {
               </PieChart>
             </ResponsiveContainer>
           ) : (
-            <div className="text-sm text-ink-3 py-10 text-center">No cap-allocation data available for the held funds yet.</div>
+            <div className="text-sm text-ink-3 py-10 text-center">
+              Market-cap allocation unavailable — no free data source currently provides real portfolio-holdings/cap data.
+            </div>
           )}
         </div>
 
@@ -152,22 +125,20 @@ export default function Dashboard({ filters, refreshTick }) {
                 <th className="text-left px-4 py-2.5">Scheme</th>
                 <th className="text-left px-4 py-2.5">Advisor</th>
                 <th className="text-right px-4 py-2.5">Invested</th>
-                <th className="text-right px-4 py-2.5">{isLive ? 'Current (live)' : 'Current'}</th>
+                <th className="text-right px-4 py-2.5">Current</th>
                 <th className="text-right px-4 py-2.5">Gain</th>
+                <th className="text-right px-4 py-2.5">Absolute Return</th>
                 <th className="text-right px-4 py-2.5">XIRR</th>
               </tr>
             </thead>
             <tbody>
               {schemes.map((s) => {
-                const value = isLive ? s.live_value : s.current_value
-                const gain = isLive ? s.live_gain : s.absolute_gain
-                const xirr = isLive ? s.live_xirr : s.xirr
-                // Only worth showing a live NAV date when it actually differs
-                // from the statement's own valuation date — otherwise it's
-                // just repeating a date the user already sees as context.
-                const showLiveDate = isLive && s.live_nav_date && s.live_nav_date !== s.valuation_date
+                // Show the actual resolved NAV date only when it differs
+                // from today — a weekend/holiday gap or a data lag both
+                // mean "today's NAV" isn't literally from today (spec 10.3).
+                const showNavDate = s.current_nav_date && s.current_nav_date !== portfolio.requested_valuation_date
                 return (
-                  <tr key={s.folio + s.scheme_name} className="border-t border-line-soft hover:bg-paper-soft/60 transition-colors">
+                  <tr key={s.holding_id} className="border-t border-line-soft hover:bg-paper-soft/60 transition-colors">
                     <td className="px-4 py-2.5">
                       <div className="font-medium text-ink">{s.scheme_name}</div>
                       <div className="text-xs text-ink-3 font-mono">{s.folio}</div>
@@ -175,18 +146,21 @@ export default function Dashboard({ filters, refreshTick }) {
                     <td className="px-4 py-2.5 text-ink-2">{s.advisor_label || s.advisor || '—'}</td>
                     <td className="px-4 py-2.5 text-right tabular text-ink-2">{formatIndian(s.net_invested_value)}</td>
                     <td className="px-4 py-2.5 text-right tabular font-medium text-ink">
-                      {formatIndian(value)}
-                      {showLiveDate && <div className="text-xs text-ink-3 font-normal">as of {formatDate(s.live_nav_date)}</div>}
+                      {formatIndian(s.current_value)}
+                      {showNavDate && <div className="text-xs text-ink-3 font-normal">as of {formatDate(s.current_nav_date)}</div>}
                     </td>
-                    <td className={`px-4 py-2.5 text-right tabular font-medium ${gain >= 0 ? 'text-good' : 'text-bad'}`}>
-                      {formatIndian(gain)}
+                    <td className={`px-4 py-2.5 text-right tabular font-medium ${s.absolute_gain >= 0 ? 'text-good' : 'text-bad'}`}>
+                      {formatIndian(s.absolute_gain)}
                     </td>
-                    <td className="px-4 py-2.5 text-right tabular text-ink-2">{xirr != null ? formatPct(xirr) : '—'}</td>
+                    <td className="px-4 py-2.5 text-right tabular text-ink-2">
+                      {s.absolute_gain_pct != null ? formatPct(s.absolute_gain_pct) : '—'}
+                    </td>
+                    <td className="px-4 py-2.5 text-right tabular text-ink-2">{s.xirr != null ? formatPct(s.xirr) : '—'}</td>
                   </tr>
                 )
               })}
               {schemes.length === 0 && (
-                <tr><td colSpan={6} className="px-4 py-8 text-center text-ink-3">No schemes match these filters.</td></tr>
+                <tr><td colSpan={7} className="px-4 py-8 text-center text-ink-3">No schemes match these filters.</td></tr>
               )}
             </tbody>
           </table>

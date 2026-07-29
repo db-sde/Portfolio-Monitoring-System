@@ -3,29 +3,12 @@ import { api } from '../api'
 import { formatIndian, formatUnits, formatDate } from '../components/IndianNumber'
 import SkeletonTable from '../components/SkeletonTable'
 
-function downloadCsv(filename, rows) {
-  const csvField = (v) => {
-    if (v == null) return ''
-    const s = String(v).replace(/\n/g, ' ')
-    return /[",\n]/.test(s) ? '"' + s.replace(/"/g, '""') + '"' : s
-  }
-  const text = rows.map((r) => r.map(csvField).join(',')).join('\n')
-  const blob = new Blob([text], { type: 'text/csv' })
-  const url = URL.createObjectURL(blob)
-  const a = document.createElement('a')
-  a.href = url
-  a.download = filename
-  document.body.appendChild(a)
-  a.click()
-  a.remove()
-  setTimeout(() => URL.revokeObjectURL(url), 1000)
-}
-
 export default function CapitalGains({ filters, refreshTick }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [fy, setFy] = useState(null)
+  const [exporting, setExporting] = useState(false)
 
   useEffect(() => {
     setLoading(true)
@@ -41,38 +24,48 @@ export default function CapitalGains({ filters, refreshTick }) {
 
   const gains = data?.gains || []
   const gifts = data?.gifts || []
+  const fyRows = useMemo(() => gains.filter((g) => g.fy === fy), [gains, fy])
 
+  // Spec 12.1: every summary card scopes to the SELECTED FY, not every
+  // year ever realised — computed from fyRows, not the full gains list.
   const { stcg, ltcg, net } = useMemo(() => {
     let s = 0, l = 0
-    gains.forEach((g) => { s += g.stcg; l += g.ltcg })
+    fyRows.forEach((g) => { s += g.stcg; l += g.ltcg })
     return { stcg: s, ltcg: l, net: s + l }
-  }, [gains])
-
-  const fyRows = useMemo(() => gains.filter((g) => g.fy === fy), [gains, fy])
+  }, [fyRows])
 
   if (error) return <div className="text-sm text-bad">{error}</div>
   if (loading) return <SkeletonTable rows={8} cols={7} />
 
-  const exportFyCsv = () => {
-    const head = ['Scheme', 'ISIN', 'Advisor', 'Type', 'Acquired', 'Sold', 'Units', 'Cost of acquisition', 'Sale value', 'Gain/Loss', 'Term']
-    const rows = fyRows.map((g) => [
-      g.scheme, g.isin, g.advisor_label || g.advisor || '', g.fund_type,
-      g.purchase_date, g.sale_date, g.units, g.acquisition_value.toFixed(2), g.sale_value.toFixed(2), g.gain.toFixed(2), g.gain_type,
-    ])
-    downloadCsv(`capital-gains-112a-${fy}.csv`, [head, ...rows])
+  const exportFyCsv = async () => {
+    setExporting(true)
+    try {
+      const blob = await api.download112aCsv({
+        fy, level: filters.level, group_name: filters.groupName,
+        investor_name: filters.investorName, arn: filters.arn,
+      })
+      const url = URL.createObjectURL(blob)
+      const a = document.createElement('a')
+      a.href = url
+      a.download = `capital-gains-112a-${fy}.csv`
+      document.body.appendChild(a)
+      a.click()
+      a.remove()
+      setTimeout(() => URL.revokeObjectURL(url), 1000)
+    } finally {
+      setExporting(false)
+    }
   }
 
   return (
     <div className="space-y-6 animate-fade-up">
-      {data?.gains_error && (
-        <div className="rounded-lg border border-warn/20 bg-warn-tint text-warn text-sm px-4 py-2.5">{data.gains_error}</div>
-      )}
+      {(data?.warnings || []).map((w, i) => (
+        <div key={i} className="rounded-lg border border-warn/20 bg-warn-tint text-warn text-sm px-4 py-2.5">{w}</div>
+      ))}
 
       {!gains.length ? (
         <div className="rounded-xl border border-line-soft bg-card p-10 text-center text-sm text-ink-3">
-          No realised sales found — gains only appear once units are actually redeemed or switched out. If you've
-          just uploaded a statement, make sure it was the original CAS PDF (a pre-parsed JSON upload doesn't
-          compute gains).
+          No realised sales found — gains only appear once units are actually redeemed or switched out.
         </div>
       ) : (
         <>
@@ -86,7 +79,7 @@ export default function CapitalGains({ filters, refreshTick }) {
               <div className={`font-display text-2xl font-bold tabular ${ltcg >= 0 ? 'text-good' : 'text-bad'}`}>{formatIndian(ltcg)}</div>
             </div>
             <div className="rounded-xl border border-line-soft bg-card p-4 bg-band">
-              <div className="text-xs font-medium text-band-ink/70 mb-1">Net realised gain (all years)</div>
+              <div className="text-xs font-medium text-band-ink/70 mb-1">Net realised gain (selected FY)</div>
               <div className="font-display text-2xl font-bold tabular text-band-ink">{formatIndian(net)}</div>
             </div>
           </div>
@@ -107,9 +100,10 @@ export default function CapitalGains({ filters, refreshTick }) {
                 </select>
                 <button
                   onClick={exportFyCsv}
-                  className="rounded-lg bg-accent text-accent-ink text-sm font-medium px-3 py-1.5 hover:bg-accent-strong transition-colors"
+                  disabled={exporting}
+                  className="rounded-lg bg-accent text-accent-ink text-sm font-medium px-3 py-1.5 hover:bg-accent-strong transition-colors disabled:opacity-50"
                 >
-                  Export 112A CSV
+                  {exporting ? 'Exporting…' : 'Export 112A CSV'}
                 </button>
               </div>
             </div>

@@ -70,8 +70,17 @@ export default function App() {
   useEffect(() => {
     loadConfig()
     api.getEnrichStatus().then(setEnrichStatus).catch(() => {})
-    api.getPortfolio({}).then((p) => {
-      setUploadInfo({ investor_name: p.investor_info?.name, statement_period: p.statement_period })
+    api.getPortfolio({ include_zero_value: true }).then((p) => {
+      // Postgres just has empty tables before the first upload — unlike
+      // the old cas_data.json-missing 404, this endpoint always returns
+      // 200. holdings_coverage_through (null until a CAS has actually
+      // been imported) is what distinguishes "nothing uploaded yet" from
+      // "uploaded, but every holding got filtered out."
+      if (!p.holdings_coverage_through) return
+      setUploadInfo({
+        investor_name: (p.investor_names || []).join(', ') || undefined,
+        statement_period: { from: p.holdings_coverage_from, to: p.holdings_coverage_through },
+      })
     }).catch(() => {}).finally(() => setCheckingInitial(false))
   }, [loadConfig])
 

@@ -69,7 +69,7 @@ export default function Exposure({ refreshTick }) {
           </ResponsiveContainer>
         ) : (
           <div className="text-sm text-ink-3 py-10 text-center">
-            No cap-allocation data available (needs mfdata.in enrichment on the held funds).
+            Market-cap allocation unavailable — no free data source currently publishes real portfolio-holdings/cap data.
           </div>
         )}
       </div>

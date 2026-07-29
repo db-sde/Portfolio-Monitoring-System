@@ -3,6 +3,15 @@ import { api } from '../api'
 import { formatIndian, formatPct } from '../components/IndianNumber'
 import SkeletonTable from '../components/SkeletonTable'
 
+function BenchmarkCell({ value, status, tooltip }) {
+  const title = status === 'unavailable' ? 'Benchmark data unavailable' : tooltip
+  return (
+    <td className="px-4 py-2.5 text-right tabular text-ink-3" title={title}>
+      {value != null ? formatPct(value) : '—'}
+    </td>
+  )
+}
+
 export default function PortfolioSummary({ refreshTick }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
@@ -42,7 +51,11 @@ export default function PortfolioSummary({ refreshTick }) {
                       <th className="text-right px-4 py-2.5">Abs. return</th>
                       <th className="text-right px-4 py-2.5">XIRR</th>
                       <th className="text-right px-4 py-2.5">L/M/S cap</th>
-                      <th className="text-right px-4 py-2.5">Benchmark XIRR</th>
+                      <th className="text-right px-4 py-2.5" title="Proxy via a Nifty 50 index fund's own NAV — not the official TRI series (expense ratio, tracking error and cash drag included).">
+                        Nifty 50 (proxy) XIRR
+                      </th>
+                      <th className="text-right px-4 py-2.5">Nifty 500 XIRR</th>
+                      <th className="text-right px-4 py-2.5">Fund benchmark XIRR</th>
                     </tr>
                   </thead>
                   <tbody>
@@ -60,9 +73,9 @@ export default function PortfolioSummary({ refreshTick }) {
                         <td className="px-4 py-2.5 text-right tabular text-ink-2">
                           {a.largecap_pct != null ? `${a.largecap_pct}/${a.midcap_pct}/${a.smallcap_pct}` : '—'}
                         </td>
-                        <td className="px-4 py-2.5 text-right tabular text-ink-3">
-                          {a.benchmark_xirr != null ? formatPct(a.benchmark_xirr) : '—'}
-                        </td>
+                        <BenchmarkCell value={a.nifty50_proxy_xirr} status="ok" tooltip={a.nifty50_proxy_disclosure} />
+                        <BenchmarkCell value={a.nifty500_xirr} status={a.nifty500_status} />
+                        <BenchmarkCell value={a.fund_respective_xirr} status={a.fund_respective_status} />
                       </tr>
                     ))}
                   </tbody>

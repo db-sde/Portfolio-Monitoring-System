@@ -58,6 +58,18 @@ export const api = {
   getCapitalGains(params) {
     return request(`/api/capital-gains${qs(params)}`)
   },
+  // The one endpoint that isn't JSON (spec 12.2: the parser's own
+  // verified Schedule 112A export) — same BASE-prefixing as request()
+  // so the VITE_API_BASE_URL override still works for it, just a Blob
+  // instead of a parsed body.
+  async download112aCsv(params) {
+    const res = await fetch(`${BASE}/api/capital-gains/112a.csv${qs(params)}`)
+    if (!res.ok) throw new Error(`Export failed (${res.status})`)
+    return res.blob()
+  },
+  getDataQuality() {
+    return request('/api/data-quality')
+  },
   getConfig() {
     return request('/api/config')
   },
