@@ -5,45 +5,67 @@ repo deploys. Upload your CAS PDF (CAMS or KFintech) and its password —
 that's the whole input — and it parses it in-process via `casparser`
 (the same library the retired [`casparser-web`](archive/casparser-web/README.md)
 tool wraps, kept in `archive/` for reference, not deployed anymore),
-enriches every fund with live market data, computes XIRR/returns/risk
-metrics, and gives you a dashboard broken down by group / investor /
-advisor. No separate parsing step, no intermediate JSON file to
-generate yourself — one upload, one dashboard.
+reconstructs a real FIFO acquisition-lot ledger from the transaction
+history, values everything against live MFAPI-resolved NAV (never the
+CAS's own printed valuation), and gives you a dashboard broken down by
+group / investor / advisor — current value, XIRR, capital gains,
+benchmark comparison, risk ratios, all derived from that one ledger.
 
 (A pre-parsed CAS JSON is still accepted too, if you already have one —
 `/api/upload-cas` detects which by file extension. Only CAMS/KFintech
 mutual-fund statements are analysed; an NSDL/CDSL demat statement is
-rejected with a clear message, since the analytics here — XIRR, cap
-allocation, advisor comparison — are all built around the folio/scheme
-shape those two RTAs produce.)
+rejected with a clear message, since the analytics here — XIRR, FIFO
+capital gains, advisor comparison — are all built around the
+folio/scheme/transaction shape those two RTAs produce.)
 
 ```
-backend/            FastAPI app — calculations, enrichment, config, all routes
+backend/            FastAPI app on Postgres — ingestion, FIFO/XIRR
+                     engine, enrichment, benchmark simulation, all routes
 frontend/            React + Vite + Tailwind dashboard
 archive/casparser-web/  Retired — the PDF-parser-only tool this replaced
 ```
 
+## Architecture
+
+Every number on every page traces back to one of two things: the CAS
+statement's own transaction ledger (never its printed valuation), or a
+live NAV resolved from mfapi.in. Concretely:
+
+- **Postgres (Neon)** is the only persistence layer — `backend/models.py`
+  defines cas_uploads/folios/schemes/scheme_aliases/holdings/
+  transactions/purchase_lots/disposal_allocations/nav_cache/
+  enrichment_cache/benchmark_* /config_*, all Decimal-precision. There's
+  no JSON-file storage left; a Render redeploy no longer wipes anything.
+- **`fifo.py`** is the acquisition-lot engine (FIFO, at investor + folio +
+  scheme + plan + option grain) that every valuation, gain, and days-held
+  figure is built from — verified exactly against a worked multi-purchase
+  /partial-redemption example. Gift-in/gift-out and segregation reduce a
+  holding's real unit balance without generating a taxable disposal
+  (donor cost basis isn't available from a single CAS; see `fifo.py`'s
+  `NON_TAXABLE_REDUCTION_TYPES`).
+- **`xirr_engine.py`** solves money-weighted XIRR from full dated
+  cash-flow history — every page's XIRR (including subtotals/advisor
+  blends) is recalculated from consolidated cash flows, never averaged
+  from child XIRRs.
+- **`scheme_resolution.py`** resolves a CAS scheme to a canonical record
+  by ISIN first, then a validated AMFI code, then a persisted alias
+  (this is what recovers a fund whose AMFI code was retired by an AMC
+  merger — e.g. HSBC absorbing L&T's schemes in 2022 left an old code
+  frozen on its last NAV while the real fund kept trading under a new
+  one; confirmed live and fixed here).
+- **`benchmark_service.py`** replays a holding/advisor/portfolio's own
+  external cash flows into a benchmark's NAV series for a
+  personal-XIRR-comparable benchmark return — see the caveat below on
+  which benchmarks that's actually possible for.
+
 ## Deployment
 
-This is what's actually live, on the same two services that used to run
-casparser-web — nothing was recreated, the code underneath them just
-changed:
+- **Backend** → Render, building `Dockerfile` at this repo's root
+- **Frontend** → Vercel, Root Directory `frontend`
 
-- **Backend** → Render, building `Dockerfile` at this repo's root (unchanged path/config from before)
-- **Frontend** → Vercel, Root Directory `frontend` (unchanged setting from before), now building a real Vite app instead of serving static files — see the Vite-build note in `frontend/vercel.json`'s comments if a push doesn't pick that up automatically
+**Postgres is required**, not optional — the backend won't start without
+`DATABASE_URL`:
 
-One real tradeoff worth knowing: **Render's filesystem is ephemeral across deploys**. `config.json` is checked into the repo so it survives fine, but `cas_data.json`, `gains_data.json`, and the enrichment cache are written at runtime and get wiped on every redeploy — after each push that triggers a new Render build, you'll need to re-upload your statement once. Groups/investors/ARNs saved through the Settings page at runtime hit the same wall (they're written to the same `config.json` path but outside of a git commit, so a redeploy reverts them to whatever's checked in). Within a single running deploy (i.e. between your own visits, no new push in between), it persists exactly like running locally would.
-
-If you'd rather run it entirely on your own machine instead (e.g. to avoid that redeploy-wipe behavior, or if `mfdata.in` turns out to only be reachable from a residential IP — see below), the local + optional `ngrok` tunnel path below still works unchanged.
-
-**Migrating off the ephemeral disk (in progress):** moving persistence to
-a real database — [Neon](https://neon.tech) Postgres, free tier — so
-none of the above gets wiped on redeploy, and so multiple people's
-statements can accumulate instead of the latest upload overwriting the
-last one. The app doesn't read from Postgres yet; this is the connection
-plumbing landing first.
-
-To set it up:
 1. Create a free project at [neon.tech](https://neon.tech) and copy its
    connection string (Neon console → your project → **Connect** → the
    `psql`/pooled connection string, looks like
@@ -52,62 +74,53 @@ To set it up:
    variable named `DATABASE_URL` with that value.
 3. **Local dev**: `cp backend/.env.example backend/.env` and paste the
    same connection string in as `DATABASE_URL` — `main.py` loads `.env`
-   automatically via `python-dotenv` (already a dependency). `.env` is
-   gitignored; never commit it.
+   automatically via `python-dotenv`. `.env` is gitignored; never commit
+   it or paste a real connection string into chat/an issue/a PR.
 
-## The enrichment reachability caveat (read this first)
+Schema creation is idempotent and automatic (`db.init_db()` runs on every
+startup) — there's no separate migration step to run by hand. Neon's
+free-tier compute suspends after inactivity and wakes on the next
+connection, so the very first request after a quiet period can take a
+few seconds longer than usual; that's expected, not a failure.
 
-Three external data sources feed the "enriched" fields (spec section 7):
+## Enrichment sources — what's real, what's genuinely unavailable
 
-| Source | What it's for | Status while building this |
+| Source | What it provides | Status |
 |---|---|---|
-| **mfdata.in** | AUM, cap-allocation %, benchmark, category, expense ratio, fund manager, trailing returns, risk ratios (sharpe/alpha/beta/std dev) — almost everything | **Unreachable from every network path tried** while building this (direct request, docs page, different User-Agents — all failed, not with a 404 but a flat connection failure/403 consistent with bot-protection on datacenter IPs) |
-| **mfapi.in** | NAV history + basic category | Confirmed working reliably |
-| **captnemo** (Kuvera) | Category + scheme rules, by ISIN | Confirmed working, but doesn't carry cap-allocation/risk data at all |
+| **mfapi.in** | NAV history (the basis for *everything* — current value, returns, volatility, Sharpe/Sortino/max-drawdown, and the Nifty 50 benchmark proxy series) | Confirmed working; retried a few times on failure since it's a free, best-effort API that fails transiently under load (confirmed live, not hypothetical) |
+| **captnemo** (Kuvera's backing API) | Category, expense ratio, fund manager, a volatility figure, by ISIN | Confirmed working |
+| **mfdata.in** | Was meant to be primary (cap-allocation %, precomputed ratios) | **Confirmed permanently unreachable** — Cloudflare returns error 522 (origin down), not a bot-block. Still probed once per scheme with a short timeout in case it ever comes back; nothing in the app waits on it succeeding |
 
-Since this runs on **your own machine** rather than a cloud host, mfdata.in
-may well work fine for you — the kind of protection that blocked every
-attempt here usually isn't aimed at residential IPs. Test it yourself:
+Returns, volatility, Sharpe, Sortino, max drawdown, alpha, and beta are
+all computed directly from mfapi.in's NAV history — no dedicated ratios
+endpoint exists on any free source, so `enrichment.py` derives them with
+standard formulas instead (cross-checked against an independent
+NAV-analytics site's live figures for several real funds).
 
-```bash
-curl https://mfdata.in/api/v1/schemes/117560
-```
+**Two gaps remain genuinely open**, not simplified-away:
 
-If that returns real JSON, enrichment will pick up cap-allocation, risk
-ratios, and trailing returns automatically — nothing to change. If it
-doesn't, the app still works: those specific fields show as empty/"—"
-rather than breaking anything (`enrichment.py`'s whole design is to
-degrade field-by-field, never to fail the request), and you still get
-real NAV history (for the snapshot's opening/closing balance math) and
-category from the two working fallbacks.
+- **Cap allocation** (large/mid/small-cap %) and **sector/holdings
+  exposure** — no free source publishes real portfolio-holdings data.
+  Every page that would show this (Dashboard, Exposure, Portfolio
+  Summary) correctly reports "unavailable" rather than guessing from a
+  scheme's category label.
+- **Nifty 500 and fund-respective benchmark XIRR** — no free source
+  publishes raw index values for either. The **Nifty 50** column *is*
+  real: it uses a Nifty 50 index fund's own NAV as a proxy (clearly
+  labelled as a proxy, never presented as the official TRI series), the
+  same NAV-history mechanism as everything else. `benchmark_service.py`'s
+  `BenchmarkProvider` interface and the `scheme_benchmark_map` table are
+  ready for a real source the moment one exists — nothing here needs
+  rewriting later, just a new provider wired in.
 
-`enrichment.py`'s field-name mapping for mfdata.in's response is taken
-from the spec's own documented schema, not from a live response this
-build actually saw — if your real responses use different field names,
-`_extract_mfdata_fields()` in that file is the one place to adjust.
-
-## Known simplifications vs. the full spec
-
-- **Benchmark XIRR** (`benchmark_xirr`, `beating_benchmark` in the
-  Portfolio Summary view) is always `null`. Computing it needs a real
-  benchmark NAV history (e.g. Nifty 500 TRI) from a verified source —
-  building that in speculatively felt worse than being honest that it's
-  not there yet. `calculate_benchmark_xirr()` in `calculations.py` is
-  fully implemented and unit-tested; it just needs a real data feed
-  wired into `portfolio.py` to call it with.
-- **Fund Summary** only lists funds you actually hold (`is_held: true`
-  for everything). A fuller version comparing against funds you *don't*
-  hold would need a broader fund catalog beyond what's in one statement.
-- **Phase 2 endpoints** (`/api/portfolio/risk-reward`, `/api/portfolio/overlap`)
-  aren't built — the spec marks these as Phase 2 explicitly.
-
-## Running it locally instead (optional alternative to the deployed version above)
+## Running it locally instead
 
 ```bash
 # Backend
 cd backend
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
+cp .env.example .env   # paste in your Neon DATABASE_URL
 uvicorn main:app --reload --port 8000
 
 # Frontend (separate terminal)
@@ -120,15 +133,25 @@ npm run dev
 Click "Upload CAS PDF" in the top bar, pick your statement, enter its
 password when prompted, and hit Parse. First upload kicks off enrichment
 in the background — the top bar shows progress, and pages refresh once
-it's done.
+it's done. Uploading the same file again (byte-identical) is recognised
+as a duplicate and skipped, not re-imported; uploading a *different*,
+overlapping statement for the same folios merges in cleanly (transactions
+are deduplicated by fingerprint, not by file).
 
-### config.json — attributing folios to a group/investor
+### Groups, investors & advisors
 
 Every distinct `advisor` (ARN code) your CAS shows folios under needs to
-be listed in `config.json` to be attributed to a group/investor in the
-Portfolio Summary view — an ARN not listed there just won't show up in
-that one view (it's still visible everywhere else, unfiltered). Edit it
-directly, or through the Settings page in the app.
+be attributed to a group/investor to show up correctly in the Portfolio
+Summary view — do this through the Settings page in the app (persisted
+in Postgres now, not a config.json file).
+
+### Resetting all data
+
+`DELETE /api/all-data` wipes every statement, holding, gain, cached
+market-data point, and config entry — a full reset, not a per-statement
+delete (holdings/lots can be shared across multiple accumulated CAS
+uploads for the same folio, so a correct partial delete is a separate,
+not-yet-built feature).
 
 ### Exposing it via ngrok (optional)
 
@@ -150,16 +173,35 @@ Note ngrok's free tier URL changes every time you restart the tunnel —
 you'll need to update `VITE_API_BASE_URL` on Vercel each time unless
 you're on a paid ngrok plan with a reserved domain.
 
+## Testing
+
+```bash
+cd backend
+python3 tests/test_fifo.py         # FIFO lot engine, pure/offline
+python3 tests/test_xirr.py         # XIRR solver, pure/offline
+python3 tests/test_integration.py  # needs DATABASE_URL — real Neon connection, self-cleaning
+```
+
 ## Endpoints
 
-See spec section 6 for full request/response shapes. Quick reference:
-
-- `POST /api/upload-cas` — upload the CAS PDF + password (or a pre-parsed CAS JSON), kicks off enrichment
-- `GET /api/portfolio` — per-scheme data, filterable by level/group/investor/arn
-- `GET /api/portfolio/snapshot` — opening/closing balance + XIRR for a date window
-- `GET /api/portfolio/summary` — advisor-level comparison table
-- `GET /api/portfolio/fund-summary` — returns heatmap for held funds
-- `GET /api/portfolio/exposure` — top AMCs/funds + cap allocation
-- `GET`/`POST /api/config` — read/write config.json
+- `POST /api/upload-cas` — upload the CAS PDF + password (or a pre-parsed CAS JSON); ingests, dedupes, runs FIFO, kicks off enrichment in the background
+- `GET /api/portfolio` — per-holding table + asset-class subtotals, filterable by level/group/investor/arn and valuation_date
+- `GET /api/portfolio/snapshot` — opening/closing balance + net gain + XIRR for a date window, bucketed by asset class
+- `GET /api/portfolio/summary` — advisor-level comparison, including Nifty 50 (proxy) / Nifty 500 / fund-respective benchmark XIRR columns
+- `GET /api/portfolio/fund-summary` — returns/risk-ratio heatmap for held funds
+- `GET /api/portfolio/exposure` — top AMCs/funds (live value) + cap allocation (honest "unavailable")
+- `GET /api/transactions` — flat transaction ledger, filterable
+- `GET /api/capital-gains` — realised gains for the selected FY + gift-transfer disclosure
+- `GET /api/capital-gains/112a.csv?fy=` — official Schedule 112A export (casparser's own verified format)
+- `GET /api/data-quality` — every holding currently flagged for review, with why
+- `GET`/`POST /api/config` — read/write group/investor/advisor attribution + preferences
+- `DELETE /api/all-data` — full data reset
 - `GET /api/enrich/status` — enrichment progress
-- `GET /api/health` — liveness check
+- `GET /api/health` — liveness check (no DB dependency)
+
+Every response includes `requested_valuation_date`, `holdings_coverage_through`,
+`nav_policy`, `calculation_version`, `warnings`, and `data_quality`
+(`OK`/`PARTIAL`) metadata. A holding needing attention carries a `flags`
+array with a specific code — `SCHEME_UNRESOLVED`, `NAV_UNAVAILABLE`,
+`CAS_RECONCILIATION_FAILED`, `INCOMPLETE_OPENING_HISTORY`,
+`FIFO_SHORTFALL`, or `XIRR_NO_SOLUTION` — never a silently wrong number.
