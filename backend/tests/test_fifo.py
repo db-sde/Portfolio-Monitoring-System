@@ -124,6 +124,26 @@ def test_fifo_shortfall_not_fabricated():
     assert result.allocations[0].allocated_units == Decimal("100")
 
 
+def test_reversal_nets_out_against_the_purchase_it_reverses():
+    """Real production bug, found on a real statement: a bounced/reversed
+    SIP installment shows up as its own PURCHASE_SIP row followed by a
+    REVERSAL row clawing back the exact same units/amount. Before this
+    test, REVERSAL wasn't in any of fifo.py's type sets at all, so
+    run_fifo silently skipped it — the reversed purchase's units stayed
+    in the derived balance forever, inflating a real holding's balance
+    by exactly the reversed amount versus the CAS statement's own
+    printed close. No realized_gain should come out of this either: a
+    reversed purchase was never a real disposal."""
+    events = [
+        LotInput(1, date(2020, 10, 12), "PURCHASE_SIP", Decimal("43.387"), Decimal("999.95"), Decimal("23.047")),
+        LotInput(2, date(2020, 10, 12), "REVERSAL", Decimal("43.387"), Decimal("999.95"), Decimal("23.047")),
+    ]
+    result = run_fifo(events)
+    assert sum(l.remaining_units for l in result.lots) == Decimal("0")
+    assert not result.allocations  # a reversal is not a taxable disposal
+    assert not result.shortfalls
+
+
 def test_zero_holding_excluded_by_caller():
     """A fully-redeemed holding (remaining_units == 0 on every lot) isn't
     something fifo.py itself hides — that's a caller-side display

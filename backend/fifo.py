@@ -39,10 +39,23 @@ DISPOSAL_TYPES = {"REDEMPTION", "SWITCH_OUT", "SWITCH_OUT_MERGER"}
 # needs its own explicit cost-split data this transaction row doesn't
 # carry) — FIFO-consumed like a disposal for balance accuracy, but never
 # produces a DisposalAllocation/realized_gain.
-NON_TAXABLE_REDUCTION_TYPES = {"GIFT_OUT", "SEGREGATION"}
+#
+# REVERSAL belongs here too, not in the no-op list below — a real
+# statement's REVERSAL row (a bounced/reversed SIP installment: the AMC
+# claws back the exact units and amount of an earlier PURCHASE_SIP) is
+# never paired to its originating purchase by any explicit key, so
+# rather than try to match them, it's consumed the same way GIFT_OUT
+# already is: chronologically against whatever lots are open, oldest
+# first. Confirmed against a real statement where the original design
+# ("no unit effect, handled by the transaction it reverses simply not
+# being counted") left REVERSAL out of every FIFO-affecting set
+# entirely — the reversed SIP's units stayed in the derived balance
+# forever since nothing ever subtracted them back out, inflating a real
+# holding's balance by exactly the sum of its REVERSAL units versus the
+# CAS statement's own printed close.
+NON_TAXABLE_REDUCTION_TYPES = {"GIFT_OUT", "SEGREGATION", "REVERSAL"}
 # No unit effect, no lot action at all: DIVIDEND_PAYOUT, STT_TAX,
-# STAMP_DUTY_TAX, TDS_TAX, MISC, UNKNOWN, REVERSAL (handled by the
-# transaction it reverses simply not being counted).
+# STAMP_DUTY_TAX, TDS_TAX, MISC, UNKNOWN.
 
 
 @dataclass

@@ -39,10 +39,17 @@ live NAV resolved from mfapi.in. Concretely:
 - **`fifo.py`** is the acquisition-lot engine (FIFO, at investor + folio +
   scheme + plan + option grain) that every valuation, gain, and days-held
   figure is built from — verified exactly against a worked multi-purchase
-  /partial-redemption example. Gift-in/gift-out and segregation reduce a
-  holding's real unit balance without generating a taxable disposal
-  (donor cost basis isn't available from a single CAS; see `fifo.py`'s
-  `NON_TAXABLE_REDUCTION_TYPES`).
+  /partial-redemption example. Gift-in/gift-out, segregation, and
+  REVERSAL (a bounced/reversed SIP installment — the AMC claws back the
+  exact units and amount of an earlier purchase; found on a real
+  statement) reduce a holding's real unit balance without generating a
+  taxable disposal (donor cost basis isn't available from a single CAS
+  for gifts; a reversal was never a real disposal at all — see
+  `fifo.py`'s `NON_TAXABLE_REDUCTION_TYPES`). REVERSAL wasn't handled at
+  all until a real holding's derived balance came out 82 units higher
+  than the CAS statement's own printed close — exactly the sum of that
+  holding's three reversed SIP installments, which nothing had ever
+  subtracted back out.
 - **`xirr_engine.py`** solves money-weighted XIRR from full dated
   cash-flow history — every page's XIRR (including subtotals/advisor
   blends) is recalculated from consolidated cash flows, never averaged
