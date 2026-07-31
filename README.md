@@ -213,15 +213,21 @@ NAV-analytics site's live figures for several real funds).
 cd backend
 python3 -m venv venv && source venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # paste in your Neon DATABASE_URL
+cp .env.example .env   # paste in your Neon DATABASE_URL and an API_KEY (see Deployment above)
 uvicorn main:app --reload --port 8000
 
 # Frontend (separate terminal)
 cd frontend
 npm install
+cp .env.example .env   # VITE_API_KEY must match the backend's API_KEY exactly
 npm run dev
 # opens at http://localhost:5173
 ```
+
+Both `.env` files are required, not optional — the backend rejects every
+request without a matching `API_KEY`/`VITE_API_KEY` pair (see
+Deployment's `API_KEY` section above for why). Skipping either one shows
+up as every request in the browser failing with 401.
 
 Click "Upload CAS PDF" in the top bar, pick your statement, enter its
 password when prompted, and hit Parse. First upload kicks off enrichment
@@ -270,12 +276,24 @@ you're on a paid ngrok plan with a reserved domain.
 
 ```bash
 cd backend
-python3 tests/test_fifo.py         # FIFO lot engine, pure/offline
-python3 tests/test_xirr.py         # XIRR solver, pure/offline
-python3 tests/test_integration.py  # needs DATABASE_URL — real Neon connection, self-cleaning
+python3 tests/test_fifo.py              # FIFO lot engine, pure/offline
+python3 tests/test_xirr.py              # XIRR solver, pure/offline
+python3 tests/test_ingestion_helpers.py # ingestion.py's pure helper functions, pure/offline
+python3 tests/test_integration.py       # needs DATABASE_URL — real Neon connection, self-cleaning
 ```
 
+28 tests total across the four files. Every bug fix described in
+Architecture above shipped with a regression test in one of these —
+`test_fifo.py`'s `test_reversal_nets_out_against_the_purchase_it_reverses`,
+`test_integration.py`'s `test_stamp_duty_flows_into_lot_cost_basis` and
+`test_snapshot_reversal_does_not_inflate_purchase_or_xirr`, and
+`test_ingestion_helpers.py`'s `test_as_date_handles_dd_mon_yyyy` are the
+direct record of each real incident, not just abstract coverage.
+
 ## Endpoints
+
+Every one of these requires the `X-API-Key` header described in
+Deployment's `API_KEY` section, except `GET /api/health`.
 
 - `POST /api/upload-cas` — upload the CAS PDF + password (or a pre-parsed CAS JSON); ingests, dedupes, runs FIFO, kicks off enrichment in the background
 - `GET /api/portfolio` — per-holding table + asset-class subtotals, filterable by level/group/investor/arn and valuation_date
