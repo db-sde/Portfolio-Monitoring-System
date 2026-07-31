@@ -32,7 +32,7 @@ from fifo import DISPOSAL_TYPES, LOT_CREATING_TYPES, NON_TAXABLE_REDUCTION_TYPES
 from models import (
     CasUpload, DisposalAllocation, Folio, Holding, PurchaseLot, Transaction,
 )
-from scheme_resolution import resolve_scheme
+from scheme_resolution import prefetch_mfapi_schemes, resolve_scheme
 
 RECONCILIATION_TOLERANCE = Decimal("0.001")  # units; casparser's own Decimal rounding noise floor
 
@@ -108,28 +108,32 @@ def _as_date(value) -> date:
     return value if isinstance(value, date) else datetime.strptime(str(value), "%Y-%m-%d").date()
 
 
-def _existing_transaction(session: Session, holding_id: int, txn, occurrence_index: int) -> Optional[Transaction]:
-    """Fingerprint lookup (spec 6.3): holding + date + type + amount +
-    units + nav + occurrence_index. A description isn't part of the key
-    here — two rows can have cosmetically different descriptions
-    (e.g. RTA batch IDs) for what's genuinely the same transaction."""
-    return session.execute(
-        select(Transaction).where(
-            Transaction.holding_id == holding_id,
-            Transaction.date == _as_date(txn.date),
-            Transaction.type == txn.type,
-            Transaction.amount == txn.amount,
-            Transaction.units == txn.units,
-            Transaction.nav == txn.nav,
-            Transaction.occurrence_index == occurrence_index,
-        )
-    ).scalar_one_or_none()
+def _transaction_fingerprint(t) -> tuple:
+    """Same fingerprint spec 6.3 describes, as a plain tuple — used both
+    to key already-persisted rows and to check new ones against them
+    entirely in memory. `t` can be an ORM Transaction row or anything
+    with the same attribute names (duck-typed on purpose so this works
+    for both)."""
+    return (t.date, t.type, t.amount, t.units, t.nav, t.occurrence_index)
 
 
 def _persist_transactions(session: Session, holding: Holding, scheme, upload_id: int) -> list[Transaction]:
     """Insert any transaction rows not already present (by fingerprint),
     and return the FULL set for this holding (old + new) so FIFO always
-    runs against the complete ledger, not just this upload's rows."""
+    runs against the complete ledger, not just this upload's rows.
+
+    One SELECT for the whole holding, not one per incoming transaction —
+    the original per-row lookup was a real N+1 query pattern that took
+    ~145s to import 120 transactions across 5 funds in testing (each
+    round-trip to Neon adds real network latency; 120 of them serialised
+    is what actually blew through Render's request timeout in
+    production, not casparser or the ingestion logic itself). Duplicate
+    detection now happens against an in-memory set built from one query."""
+    existing_rows = list(session.execute(
+        select(Transaction).where(Transaction.holding_id == holding.holding_id)
+    ).scalars())
+    existing_fingerprints = {_transaction_fingerprint(t) for t in existing_rows}
+
     # occurrence_index disambiguates genuinely-identical same-day rows
     # (spec 6.3) — counted per (date, type, amount, units, nav) group,
     # in the order casparser itself returned them.
@@ -138,8 +142,8 @@ def _persist_transactions(session: Session, holding: Holding, scheme, upload_id:
         key = (_as_date(txn.date), txn.type, txn.amount, txn.units, txn.nav)
         occurrence_index = seen_keys.get(key, 0)
         seen_keys[key] = occurrence_index + 1
-        existing = _existing_transaction(session, holding.holding_id, txn, occurrence_index)
-        if existing is None:
+        fingerprint = (*key, occurrence_index)
+        if fingerprint not in existing_fingerprints:
             session.add(Transaction(
                 holding_id=holding.holding_id,
                 date=_as_date(txn.date),
@@ -153,6 +157,7 @@ def _persist_transactions(session: Session, holding: Holding, scheme, upload_id:
                 source_upload_id=upload_id,
                 occurrence_index=occurrence_index,
             ))
+            existing_fingerprints.add(fingerprint)  # guards against a duplicate row within this same upload
     session.flush()
     return list(session.execute(
         select(Transaction).where(Transaction.holding_id == holding.holding_id).order_by(Transaction.date, Transaction.occurrence_index)
@@ -242,6 +247,17 @@ async def ingest_cas(
 
     result = IngestResult(upload_id=upload.upload_id, duplicate=False, warnings=list(upload.warnings))
 
+    # Prefetch every scheme's mfapi.in data CONCURRENTLY before the main
+    # loop, which resolves schemes sequentially (it has to — each
+    # resolve_scheme call reads/writes the same DB session, and
+    # SQLAlchemy sessions aren't safe for concurrent use). Proven live:
+    # this was the dominant cost in a real upload timing out — 5 schemes
+    # resolved sequentially took ~35s of pure network wait (mfapi.in's
+    # own per-call latency, 1-15s and highly variable); prefetching
+    # collapses that to roughly the single slowest call instead of their sum.
+    all_amfi_codes = [s.amfi for folio in parsed.folios for s in folio.schemes if s.amfi]
+    prefetched_mfapi = await prefetch_mfapi_schemes(client, all_amfi_codes)
+
     for folio in parsed.folios:
         folio_row = _get_or_create_folio(session, investor_id, folio.folio, folio.amc)
         for scheme in folio.schemes:
@@ -251,6 +267,7 @@ async def ingest_cas(
                 session, client,
                 cas_isin=scheme.isin, cas_amfi_code=scheme.amfi, cas_scheme_name=scheme.scheme,
                 cas_rta_code=scheme.rta_code, plan=plan, option=option, asset_class=asset_class,
+                prefetched_mfapi=prefetched_mfapi,
             )
             holding = _get_or_create_holding(
                 session, folio_row.folio_id, resolution.scheme.scheme_id, plan, option, scheme.advisor,

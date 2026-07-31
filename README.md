@@ -58,6 +58,24 @@ live NAV resolved from mfapi.in. Concretely:
   personal-XIRR-comparable benchmark return — see the caveat below on
   which benchmarks that's actually possible for.
 
+**Upload performance**: `ingest_cas` resolves schemes sequentially (each
+`resolve_scheme` call reads/writes the same DB session, so it can't
+safely run concurrently with itself) — but the mfapi.in *network* call
+each one makes is independent of the DB, so `scheme_resolution.py`'s
+`prefetch_mfapi_schemes` fetches every scheme's mfapi.in data
+concurrently up front, and the sequential resolution loop then reads
+from that prefetched map instead of making its own live call. This
+exists because of a real incident: a production upload was timing out
+with a 500, traced by profiling the exact ingestion path end-to-end —
+resolving 5 schemes sequentially spent ~35s just waiting on mfapi.in
+(its own per-call latency is highly variable, 1-15s, especially under
+concurrent load), and a separate N+1 query pattern in
+`_persist_transactions` (one round trip per incoming transaction to
+check for duplicates, instead of one per holding) added another ~75s
+importing 120 transactions. Fixed, in order: batch the duplicate check
+into one query per holding, then prefetch mfapi.in concurrently — took
+a 5-fund/120-transaction import from 145s down to ~25s.
+
 ## Deployment
 
 - **Backend** → Render, building `Dockerfile` at this repo's root

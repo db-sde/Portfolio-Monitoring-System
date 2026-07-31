@@ -16,6 +16,8 @@ CAS is never read for current or historical value anywhere in this file.
 
 from __future__ import annotations
 
+import json
+import logging
 import os
 import tempfile
 from datetime import date, datetime, timezone
@@ -36,7 +38,7 @@ from starlette.concurrency import run_in_threadpool
 from casparser import read_cas_pdf
 from casparser.enums import TransactionType
 from casparser.exceptions import CASParseError, ParserException
-from casparser.types import NSDLCASData
+from casparser.types import CASData, NSDLCASData
 
 import benchmark_service
 import config_service
@@ -51,6 +53,9 @@ from models import CasUpload, EnrichmentCache, Folio, Holding, Scheme, Transacti
 
 CALCULATION_VERSION = "2.0.0"  # bumped on any change to a calculation rule (spec 22)
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger("portfolioiq")
 
 app = FastAPI(title="PortfolioIQ")
 
@@ -200,21 +205,46 @@ async def upload_cas(
     content = await file.read()
     if len(content) > MAX_UPLOAD_BYTES:
         raise HTTPException(413, "That file is larger than we accept (20MB max).")
-    if not filename.endswith(".pdf"):
-        raise HTTPException(400, "Upload the CAS PDF from CAMS/KFintech.")
+    if not (filename.endswith(".pdf") or filename.endswith(".json")):
+        raise HTTPException(400, "Upload the CAS PDF from CAMS/KFintech (or a previously-parsed CAS JSON file).")
 
-    with tempfile.TemporaryDirectory(prefix="portfolioiq-") as tmp:
-        pdf_path = Path(tmp) / "statement.pdf"
-        pdf_path.write_bytes(content)
+    if filename.endswith(".json"):
+        # A previously-parsed CAS JSON — useful for testing, or if
+        # someone already has one from elsewhere. Re-validated through
+        # the same CASData pydantic model read_cas_pdf itself returns
+        # (Decimal/date fields coerce correctly from JSON strings/numbers
+        # via pydantic, same as any other CASData construction), so
+        # everything downstream sees an identical shape either way.
         try:
-            parsed = await run_in_threadpool(read_cas_pdf, str(pdf_path), password)
-        except CASParseError as exc:
-            message = str(exc)
-            if "password" in message.lower():
-                raise HTTPException(401, "That password didn't work. Double check it and try again.")
-            raise HTTPException(422, "We couldn't read this as a CAS statement. Make sure it's the unmodified PDF from CAMS or KFintech.")
-        except ParserException:
-            raise HTTPException(422, "This statement couldn't be parsed.")
+            raw_dict = json.loads(content)
+        except json.JSONDecodeError:
+            raise HTTPException(400, "That doesn't look like valid JSON.")
+        try:
+            parsed = CASData.model_validate(raw_dict)
+        except Exception as exc:
+            raise HTTPException(422, f"That JSON doesn't match the expected CAS data shape: {exc}")
+    else:
+        with tempfile.TemporaryDirectory(prefix="portfolioiq-") as tmp:
+            pdf_path = Path(tmp) / "statement.pdf"
+            pdf_path.write_bytes(content)
+            try:
+                parsed = await run_in_threadpool(read_cas_pdf, str(pdf_path), password)
+            except CASParseError as exc:
+                message = str(exc)
+                if "password" in message.lower():
+                    raise HTTPException(401, "That password didn't work. Double check it and try again.")
+                raise HTTPException(422, "We couldn't read this as a CAS statement. Make sure it's the unmodified PDF from CAMS or KFintech.")
+            except ParserException:
+                raise HTTPException(422, "This statement couldn't be parsed.")
+            except Exception:
+                # Anything else — a casparser internal error on a real-world
+                # PDF shape the CASParseError/ParserException catches above
+                # don't cover — must not surface as a bare, undiagnosable 500.
+                # Logged with the full traceback (visible in Render's log
+                # viewer) so a report of "upload failed" is actually
+                # debuggable instead of a dead end.
+                logger.exception("read_cas_pdf failed on an uncategorised exception")
+                raise HTTPException(422, "This statement couldn't be parsed. If this keeps happening, it's a bug — the server log has the details.")
 
     if isinstance(parsed, NSDLCASData):
         raise HTTPException(
@@ -224,8 +254,12 @@ async def upload_cas(
         )
     _fix_segregation_classification(parsed)
 
-    async with httpx.AsyncClient() as client:
-        result = await ingestion.ingest_cas(session, client, parsed, content, investor_id=None)
+    try:
+        async with httpx.AsyncClient() as client:
+            result = await ingestion.ingest_cas(session, client, parsed, content, investor_id=None)
+    except Exception:
+        logger.exception("ingest_cas failed after a successful PDF parse")
+        raise HTTPException(500, "The statement parsed, but importing it failed. This is a bug — the server log has the details.")
 
     if result.duplicate:
         return {"status": "duplicate", "message": "This exact statement has already been imported.", "upload_id": result.upload_id}
