@@ -12,6 +12,12 @@ dist
 dist-ssr
 *.local
 
+# Never commit real secrets (VITE_API_KEY) — .env.example documents the
+# shape, real values go here or in Vercel's environment variable dashboard.
+.env
+.env.local
+.env.*.local
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json

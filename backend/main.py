@@ -19,6 +19,7 @@ from __future__ import annotations
 import json
 import logging
 import os
+import secrets
 import tempfile
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -29,8 +30,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Response, UploadFile
+from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException, Query, Request, Response, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
@@ -62,6 +64,34 @@ app = FastAPI(title="PortfolioIQ")
 _default_origins = "http://localhost:5173"
 _cors_origins = [o.strip() for o in os.environ.get("CORS_ORIGINS", _default_origins).split(",") if o.strip()]
 app.add_middleware(CORSMiddleware, allow_origins=_cors_origins, allow_methods=["*"], allow_headers=["*"])
+
+# This app has real personal financial data behind it (holdings, PAN,
+# transaction history) and, until this was added, zero authentication —
+# every route including DELETE /api/all-data was reachable by anyone who
+# found the (public) GitHub repo or just the live URL. That's not
+# hypothetical: a real upload's data was wiped in production between two
+# checks minutes apart, with nothing in this app's own code or UI capable
+# of having caused it — the only thing that fits is an unauthenticated
+# caller hitting the endpoint directly. A shared API key isn't a full
+# auth system (there's no per-user login, and a key embedded in the
+# built frontend bundle is visible to anyone who inspects that bundle's
+# own network requests), but it closes the actual exposure this
+# incident came from: a stranger or bot finding the endpoint from the
+# public source and calling it directly, without ever loading the app.
+API_KEY = os.environ.get("API_KEY")
+_UNAUTHENTICATED_PATHS = {"/api/health"}
+
+
+@app.middleware("http")
+async def _require_api_key(request: Request, call_next):
+    if request.method == "OPTIONS" or request.url.path in _UNAUTHENTICATED_PATHS:
+        return await call_next(request)
+    if not API_KEY:
+        return JSONResponse(status_code=500, content={"detail": "Server misconfigured: API_KEY is not set."})
+    supplied = request.headers.get("x-api-key", "")
+    if not secrets.compare_digest(supplied, API_KEY):
+        return JSONResponse(status_code=401, content={"detail": "Missing or invalid API key."})
+    return await call_next(request)
 
 
 @app.on_event("startup")

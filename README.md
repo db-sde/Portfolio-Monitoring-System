@@ -135,6 +135,32 @@ free-tier compute suspends after inactivity and wakes on the next
 connection, so the very first request after a quiet period can take a
 few seconds longer than usual; that's expected, not a failure.
 
+**`API_KEY` is also required**, not optional — every request to the
+backend (except `GET /api/health`) must send it back as an `X-API-Key`
+header, checked in `main.py`'s `_require_api_key` middleware, or the
+backend returns 401 (or 500 if `API_KEY` itself isn't set). This exists
+because of a real incident: with this repo public on GitHub and zero
+auth on any route, a real production upload's entire dataset — every
+statement, holding, and transaction — was wiped via `DELETE
+/api/all-data` by an unauthenticated caller; nothing in this app's own
+code or UI could have done it. A shared key isn't real per-user auth
+(it ships in the built frontend bundle, so it's visible to anyone who
+inspects that bundle's own network requests), but it stops a stranger
+or bot from calling the API directly without ever loading the app,
+which is the exposure this incident actually came from.
+
+1. Generate a key: `python3 -c "import secrets; print(secrets.token_urlsafe(32))"`.
+2. **Render** → backend service → *Environment* → add `API_KEY` with
+   that value.
+3. **Vercel** → frontend project → *Environment Variables* → add
+   `VITE_API_KEY` with the **same** value, then redeploy (Vite bakes env
+   vars in at build time, so a var added after the last build won't take
+   effect until the next one).
+4. **Local dev**: put the same value in `backend/.env`'s `API_KEY` and
+   `frontend/.env`'s `VITE_API_KEY` (copy each from its `.env.example`
+   first) — they must match each other exactly, but don't need to match
+   Render/Vercel's production value.
+
 ## Enrichment sources — what's real, what's genuinely unavailable
 
 | Source | What it provides | Status |
