@@ -64,6 +64,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import logging
 import os
 import re
 from datetime import datetime, timedelta, timezone
@@ -71,6 +72,8 @@ from pathlib import Path
 from typing import Any, Optional
 
 import httpx
+
+logger = logging.getLogger("portfolioiq")
 
 CACHE_TTL_HOURS = float(os.environ.get("CACHE_TTL_HOURS", "24"))
 MFDATA_BASE = "https://mfdata.in/api/v1"
@@ -714,12 +717,22 @@ async def enrich_schemes(schemes: list[dict]) -> dict[str, dict]:
             # series for every fund, and this way a portfolio with 20
             # holdings costs 1 extra request, not 20.
             benchmark_nav_history = await _get_benchmark_nav_history(client, cache)
+            # return_exceptions=True is load-bearing, not defensive
+            # boilerplate: without it, one scheme raising (a real
+            # incident — one bad fund in a 14-scheme real-portfolio batch
+            # took down NAV enrichment for all 13 others, silently,
+            # because plain gather() discards every already-completed
+            # result the moment any single coroutine raises) blows up the
+            # whole batch instead of failing just that one scheme.
             fetched = await asyncio.gather(*[
                 _enrich_one(client, s["amfi"], s.get("isin"), s.get("scheme", ""), benchmark_nav_history)
                 for s in to_fetch
-            ])
+            ], return_exceptions=True)
         for scheme, data in zip(to_fetch, fetched):
             amfi = scheme["amfi"]
+            if isinstance(data, BaseException):
+                logger.exception("enrich_schemes: _enrich_one failed for amfi=%s", amfi, exc_info=data)
+                continue
             results[amfi] = data
             cache[amfi] = {
                 "cached_at": datetime.now(timezone.utc).isoformat(),

@@ -184,14 +184,28 @@ async def _run_enrichment_task(scheme_ids: list[int]) -> None:
     it — caught live in testing (a raised ConnectTimeout in the
     benchmark call discarded an already-successful scheme NAV
     population in the same transaction). Isolating them means a failure
-    in one never costs the other its work."""
-    async with httpx.AsyncClient() as client:
-        with db.get_session() as session:
-            await benchmark_service.refresh_nifty50_proxy_nav(session, client)
-        with db.get_session() as session:
-            schemes = [session.get(Scheme, sid) for sid in scheme_ids]
-            schemes = [s for s in schemes if s is not None]
-            await enrichment_bridge.refresh_enrichment(session, schemes)
+    in one never costs the other its work.
+
+    This whole body is wrapped in try/except: it runs as a FastAPI
+    BackgroundTask, after the HTTP response has already been sent, so
+    there is no request/response cycle left to surface an exception
+    through — an uncaught one here fails completely silently to the
+    client and, depending on the ASGI server, may not even reach the
+    log. A real production upload's enrichment came back with zero
+    NAV/enrichment rows for every real scheme with no visible error;
+    logging explicitly here is what would have made that diagnosable
+    from Render's log viewer instead of requiring a live DB query to
+    even notice it happened."""
+    try:
+        async with httpx.AsyncClient() as client:
+            with db.get_session() as session:
+                await benchmark_service.refresh_nifty50_proxy_nav(session, client)
+            with db.get_session() as session:
+                schemes = [session.get(Scheme, sid) for sid in scheme_ids]
+                schemes = [s for s in schemes if s is not None]
+                await enrichment_bridge.refresh_enrichment(session, schemes)
+    except Exception:
+        logger.exception("_run_enrichment_task failed for scheme_ids=%s", scheme_ids)
 
 
 @app.post("/api/upload-cas")

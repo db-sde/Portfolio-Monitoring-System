@@ -23,6 +23,7 @@ most requests, not just after the first one per process.
 
 from __future__ import annotations
 
+import logging
 from datetime import date, datetime, timedelta, timezone
 from decimal import Decimal
 from typing import Optional
@@ -33,6 +34,8 @@ from sqlalchemy.orm import Session
 import enrichment
 import nav_service
 from models import EnrichmentCache, Scheme
+
+logger = logging.getLogger("portfolioiq")
 
 CACHE_TTL_HOURS = 24
 PROVIDER_KEY = "mfapi.in+captnemo"
@@ -79,32 +82,48 @@ async def refresh_enrichment(session: Session, schemes: list[Scheme]) -> dict[in
         payload = results.get(scheme.amfi_code) if scheme.amfi_code else None
         if payload is None:
             continue
-        nav_history = payload.pop("_nav_history", None) or []
-        if nav_history:
-            points = []
-            for row in nav_history:
-                d = enrichment._parse_nav_date(row["date"])
-                if d is not None:
-                    points.append((d, Decimal(str(row["nav"]))))
-            nav_service.store_nav_points(session, scheme.scheme_id, points)
+        try:
+            # A SAVEPOINT (begin_nested), not the bare session: this loop
+            # shares one session/transaction across every scheme in the
+            # batch, and a plain session.rollback() on a mid-loop failure
+            # would undo every earlier scheme's already-flushed writes
+            # too, not just this one's — a real bug caught before it
+            # shipped. begin_nested() scopes the rollback to just this
+            # scheme's own SAVEPOINT on exception, leaving prior schemes'
+            # flushed work in the (still-open) outer transaction intact.
+            with session.begin_nested():
+                nav_history = payload.pop("_nav_history", None) or []
+                if nav_history:
+                    points = []
+                    for row in nav_history:
+                        d = enrichment._parse_nav_date(row["date"])
+                        if d is not None:
+                            points.append((d, Decimal(str(row["nav"]))))
+                    nav_service.store_nav_points(session, scheme.scheme_id, points)
 
-        existing = session.execute(
-            select(EnrichmentCache).where(
-                EnrichmentCache.scheme_id == scheme.scheme_id, EnrichmentCache.provider == PROVIDER_KEY,
+                existing = session.execute(
+                    select(EnrichmentCache).where(
+                        EnrichmentCache.scheme_id == scheme.scheme_id, EnrichmentCache.provider == PROVIDER_KEY,
+                    )
+                ).scalar_one_or_none()
+                data_as_of = date.today()
+                if existing:
+                    existing.payload = payload
+                    existing.data_as_of = data_as_of
+                    existing.fetched_at = datetime.now(timezone.utc)
+                    existing.status = "ok" if payload.get("enrichment_source") != "failed" else "unavailable"
+                else:
+                    session.add(EnrichmentCache(
+                        scheme_id=scheme.scheme_id, provider=PROVIDER_KEY, payload=payload,
+                        data_as_of=data_as_of, fetched_at=datetime.now(timezone.utc),
+                        status="ok" if payload.get("enrichment_source") != "failed" else "unavailable",
+                    ))
+        except Exception:
+            logger.exception(
+                "refresh_enrichment: failed to persist scheme_id=%s amfi=%s",
+                scheme.scheme_id, scheme.amfi_code,
             )
-        ).scalar_one_or_none()
-        data_as_of = date.today()
-        if existing:
-            existing.payload = payload
-            existing.data_as_of = data_as_of
-            existing.fetched_at = datetime.now(timezone.utc)
-            existing.status = "ok" if payload.get("enrichment_source") != "failed" else "unavailable"
-        else:
-            session.add(EnrichmentCache(
-                scheme_id=scheme.scheme_id, provider=PROVIDER_KEY, payload=payload,
-                data_as_of=data_as_of, fetched_at=datetime.now(timezone.utc),
-                status="ok" if payload.get("enrichment_source") != "failed" else "unavailable",
-            ))
+            continue
         fresh[scheme.scheme_id] = payload
 
     session.flush()

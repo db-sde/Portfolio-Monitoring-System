@@ -76,6 +76,33 @@ importing 120 transactions. Fixed, in order: batch the duplicate check
 into one query per holding, then prefetch mfapi.in concurrently — took
 a 5-fund/120-transaction import from 145s down to ~25s.
 
+**Background enrichment reliability**: `/api/upload-cas` returns as soon
+as ingestion/FIFO finish and kicks off NAV/risk-ratio enrichment as a
+FastAPI `BackgroundTask` (`_run_enrichment_task` in `main.py`), so the
+response doesn't wait on 10+ more mfapi.in round trips. A real upload of
+14 real schemes hit an incident where every single one came back with
+no NAV data (current value stuck at ₹0) even though re-running the
+exact same enrichment call by hand against the same schemes moments
+later succeeded completely — proving the enrichment logic itself was
+correct. Root cause: `enrichment.py`'s `enrich_schemes` fetched the
+whole batch through one `asyncio.gather(...)` with default settings, so
+a single scheme's transient mfapi.in blip (confirmed elsewhere in this
+doc to happen under concurrent load) raised, and plain `gather()`
+discards every other coroutine's already-completed result the moment
+any one of them raises — an all-or-nothing batch, not a per-scheme
+failure. Compounding it, nothing wrapped `_run_enrichment_task` itself,
+so the exception vanished with no trace: background tasks run after the
+HTTP response is already sent, so there's no request/response cycle
+left to surface an error through. Fixed three ways: `enrich_schemes`
+now calls `gather(..., return_exceptions=True)` and logs+skips just the
+scheme(s) that failed; `enrichment_bridge.refresh_enrichment`'s
+per-scheme DB write runs inside its own `session.begin_nested()`
+SAVEPOINT so one scheme's bad payload can't roll back every other
+scheme already flushed in the same shared session; and
+`_run_enrichment_task` is now wrapped in try/except with
+`logger.exception`, so a future failure is visible in Render's log
+viewer instead of only discoverable by directly querying the database.
+
 ## Deployment
 
 - **Backend** → Render, building `Dockerfile` at this repo's root
