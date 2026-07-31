@@ -200,12 +200,49 @@ def _rebuild_fifo(session: Session, holding: Holding, transactions: list[Transac
     # magnitudes ("100 units acquired" / "120 units disposed"), not
     # signed deltas, so both are normalised to abs() here regardless of
     # transaction type.
+    #
+    # Spec 8.3/12: "tax cost includes apportioned acquisition stamp duty
+    # where applicable" — a real CAS ledger carries stamp duty as its own
+    # STAMP_DUTY_TAX row alongside the purchase it applies to, not as
+    # part of the purchase row's own amount. fifo.py/PurchaseLot/
+    # gains_service_db.py all already carry a stamp_duty field end to
+    # end (including gains_service_db's own proportional split when a
+    # lot is only partially sold), but nothing here was ever populating
+    # it — every lot's stamp_duty silently stayed the dataclass default
+    # of zero, understating cost basis (and overstating realized gains)
+    # on the 112A export by however much stamp duty that holding paid.
+    # Matched by same holding + same date, since that's how a real
+    # statement pairs them; split proportionally by purchase amount on
+    # the rare date with more than one lot-creating transaction.
+    stamp_duty_by_date: dict[date, Decimal] = {}
+    for t in transactions:
+        if t.type == "STAMP_DUTY_TAX" and t.amount:
+            stamp_duty_by_date[t.date] = stamp_duty_by_date.get(t.date, Decimal("0")) + abs(t.amount)
+
+    lot_creating_by_date: dict[date, list[Transaction]] = {}
+    for t in transactions:
+        if t.type in LOT_CREATING_TYPES:
+            lot_creating_by_date.setdefault(t.date, []).append(t)
+
+    def _stamp_duty_for(t: Transaction) -> Decimal:
+        day_total = stamp_duty_by_date.get(t.date)
+        if not day_total:
+            return Decimal("0")
+        same_day = lot_creating_by_date.get(t.date, [])
+        if len(same_day) <= 1:
+            return day_total
+        amounts_total = sum((abs(x.amount) for x in same_day if x.amount), Decimal("0"))
+        if not amounts_total or not t.amount:
+            return Decimal("0")
+        return day_total * (abs(t.amount) / amounts_total)
+
     events = [
         LotInput(
             transaction_id=t.transaction_id, date=t.date, type=t.type,
             units=abs(t.units) if t.units is not None else Decimal("0"),
             amount=abs(t.amount) if t.amount is not None else Decimal("0"),
             nav=t.nav,
+            stamp_duty=_stamp_duty_for(t) if t.type in LOT_CREATING_TYPES else Decimal("0"),
         )
         for t in transactions
         if t.type in LOT_CREATING_TYPES or t.type in DISPOSAL_TYPES or t.type in NON_TAXABLE_REDUCTION_TYPES

@@ -37,8 +37,14 @@ MONEY_IN_TYPES = {"REDEMPTION", "SWITCH_OUT", "SWITCH_OUT_MERGER", "DIVIDEND_PAY
 # added, no net external flow), STAMP_DUTY_TAX/STT_TAX/TDS_TAX (already
 # folded into acquisition/disposal cost, not a separate flow event here),
 # SEGREGATION/GIFT_IN/GIFT_OUT/MISC/UNKNOWN (spec 8.3: excluded without
-# linked donor/cost data), REVERSAL (handled by the transaction it
-# reverses no longer being counted, not as its own flow).
+# linked donor/cost data). REVERSAL is NOT in this "no impact" group —
+# despite what an earlier version of this comment claimed ("handled by
+# the transaction it reverses no longer being counted"), nothing ever
+# actually excluded that transaction; a bounced SIP's original
+# PURCHASE_SIP outflow is always counted normally. REVERSAL needs its
+# own offsetting flow instead, handled explicitly below (not via this
+# set, since its amount is already negative and would double-negate
+# through the abs() both sets apply).
 
 
 @dataclass

@@ -33,6 +33,16 @@ BUCKET_KEYS = ("EQUITY", "HYBRID", "DEBT", "total")
 
 MONEY_OUT_TYPES = {"PURCHASE", "PURCHASE_SIP", "SWITCH_IN", "SWITCH_IN_MERGER"}
 MONEY_IN_TYPES = {"REDEMPTION", "SWITCH_OUT", "SWITCH_OUT_MERGER", "DIVIDEND_PAYOUT"}
+# REVERSAL isn't in MONEY_IN_TYPES: its amount is already negative (a
+# bounced SIP's amount/units are both stored negative), so it needs its
+# own signed handling below rather than an abs()'d addition — see
+# portfolio_service.py's _txn_cash_flow, which already does this
+# correctly; this module's own period_cashflows loop didn't, until this
+# was found by auditing every MONEY_IN/OUT_TYPES site against the same
+# real-statement bug that hit fifo.py (a reversed SIP's original
+# PURCHASE_SIP outflow was being counted with nothing to offset it,
+# overstating net invested cash and understating this holding's XIRR
+# for this exact window).
 
 
 @dataclass
@@ -101,10 +111,21 @@ def compute_snapshot(
             key = type_key.get(t.type)
             if key and t.amount is not None:
                 period[key] += abs(t.amount)
+            elif t.type == "REVERSAL" and t.amount is not None:
+                # Same gap as the cash-flow branch below: a bounced SIP's
+                # PURCHASE_SIP amount already landed in period["purchase"]
+                # via type_key above, and nothing reversed it back out —
+                # inflating the displayed Purchase total on the Snapshot
+                # page by however much was reversed. REVERSAL is
+                # casparser's own name for a reversed SIP installment
+                # specifically, so it always nets against "purchase".
+                period["purchase"] -= abs(t.amount)
             if t.type in MONEY_OUT_TYPES and t.amount is not None:
                 period_cashflows.append((t.date, -abs(t.amount)))
             elif t.type in MONEY_IN_TYPES and t.amount is not None:
                 period_cashflows.append((t.date, abs(t.amount)))
+            elif t.type == "REVERSAL" and t.amount is not None:
+                period_cashflows.append((t.date, -t.amount))
         if closing_value:
             period_cashflows.append((end_date, closing_value))
 

@@ -49,7 +49,22 @@ live NAV resolved from mfapi.in. Concretely:
   all until a real holding's derived balance came out 82 units higher
   than the CAS statement's own printed close — exactly the sum of that
   holding's three reversed SIP installments, which nothing had ever
-  subtracted back out.
+  subtracted back out. The same REVERSAL gap turned out to be in two
+  more places, found by auditing every spot in the backend that
+  branches on transaction type: `portfolio_service.py`'s holding-level
+  XIRR already special-cased it correctly, but `snapshot_service.py`'s
+  own period cash-flow list and its displayed "Purchase" total didn't —
+  a fully-reversed SIP would count as a real outflow with nothing to
+  offset it, inflating both the Snapshot page's Purchase figure and
+  understating its XIRR. Fixed the same way, in both places. Separately,
+  the spec's own requirement that "tax cost includes apportioned
+  acquisition stamp duty" had all its plumbing built
+  (`PurchaseLot.stamp_duty`, `gains_service_db.py`'s proportional split
+  on partial disposal) but `ingestion.py` never actually extracted the
+  real amount from a CAS statement's own `STAMP_DUTY_TAX` rows — every
+  lot's stamp duty silently stayed zero, understating cost basis (and
+  overstating realized gains) on the 112A export. Now matched by
+  same-holding + same-date and wired through.
 - **`xirr_engine.py`** solves money-weighted XIRR from full dated
   cash-flow history — every page's XIRR (including subtotals/advisor
   blends) is recalculated from consolidated cash flows, never averaged
