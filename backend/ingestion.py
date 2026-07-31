@@ -104,8 +104,27 @@ def _get_or_create_holding(
     return holding
 
 
+# casparser's own date-bearing fields aren't uniformly formatted: real
+# statement_period.from_/to strings observed live as "01-Jan-2003"
+# (DD-Mon-YYYY) — not the ISO format this originally assumed, which
+# only ever showed up in this app's own synthetic test fixtures and
+# crashed on the first real CAS statement it processed in production.
+# TransactionData.date is typed Union[date, str] and is usually already
+# a real date object by the time it reaches here, but the same
+# multi-format fallback covers it too if it isn't.
+_DATE_FORMATS = ("%Y-%m-%d", "%d-%b-%Y", "%d-%m-%Y")
+
+
 def _as_date(value) -> date:
-    return value if isinstance(value, date) else datetime.strptime(str(value), "%Y-%m-%d").date()
+    if isinstance(value, date):
+        return value
+    s = str(value)
+    for fmt in _DATE_FORMATS:
+        try:
+            return datetime.strptime(s, fmt).date()
+        except ValueError:
+            continue
+    raise ValueError(f"Unrecognised date format: {s!r} (tried {_DATE_FORMATS})")
 
 
 def _transaction_fingerprint(t) -> tuple:
