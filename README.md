@@ -279,8 +279,21 @@ cd backend
 python3 tests/test_fifo.py              # FIFO lot engine, pure/offline
 python3 tests/test_xirr.py              # XIRR solver, pure/offline
 python3 tests/test_ingestion_helpers.py # ingestion.py's pure helper functions, pure/offline
-python3 tests/test_integration.py       # needs DATABASE_URL — real Neon connection, self-cleaning
+python3 tests/test_integration.py       # needs DATABASE_URL — real Neon connection, TRUNCATEs tables
 ```
+
+**`test_integration.py` is destructive** — its `_cleanup()` TRUNCATEs
+cas_uploads/holdings/schemes/transactions/etc. with CASCADE at the start
+and end of every test. This project has one Neon database, not a
+separate test instance, and running this file with `DATABASE_URL`
+pointed at a database holding a real upload will destroy it — a real
+incident, not a hypothetical: it happened mid-session, wiping a just
+re-uploaded real portfolio with zero warning. `_cleanup()` now refuses
+to run if `cas_uploads` holds anything that isn't this file's own test
+fixture data (every fixture uses investor name `"T"`; a real name
+trips the guard), but that's a tripwire for this one specific mistake,
+not a reason to skip checking what `DATABASE_URL` actually points at
+before running this file.
 
 28 tests total across the four files. Every bug fix described in
 Architecture above shipped with a regression test in one of these —

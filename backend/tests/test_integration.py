@@ -1,11 +1,25 @@
 """
-Integration tests against a real (test-scoped) Neon connection, covering
-the remaining spec 20.1 rows not exercised by test_fifo.py/test_xirr.py:
+Integration tests against a real Neon connection, covering the
+remaining spec 20.1 rows not exercised by test_fifo.py/test_xirr.py:
 weekend/holiday NAV resolution, overlapping-CAS-upload idempotency, and
 missing-benchmark-data handling. Each test cleans up its own rows.
 
 Run: python backend/tests/test_integration.py (needs DATABASE_URL set —
 backend/.env is loaded automatically, same as the app itself).
+
+DANGER — read before running this against anything but a scratch
+database: _cleanup() TRUNCATEs cas_uploads/holdings/schemes/transactions
+/purchase_lots/etc. with CASCADE, unconditionally, at the start AND end
+of every single test. This project has exactly one Neon database, not a
+separate test instance — a real incident happened because of exactly
+this: running this file with DATABASE_URL pointed at the same database
+a real CAS upload had just landed in destroyed that upload completely,
+with zero warning, mid-session. _cleanup() now refuses to run if
+cas_uploads holds anything that doesn't look like this file's own test
+fixtures (every one of which uses investor name "T") — but that guard
+is a tripwire for exactly this one mistake, not a substitute for
+actually checking DATABASE_URL points at a scratch database before
+running this file at all.
 """
 import asyncio
 import sys
@@ -35,8 +49,24 @@ from casparser.types import (  # noqa: E402
 from casparser.enums import TransactionType, CASFileType, FileType  # noqa: E402
 
 
+TEST_FIXTURE_INVESTOR_NAME = "T"  # every InvestorInfo(...) in this file uses this
+
+
 def _cleanup():
     with db.engine.begin() as conn:
+        names = [row[0] for row in conn.execute(
+            text("SELECT DISTINCT raw_parsed_json->'investor_info'->>'name' FROM cas_uploads")
+        ).fetchall()]
+        unexpected = [n for n in names if n != TEST_FIXTURE_INVESTOR_NAME]
+        if unexpected:
+            raise RuntimeError(
+                f"REFUSING to clean up: cas_uploads contains investor name(s) {unexpected!r} that "
+                f"aren't this test suite's own fixture name ({TEST_FIXTURE_INVESTOR_NAME!r}). This "
+                f"almost certainly means DATABASE_URL points at a database holding a real upload, "
+                f"and _cleanup() is about to TRUNCATE it along with everything else — exactly the "
+                f"incident that put this guard here. Point DATABASE_URL at a scratch database, or "
+                f"if you are certain this data is disposable, delete it yourself first."
+            )
         for t in ("disposal_allocations", "purchase_lots", "transactions", "nav_cache",
                   "holdings", "scheme_aliases", "schemes", "folios", "cas_uploads"):
             conn.execute(text(f"TRUNCATE TABLE {t} RESTART IDENTITY CASCADE"))
