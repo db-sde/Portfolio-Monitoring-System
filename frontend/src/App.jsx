@@ -38,6 +38,7 @@ export default function App() {
   const [enrichStatus, setEnrichStatus] = useState(null)
   const [uploading, setUploading] = useState(false)
   const [uploadError, setUploadError] = useState(null)
+  const [initialLoadError, setInitialLoadError] = useState(null)
   const [refreshTick, setRefreshTick] = useState(0)
   const [sidebarOpen, setSidebarOpen] = useState(false)
 
@@ -81,7 +82,17 @@ export default function App() {
         investor_name: (p.investor_names || []).join(', ') || undefined,
         statement_period: { from: p.holdings_coverage_from, to: p.holdings_coverage_through },
       })
-    }).catch(() => {}).finally(() => setCheckingInitial(false))
+    }).catch((err) => {
+      // A failed request here used to be swallowed identically to "no
+      // data yet" — a real incident (the backend rejecting every
+      // request with 500 "API_KEY is not set") looked exactly like an
+      // empty account, with no indication anything was actually wrong.
+      // Surfaced through the same error banner WelcomeUpload already
+      // renders for a failed upload, so a misconfigured/unreachable
+      // backend is visible on page load, not just discoverable by
+      // trying to upload and having that fail too.
+      setInitialLoadError(err.message || 'Could not reach the backend.')
+    }).finally(() => setCheckingInitial(false))
   }, [loadConfig])
 
   const handleUpload = async (file, password = '') => {
@@ -104,7 +115,11 @@ export default function App() {
   }
 
   if (!uploadInfo) {
-    return <WelcomeUpload onUpload={handleUpload} uploading={uploading} error={uploadError} />
+    // uploadError (a failed upload attempt) takes priority once the user
+    // has actually tried something; initialLoadError (the page's own
+    // first load failing) is the fallback so a misconfigured/unreachable
+    // backend is visible even before they've touched anything.
+    return <WelcomeUpload onUpload={handleUpload} uploading={uploading} error={uploadError || initialLoadError} />
   }
 
   const PageComponent = PAGES[page]
