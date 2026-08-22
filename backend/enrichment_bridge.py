@@ -90,7 +90,19 @@ async def refresh_enrichment(session: Session, schemes: list[Scheme]) -> dict[in
             # too, not just this one's — a real bug caught before it
             # shipped. begin_nested() scopes the rollback to just this
             # scheme's own SAVEPOINT on exception, leaving prior schemes'
-            # flushed work in the (still-open) outer transaction intact.
+            # flushed work in the (still-open) outer transaction intact —
+            # but that alone only protects against a *data* problem in
+            # one scheme's payload. A *connection*-level failure (a real
+            # Neon timeout, caught live: writing one scheme's several-
+            # thousand-row NAV history took long enough to hit "SSL
+            # SYSCALL error: Operation timed out") breaks the whole
+            # session, and everything still sitting uncommitted — every
+            # earlier scheme in this same loop, even ones that finished
+            # cleanly — would be lost when the loop's single trailing
+            # flush/the caller's eventual commit fails too. Committing
+            # per scheme, right after each one's SAVEPOINT releases,
+            # makes every scheme's success durable independently of
+            # whether a later one in the same batch loses its connection.
             with session.begin_nested():
                 nav_history = payload.pop("_nav_history", None) or []
                 if nav_history:
@@ -118,13 +130,20 @@ async def refresh_enrichment(session: Session, schemes: list[Scheme]) -> dict[in
                         data_as_of=data_as_of, fetched_at=datetime.now(timezone.utc),
                         status="ok" if payload.get("enrichment_source") != "failed" else "unavailable",
                     ))
+            session.commit()
         except Exception:
             logger.exception(
                 "refresh_enrichment: failed to persist scheme_id=%s amfi=%s",
                 scheme.scheme_id, scheme.amfi_code,
             )
+            # rollback (not just letting the exception propagate) is what
+            # lets a scheme AFTER this one still succeed on the same
+            # session — SQLAlchemy invalidates a connection that died
+            # mid-query and transparently gets a fresh one from the pool
+            # (pool_pre_ping=True) on the session's next use, but only
+            # once the session's own error state has been cleared.
+            session.rollback()
             continue
         fresh[scheme.scheme_id] = payload
 
-    session.flush()
     return fresh
