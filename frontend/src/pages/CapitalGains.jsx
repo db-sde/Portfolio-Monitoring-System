@@ -78,7 +78,7 @@ export default function CapitalGains({ filters, refreshTick }) {
               <div className="text-xs font-medium text-ink-3 mb-1">Long-term (LTCG)</div>
               <div className={`font-display text-2xl font-bold tabular ${ltcg >= 0 ? 'text-good' : 'text-bad'}`}>{formatIndian(ltcg)}</div>
             </div>
-            <div className="rounded-xl border border-line-soft bg-card p-4 bg-band">
+            <div className="rounded-xl border border-band-line bg-band p-4">
               <div className="text-xs font-medium text-band-ink/70 mb-1">Net realised gain (selected FY)</div>
               <div className="font-display text-2xl font-bold tabular text-band-ink">{formatIndian(net)}</div>
             </div>
