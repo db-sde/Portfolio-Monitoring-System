@@ -65,7 +65,20 @@ def get_latest_nav(session: Session, scheme_id: int) -> Optional[NavPoint]:
     return get_nav_on_or_before(session, scheme_id, date.today())
 
 
-NAV_UPSERT_BATCH_SIZE = 500
+# 500 was too conservative in practice: a real 52-scheme portfolio (some
+# funds with 20+ years of daily NAV history, ~5,000+ rows each) took
+# 262s to enrich — 23s of that was the concurrent mfapi.in fetch, the
+# rest was this function alone, because 500-row chunking meant 6+
+# separate round trips to Neon per scheme, at maybe 400-800ms each on a
+# free-tier connection: enough round trips add up to minutes, and a
+# background task that slow risks never finishing before Render's
+# process cycles it — which is almost certainly why a real production
+# upload this size came back with zero enrichment for every scheme, not
+# just some of them. 8000 rows/batch covers any realistic single
+# scheme's full history (23 years * ~250 trading days ≈ 5,750 rows) in
+# one round trip, and 8000 rows * 5 columns = 40,000 bind parameters,
+# safely under Postgres's ~65,535-parameter-per-statement limit.
+NAV_UPSERT_BATCH_SIZE = 8000
 
 
 def store_nav_points(
