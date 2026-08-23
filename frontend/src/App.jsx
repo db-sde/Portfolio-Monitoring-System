@@ -100,6 +100,19 @@ export default function App() {
     setUploadError(null)
     try {
       const result = await api.uploadCas(file, password)
+      if (result.status === 'duplicate') {
+        // The backend's success shape (investor_name/statement_period) and
+        // its duplicate shape (message/upload_id) are different — this used
+        // to be read as if it were always the success shape, so a
+        // duplicate's undefined investor_name/statement_period got set
+        // silently and nothing on screen indicated the upload had actually
+        // been rejected. A user re-uploading (or uploading a file that
+        // happened to already be in the system) saw no error, no change,
+        // and no explanation — exactly what "I uploaded a different file
+        // and everything stayed the same" describes.
+        setUploadError(result.message || 'This exact statement has already been imported.')
+        return
+      }
       setUploadInfo({ investor_name: result.investor_name, statement_period: result.statement_period })
       setRefreshTick((t) => t + 1)
       pollEnrichStatus()
