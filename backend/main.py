@@ -709,9 +709,18 @@ def delete_all_data(session: Session = Depends(get_session)):
     from models import (
         BenchmarkPoint, BenchmarkDefinition, ConfigInvestorArn, ConfigInvestor, ConfigGroup,
         DisposalAllocation, EnrichmentCache, NavCache, Preference, PurchaseLot, SchemeAlias,
+        SchemeBenchmarkMap,
     )
+    # SchemeBenchmarkMap FKs to both schemes AND benchmark_definitions —
+    # missing here meant deleting Scheme while any row referenced it
+    # raised an uncaught IntegrityError (a bare 500, no message, since
+    # nothing wraps this endpoint in try/except). Never hit in normal use
+    # since nothing populates this table yet, but a real DELETE
+    # request against it failed exactly this way. Must come before both
+    # of its parents below.
     for model in (
-        DisposalAllocation, PurchaseLot, Transaction, Holding, SchemeAlias, Scheme, Folio, CasUpload,
+        DisposalAllocation, PurchaseLot, Transaction, Holding, SchemeAlias,
+        SchemeBenchmarkMap, Scheme, Folio, CasUpload,
         NavCache, EnrichmentCache, BenchmarkPoint, BenchmarkDefinition,
         ConfigInvestorArn, ConfigInvestor, ConfigGroup, Preference,
     ):
