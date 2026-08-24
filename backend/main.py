@@ -321,10 +321,19 @@ async def upload_cas(
         }
 
     from models import DisposalAllocation, EnrichmentCache, NavCache, PurchaseLot, SchemeAlias, SchemeBenchmarkMap
-    # SchemeBenchmarkMap must go before Scheme (FKs into it) — same
-    # IntegrityError DELETE /api/all-data hit from the identical gap;
-    # fixed there and mirrored here since this wipe deletes Scheme too.
-    for model in (DisposalAllocation, PurchaseLot, Transaction, Holding, SchemeAlias, SchemeBenchmarkMap, Scheme, Folio, CasUpload, NavCache, EnrichmentCache):
+    # Real child-before-parent order, not a guess: the previous version
+    # here still had Scheme deleted before NavCache/EnrichmentCache
+    # (which both FK into it) despite already having fixed the
+    # SchemeBenchmarkMap gap — caught live via a real 500 on this exact
+    # endpoint, reproduced directly against a copy of the real data to
+    # get the actual IntegrityError (psycopg reported
+    # nav_cache_scheme_id_fkey specifically) rather than guessing again.
+    # Traced the complete FK graph in models.py this time instead of
+    # patching one violation at a time.
+    for model in (
+        DisposalAllocation, PurchaseLot, Transaction, SchemeAlias,
+        NavCache, EnrichmentCache, SchemeBenchmarkMap, Holding, Scheme, Folio, CasUpload,
+    ):
         session.query(model).delete()
     session.flush()
 
@@ -723,17 +732,20 @@ def delete_all_data(session: Session = Depends(get_session)):
         DisposalAllocation, EnrichmentCache, NavCache, Preference, PurchaseLot, SchemeAlias,
         SchemeBenchmarkMap,
     )
-    # SchemeBenchmarkMap FKs to both schemes AND benchmark_definitions —
-    # missing here meant deleting Scheme while any row referenced it
-    # raised an uncaught IntegrityError (a bare 500, no message, since
-    # nothing wraps this endpoint in try/except). Never hit in normal use
-    # since nothing populates this table yet, but a real DELETE
-    # request against it failed exactly this way. Must come before both
-    # of its parents below.
+    # Real child-before-parent order, traced through every ForeignKey in
+    # models.py, not assembled by trial and error. The previous version
+    # added SchemeBenchmarkMap (which does FK into both schemes and
+    # benchmark_definitions) but still deleted Scheme before NavCache and
+    # EnrichmentCache — both of which also FK into schemes — so the same
+    # class of bug (an uncaught IntegrityError, bare 500, no message,
+    # since nothing wraps this endpoint in try/except) was still live.
+    # Caught by reproducing the real upload-replace 500 directly against
+    # a copy of the actual data and reading psycopg's own error, which
+    # named nav_cache_scheme_id_fkey specifically — not a guess this time.
     for model in (
-        DisposalAllocation, PurchaseLot, Transaction, Holding, SchemeAlias,
-        SchemeBenchmarkMap, Scheme, Folio, CasUpload,
-        NavCache, EnrichmentCache, BenchmarkPoint, BenchmarkDefinition,
+        DisposalAllocation, PurchaseLot, Transaction, SchemeAlias,
+        NavCache, EnrichmentCache, SchemeBenchmarkMap, Holding, Scheme, Folio, CasUpload,
+        BenchmarkPoint, BenchmarkDefinition,
         ConfigInvestorArn, ConfigInvestor, ConfigGroup, Preference,
     ):
         session.query(model).delete()
