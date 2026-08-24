@@ -63,7 +63,7 @@ function SnapshotTable({ title, period }) {
   )
 }
 
-export default function PortfolioSnapshot({ filters }) {
+export default function PortfolioSnapshot({ filters, refreshTick }) {
   const [startDate, setStartDate] = useState('')
   const [endDate, setEndDate] = useState('')
   const [data, setData] = useState(null)
@@ -83,7 +83,7 @@ export default function PortfolioSnapshot({ filters }) {
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false))
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [startDate, endDate, filters])
+  }, [startDate, endDate, filters, refreshTick])
 
   return (
     <div className="space-y-6 animate-fade-up">

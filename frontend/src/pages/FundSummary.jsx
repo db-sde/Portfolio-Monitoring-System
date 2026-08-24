@@ -19,7 +19,7 @@ const isStaleNav = (iso) => {
   return days > STALE_NAV_DAYS
 }
 
-export default function FundSummary({ filters }) {
+export default function FundSummary({ filters, refreshTick }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -35,7 +35,7 @@ export default function FundSummary({ filters }) {
       .then(setData)
       .catch((err) => setError(err.message))
       .finally(() => setLoading(false))
-  }, [filters])
+  }, [filters, refreshTick])
 
   if (error) return <div className="text-sm text-bad">{error}</div>
   if (loading) return <SkeletonTable rows={6} cols={7} />

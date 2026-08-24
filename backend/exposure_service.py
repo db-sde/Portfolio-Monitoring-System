@@ -22,6 +22,7 @@ from typing import Optional
 from portfolio_service import HoldingMetrics
 
 ZERO = Decimal("0")
+TOP_N = 10
 
 
 @dataclass
@@ -61,11 +62,15 @@ def compute_exposure(holdings: list[HoldingMetrics]) -> ExposureResult:
     by_amc: dict[str, Decimal] = {}
     for h in held:
         by_amc[h.amc] = by_amc.get(h.amc, ZERO) + h.current_value
+    # "Top" means top — this used to return every AMC/fund with no limit
+    # at all, so a real portfolio with 40+ holdings just listed all 40+
+    # in "Top funds," defeating the point of a concentration view. TOP_N
+    # caps both lists; sorting by value descending was already correct.
     top_amcs = sorted(
         (AmcExposure(amc_name=amc, current_value=v, pct_of_portfolio=(v / total_value * 100).quantize(Decimal("0.01")))
          for amc, v in by_amc.items()),
         key=lambda a: -a.current_value,
-    )
+    )[:TOP_N]
 
     top_funds = sorted(
         (FundExposure(
@@ -73,7 +78,7 @@ def compute_exposure(holdings: list[HoldingMetrics]) -> ExposureResult:
             pct_of_portfolio=(h.current_value / total_value * 100).quantize(Decimal("0.01")),
         ) for h in held),
         key=lambda f: -f.current_value,
-    )
+    )[:TOP_N]
 
     # Cap allocation (large/mid/small %) requires actual portfolio
     # holdings/sector data no free source provides (confirmed this

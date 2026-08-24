@@ -60,8 +60,8 @@ export const api = {
   getFundSummary(params) {
     return request(`/api/portfolio/fund-summary${qs(params)}`)
   },
-  getExposure() {
-    return request('/api/portfolio/exposure')
+  getExposure(params) {
+    return request(`/api/portfolio/exposure${qs(params)}`)
   },
   getTransactions(params) {
     return request(`/api/transactions${qs(params)}`)

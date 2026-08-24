@@ -31,7 +31,10 @@ export default function Dashboard({ filters, refreshTick }) {
         level: filters.level, group_name: filters.groupName,
         investor_name: filters.investorName, arn: filters.arn,
       }),
-      api.getExposure().catch(() => null),
+      api.getExposure({
+        level: filters.level, group_name: filters.groupName,
+        investor_name: filters.investorName, arn: filters.arn,
+      }).catch(() => null),
     ])
       .then(([p, e]) => { setPortfolio(p); setExposure(e) })
       .catch((err) => setError(err.message))

@@ -563,8 +563,19 @@ def get_fund_summary(
 
 
 @app.get("/api/portfolio/exposure")
-def get_exposure(session: Session = Depends(get_session)):
-    holding_ids = _all_holding_ids(session)
+def get_exposure(
+    level: Optional[str] = Query(None), group_name: Optional[str] = Query(None),
+    investor_name: Optional[str] = Query(None), arn: Optional[str] = Query(None),
+    session: Session = Depends(get_session),
+):
+    # This endpoint ignored every filter entirely until now — the page's
+    # own Level/Investor/Advisor selector was visibly interactive but had
+    # zero effect on what Exposure actually showed, found auditing every
+    # page for exactly this kind of silent no-op. Same _scope_holding_ids
+    # helper every other filterable endpoint already uses.
+    holding_ids = _scope_holding_ids(session, level, group_name, investor_name, arn)
+    if holding_ids is None:
+        holding_ids = _all_holding_ids(session)
     metrics = [portfolio_service.compute_holding_metrics(session, hid, date.today()) for hid in holding_ids]
     result = exposure_service.compute_exposure(metrics)
     return {

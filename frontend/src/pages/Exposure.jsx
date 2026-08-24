@@ -28,7 +28,7 @@ function ExposureTable({ title, rows, nameKey }) {
   )
 }
 
-export default function Exposure({ refreshTick }) {
+export default function Exposure({ filters, refreshTick }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -36,8 +36,11 @@ export default function Exposure({ refreshTick }) {
   useEffect(() => {
     setLoading(true)
     setError(null)
-    api.getExposure().then(setData).catch((err) => setError(err.message)).finally(() => setLoading(false))
-  }, [refreshTick])
+    api.getExposure({
+      level: filters.level, group_name: filters.groupName,
+      investor_name: filters.investorName, arn: filters.arn,
+    }).then(setData).catch((err) => setError(err.message)).finally(() => setLoading(false))
+  }, [filters, refreshTick])
 
   if (error) return <div className="text-sm text-bad">{error}</div>
   if (loading) return <SkeletonTable rows={6} cols={3} />

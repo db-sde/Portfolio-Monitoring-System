@@ -127,7 +127,7 @@ export default function WelcomeUpload({ onUpload, uploading, error }) {
         <div className="mt-7 flex flex-wrap justify-center gap-x-5 gap-y-2 text-xs text-ink-3">
           <span className="inline-flex items-center gap-1.5"><Check /> Parsed on your own backend</span>
           <span className="inline-flex items-center gap-1.5"><Check /> Enriched with live fund data</span>
-          <span className="inline-flex items-center gap-1.5"><Check /> Comes back the way you left it</span>
+          <span className="inline-flex items-center gap-1.5"><Check /> Stays put until you upload again</span>
         </div>
       </div>
     </div>
