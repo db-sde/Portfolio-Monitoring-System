@@ -113,6 +113,8 @@ export default function Settings({ onConfigSaved }) {
   const [loading, setLoading] = useState(true)
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
+  const [resetting, setResetting] = useState(false)
+  const [resetError, setResetError] = useState(null)
 
   useEffect(() => {
     api.getConfig().then((c) => {
@@ -153,6 +155,30 @@ export default function Settings({ onConfigSaved }) {
       onConfigSaved?.()
     } finally {
       setSaving(false)
+    }
+  }
+
+  const resetAllData = async () => {
+    const sure = window.confirm(
+      'This permanently deletes everything PortfolioIQ holds — every statement, holding, ' +
+      'transaction, gain, and this Settings page\'s own groups/investors/ARNs and preferences. ' +
+      'A plain new upload does NOT do this (it only replaces statement data); this also wipes ' +
+      'Settings. There is no undo. Continue?'
+    )
+    if (!sure) return
+    setResetting(true)
+    setResetError(null)
+    try {
+      await api.deleteAllData()
+      // Every piece of app state (uploadInfo, config, enrichStatus,
+      // filters) lives in App.jsx and has nothing wired to react to "the
+      // database is now empty" — a full reload is the simplest way to
+      // land back on a truly clean upload screen instead of threading a
+      // new reset callback through every page just for this one rare action.
+      window.location.href = '/'
+    } catch (err) {
+      setResetError(err.message)
+      setResetting(false)
     }
   }
 
@@ -252,6 +278,23 @@ export default function Settings({ onConfigSaved }) {
           {saving ? 'Saving…' : 'Save changes'}
         </button>
         {saved && <span className="text-sm text-good font-medium">Saved.</span>}
+      </div>
+
+      <div className="rounded-xl border border-bad/30 bg-bad-tint p-5">
+        <h2 className="font-display font-semibold text-bad mb-1">Danger zone</h2>
+        <p className="text-xs text-ink-2 mb-4">
+          Permanently deletes every statement, holding, transaction, and gain — plus this page's
+          own groups/investors/ARNs and preferences. A new upload already replaces statement data
+          on its own; reach for this only when you also want Settings wiped. There is no undo.
+        </p>
+        {resetError && <div className="text-sm text-bad mb-3">{resetError}</div>}
+        <button
+          onClick={resetAllData}
+          disabled={resetting}
+          className="text-sm font-semibold bg-bad text-white rounded-lg px-5 py-2.5 disabled:opacity-50 hover:opacity-90"
+        >
+          {resetting ? 'Deleting everything…' : 'Reset all data'}
+        </button>
       </div>
     </div>
   )

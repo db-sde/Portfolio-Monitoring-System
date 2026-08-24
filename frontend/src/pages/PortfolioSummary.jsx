@@ -41,6 +41,11 @@ export default function PortfolioSummary({ refreshTick }) {
                   Blended XIRR: <span className="font-semibold tabular text-ink">{investor.all_advisor_xirr != null ? formatPct(investor.all_advisor_xirr) : '—'}</span>
                 </span>
               </div>
+              {investor.advisors.length === 0 ? (
+                <div className="px-4 py-6 text-sm text-ink-3 text-center">
+                  No holdings under this investor's configured ARN(s) yet.
+                </div>
+              ) : (
               <div className="overflow-x-auto">
                 <table className="w-full text-sm">
                   <thead>
@@ -81,6 +86,7 @@ export default function PortfolioSummary({ refreshTick }) {
                   </tbody>
                 </table>
               </div>
+              )}
             </div>
           ))}
         </div>

@@ -96,4 +96,12 @@ export const api = {
   getEnrichStatus() {
     return request('/api/enrich/status')
   },
+  // Full reset (spec 19) — wipes everything a plain new upload leaves
+  // alone too: config, groups/investors/ARNs, preferences. Had no UI
+  // path at all until now (backend-only, curl/API-client only), found
+  // auditing the app end to end — a real "wipe everything" need had
+  // come up with no way to do it except a raw API call.
+  deleteAllData() {
+    return request('/api/all-data', { method: 'DELETE' })
+  },
 }

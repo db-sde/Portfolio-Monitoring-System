@@ -1,21 +1,32 @@
 export const formatIndian = (n) => {
   if (n == null || Number.isNaN(n)) return '—'
-  const isNeg = n < 0
-  const abs = Math.abs(Math.round(n)).toString()
-  let result = abs.slice(-3)
-  let rest = abs.slice(0, -3)
+  // Round the magnitude first, then decide the sign from that — a
+  // genuine-but-tiny loss like -0.4 must read as "₹0", not "−₹0": the
+  // same negative-zero display bug xirr_engine.py explicitly guards
+  // against for XIRR, just as real here for any other money figure.
+  const rounded = Math.round(Math.abs(n))
+  const digits = rounded.toString()
+  let result = digits.slice(-3)
+  let rest = digits.slice(0, -3)
   while (rest.length > 2) {
     result = rest.slice(-2) + ',' + result
     rest = rest.slice(0, -2)
   }
   if (rest) result = rest + ',' + result
+  const isNeg = n < 0 && rounded !== 0
   return (isNeg ? '−' : '') + '₹' + result
 }
 
 export const formatPct = (n, digits = 2) => {
   if (n == null || Number.isNaN(n)) return '—'
-  const sign = n > 0 ? '+' : ''
-  return `${sign}${n.toFixed(digits)}%`
+  // Same negative-zero guard as formatIndian: a value that rounds to
+  // 0.00 at this precision must show as "0.00%", never "-0.00%" —
+  // reads as a bug otherwise, even though the underlying number really
+  // is a hair below zero.
+  const magnitude = Math.abs(n).toFixed(digits)
+  if (Number(magnitude) === 0) return `${magnitude}%`
+  const sign = n > 0 ? '+' : '-'
+  return `${sign}${magnitude}%`
 }
 
 export const formatUnits = (n) => {
