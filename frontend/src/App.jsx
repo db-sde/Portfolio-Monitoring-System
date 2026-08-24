@@ -27,8 +27,9 @@ const PAGES = {
 }
 
 // Pages that don't use the level/advisor filter bar at all (summary is
-// already grouped by every advisor at once; settings isn't portfolio data).
-const NO_FILTER_BAR = new Set(['portfolio-summary', 'settings'])
+// already grouped by every advisor at once; settings isn't portfolio data;
+// upload is the drop-box screen, not a portfolio view).
+const NO_FILTER_BAR = new Set(['portfolio-summary', 'settings', 'upload'])
 
 // Sidebar navigation used to be plain useState with no URL involved at
 // all — every page lived at the same "/", so the browser's Back button
@@ -38,17 +39,19 @@ const NO_FILTER_BAR = new Set(['portfolio-summary', 'settings'])
 // two directions of keeping `page` state in sync with the real URL via
 // the History API, so Back/Forward/reload all do what they look like
 // they should.
+// "/" is its own page — the upload/drop screen — not an alias for
+// Dashboard; "upload" is a pseudo-key PAGES doesn't have an entry for,
+// handled specially in the render below (it always shows WelcomeUpload,
+// even once data exists — a deliberate, bookmarkable "start fresh" entry
+// point now that a new upload replaces what's there instead of adding
+// to it). "/dashboard" is unaffected and works exactly as before.
 function pageFromPath(pathname) {
   const key = pathname.replace(/^\/+/, '')
-  if (key === '' || key === 'dashboard') return 'dashboard'
+  if (key === '') return 'upload'
   return PAGES[key] ? key : 'dashboard'
 }
 function pathFromPage(page) {
-  // Dashboard is the home page, so it lives at the bare "/" rather than
-  // redirecting there from "/dashboard" — visiting the site's root URL
-  // (a bookmark, a shared link) should just show it, not bounce through
-  // an extra history entry to get to the same place.
-  return page === 'dashboard' ? '/' : `/${page}`
+  return page === 'upload' ? '/' : `/${page}`
 }
 
 export default function App() {
@@ -164,6 +167,10 @@ export default function App() {
       setUploadInfo({ investor_name: result.investor_name, statement_period: result.statement_period })
       setRefreshTick((t) => t + 1)
       pollEnrichStatus()
+      // Uploading from the dedicated "/" drop screen is a "give me
+      // results" action — land on Dashboard rather than leaving them on
+      // the upload screen once there's something to actually show.
+      if (page === 'upload') navigate('dashboard')
     } catch (err) {
       setUploadError(err.message)
     } finally {
@@ -183,7 +190,11 @@ export default function App() {
     return <WelcomeUpload onUpload={handleUpload} uploading={uploading} error={uploadError || initialLoadError} />
   }
 
-  const PageComponent = PAGES[page]
+  // "upload" isn't in PAGES — it's the drop-box screen (WelcomeUpload),
+  // rendered inline below rather than as a PageComponent so it can still
+  // sit inside the normal sidebar/top-bar shell once data exists (only
+  // the true no-data-yet case above renders it full-screen, standalone).
+  const PageComponent = page === 'upload' ? null : PAGES[page]
 
   return (
     <div className="flex min-h-screen">
@@ -221,7 +232,11 @@ export default function App() {
               />
             </div>
           )}
-          <PageComponent filters={filters} setFilters={setFilters} config={config} refreshTick={refreshTick} onConfigSaved={loadConfig} />
+          {page === 'upload' ? (
+            <WelcomeUpload onUpload={handleUpload} uploading={uploading} error={uploadError} />
+          ) : (
+            <PageComponent filters={filters} setFilters={setFilters} config={config} refreshTick={refreshTick} onConfigSaved={loadConfig} />
+          )}
         </main>
       </div>
     </div>
