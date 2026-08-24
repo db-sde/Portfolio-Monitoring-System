@@ -1,4 +1,5 @@
 import { useRef, useState } from 'react'
+import { formatDateTimeIST } from './IndianNumber'
 
 export default function TopBar({ investorName, statementPeriod, lastEnriched, enrichStatus, onUpload, uploading, onMenuClick }) {
   const fileInput = useRef(null)
@@ -49,7 +50,7 @@ export default function TopBar({ investorName, statementPeriod, lastEnriched, en
             <div className="font-display font-semibold text-ink truncate">{investorName}</div>
             <div className="text-xs text-ink-3 truncate">
               {statementPeriod ? `${statementPeriod.from} – ${statementPeriod.to}` : ''}
-              {lastEnriched && ` · enriched ${new Date(lastEnriched).toLocaleString()}`}
+              {lastEnriched && ` · enriched ${formatDateTimeIST(lastEnriched)}`}
             </div>
           </div>
         </div>

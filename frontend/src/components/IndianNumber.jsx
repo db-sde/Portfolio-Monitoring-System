@@ -30,6 +30,21 @@ export const formatDate = (iso) => {
   return d.toLocaleDateString('en-GB', { day: '2-digit', month: 'short', year: 'numeric' })
 }
 
+// Every fund/NAV timestamp this app shows is meaningful in IST — the
+// enriched-at time in particular is about India-market data freshness,
+// not the viewer's own clock. toLocaleString() with no timeZone uses
+// whatever the browser's system timezone happens to be, which silently
+// shows the wrong wall-clock time for anyone not already on IST.
+export const formatDateTimeIST = (iso) => {
+  if (!iso) return '—'
+  const d = new Date(iso)
+  if (Number.isNaN(d.getTime())) return iso
+  return d.toLocaleString('en-IN', {
+    timeZone: 'Asia/Kolkata', day: '2-digit', month: 'short', year: 'numeric',
+    hour: '2-digit', minute: '2-digit', hour12: true,
+  }) + ' IST'
+}
+
 export default function IndianNumber({ value, className = '' }) {
   return <span className={className}>{formatIndian(value)}</span>
 }

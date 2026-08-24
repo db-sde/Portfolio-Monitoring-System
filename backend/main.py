@@ -401,15 +401,24 @@ def get_portfolio(
     subtotals = {k: _agg_dict(v) for k, v in buckets.items() if v}
     subtotals["total"] = _agg_dict(all_metrics)
 
-    # Multiple statements can now accumulate (that's the whole point of
-    # the Neon migration — no single upload overwrites the last one), so
-    # there's no longer one CAS-embedded "investor_info.name" to show in
-    # the header. investor_names lists everyone with at least one holding
-    # in scope, from config.json's own investor labels.
+    # Uploads replace rather than accumulate now, so there's always at
+    # most one CAS statement in the system — its own investor_info.name
+    # is the natural zero-config source of truth for the header, and
+    # showing it doesn't depend on the user having set anything up in
+    # Settings first. Config-derived labels (from Settings' group/
+    # investor/ARN mapping) still take priority when configured, since
+    # that's how a user re-labels or attributes things beyond the CAS's
+    # own name — falling back to the CAS name only when nothing's been
+    # configured for these holdings' advisors at all.
     investor_names = sorted({
         config_service.find_owner_for_arn(config, m.advisor_arn)[1]
         for m in all_metrics if m.advisor_arn
     } - {None})
+    if not investor_names:
+        investor_names = sorted({
+            (u.raw_parsed_json.get("investor_info") or {}).get("name")
+            for u in session.execute(select(CasUpload)).scalars()
+        } - {None, ""})
 
     return {
         **_response_meta(session, data_quality=quality),

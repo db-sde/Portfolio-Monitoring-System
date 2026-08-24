@@ -40,10 +40,15 @@ const NO_FILTER_BAR = new Set(['portfolio-summary', 'settings'])
 // they should.
 function pageFromPath(pathname) {
   const key = pathname.replace(/^\/+/, '')
+  if (key === '' || key === 'dashboard') return 'dashboard'
   return PAGES[key] ? key : 'dashboard'
 }
 function pathFromPage(page) {
-  return `/${page}`
+  // Dashboard is the home page, so it lives at the bare "/" rather than
+  // redirecting there from "/dashboard" — visiting the site's root URL
+  // (a bookmark, a shared link) should just show it, not bounce through
+  // an extra history entry to get to the same place.
+  return page === 'dashboard' ? '/' : `/${page}`
 }
 
 export default function App() {
@@ -54,6 +59,7 @@ export default function App() {
   const [enrichStatus, setEnrichStatus] = useState(null)
   const [uploading, setUploading] = useState(false)
   const [uploadError, setUploadError] = useState(null)
+  const [uploadNotice, setUploadNotice] = useState(null)
   const [initialLoadError, setInitialLoadError] = useState(null)
   const [refreshTick, setRefreshTick] = useState(0)
   const [sidebarOpen, setSidebarOpen] = useState(false)
@@ -133,6 +139,7 @@ export default function App() {
   const handleUpload = async (file, password = '') => {
     setUploading(true)
     setUploadError(null)
+    setUploadNotice(null)
     try {
       const result = await api.uploadCas(file, password)
       if (result.status === 'duplicate') {
@@ -145,7 +152,13 @@ export default function App() {
         // happened to already be in the system) saw no error, no change,
         // and no explanation — exactly what "I uploaded a different file
         // and everything stayed the same" describes.
-        setUploadError(result.message || 'This exact statement has already been imported.')
+        //
+        // This isn't a failure, though — the data already on screen *is*
+        // this exact statement, correctly. A red error banner claiming
+        // something went wrong (and implying nothing was ever imported)
+        // is the wrong tone for "you're already looking at this"; a
+        // neutral notice is what's actually true here.
+        setUploadNotice("This statement is already loaded — you're looking at its current data.")
         return
       }
       setUploadInfo({ investor_name: result.investor_name, statement_period: result.statement_period })
@@ -188,6 +201,11 @@ export default function App() {
         {uploadError && (
           <div className="mx-4 md:mx-6 mt-4 rounded-lg border border-bad/20 bg-bad-tint text-bad text-sm px-4 py-2.5">
             {uploadError}
+          </div>
+        )}
+        {uploadNotice && (
+          <div className="mx-4 md:mx-6 mt-4 rounded-lg border border-accent/20 bg-accent-tint text-accent-strong text-sm px-4 py-2.5">
+            {uploadNotice}
           </div>
         )}
         <main className="flex-1 p-4 md:p-6 max-w-[1400px] w-full">
