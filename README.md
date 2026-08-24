@@ -229,28 +229,42 @@ request without a matching `API_KEY`/`VITE_API_KEY` pair (see
 Deployment's `API_KEY` section above for why). Skipping either one shows
 up as every request in the browser failing with 401.
 
-Click "Upload CAS PDF" in the top bar, pick your statement, enter its
-password when prompted, and hit Parse. First upload kicks off enrichment
-in the background — the top bar shows progress, and pages refresh once
-it's done. Uploading the same file again (byte-identical) is recognised
-as a duplicate and skipped, not re-imported; uploading a *different*,
-overlapping statement for the same folios merges in cleanly (transactions
-are deduplicated by fingerprint, not by file).
+Click "New statement" in the top bar, pick your statement, enter its
+password when prompted, and hit Parse. Upload kicks off enrichment in
+the background — the top bar shows progress, and pages refresh once
+it's done.
+
+**Uploading replaces, it does not accumulate.** This is a
+one-statement-at-a-time analyser, not a multi-investor portfolio
+tracker: every upload wipes every prior statement, holding,
+transaction, capital gain, and cached NAV/enrichment value before
+importing the new one. (This changed after a real incident — the
+earlier accumulate-everything design let two unrelated people's real
+statements silently combine into one "All" total on every upload,
+which looked like the numbers were wrong when the underlying math was
+actually fine.) Uploading the exact same file again (byte-identical) is
+still recognised as a no-op duplicate rather than wiping and
+re-importing identical data — everything else, including a newer
+statement for the same person, replaces what's there.
+`Settings`-configured groups/investors/ARNs and preferences are **not**
+wiped by a new upload — they're app configuration, not statement data —
+so re-mapping advisors after every upload isn't necessary.
 
 ### Groups, investors & advisors
 
 Every distinct `advisor` (ARN code) your CAS shows folios under needs to
 be attributed to a group/investor to show up correctly in the Portfolio
 Summary view — do this through the Settings page in the app (persisted
-in Postgres now, not a config.json file).
+in Postgres now, not a config.json file, and preserved across statement
+uploads/replacements).
 
 ### Resetting all data
 
-`DELETE /api/all-data` wipes every statement, holding, gain, cached
-market-data point, and config entry — a full reset, not a per-statement
-delete (holdings/lots can be shared across multiple accumulated CAS
-uploads for the same folio, so a correct partial delete is a separate,
-not-yet-built feature).
+`DELETE /api/all-data` wipes everything a new upload's replace leaves
+alone too — config, groups/investors/ARNs, and preferences — for a true
+full reset. A plain new upload already replaces every statement,
+holding, gain, and cached market-data point on its own; reach for this
+endpoint specifically when you also want your Settings wiped.
 
 ### Exposing it via ngrok (optional)
 

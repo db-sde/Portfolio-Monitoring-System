@@ -16,6 +16,7 @@ CAS is never read for current or historical value anywhere in this file.
 
 from __future__ import annotations
 
+import hashlib
 import json
 import logging
 import os
@@ -297,6 +298,32 @@ async def upload_cas(
             "CAMS/KFintech mutual-fund statements only.",
         )
     _fix_segregation_classification(parsed)
+
+    # Replace-on-upload, not accumulate: this is meant to be a
+    # one-statement-at-a-time analyser, not an ever-growing multi-investor
+    # portfolio — confirmed directly after real confusion from two
+    # unrelated people's holdings silently combining into one total on
+    # every upload. A byte-identical re-upload is still short-circuited as
+    # a no-op "duplicate" (checked here, before anything is touched, using
+    # the same file_hash ingest_cas itself would compute) so re-uploading
+    # the same file twice doesn't wipe and immediately reimport identical
+    # data. Any other file — even a newer statement for the same person —
+    # replaces everything: config/preferences/groups survive (they're app
+    # settings, not statement data), but every prior statement, holding,
+    # transaction, and cached NAV/enrichment value is gone.
+    file_hash = hashlib.sha256(content).hexdigest()
+    existing_upload = session.execute(select(CasUpload).where(CasUpload.file_hash == file_hash)).scalar_one_or_none()
+    if existing_upload:
+        return {
+            "status": "duplicate",
+            "message": "This exact statement has already been imported.",
+            "upload_id": existing_upload.upload_id,
+        }
+
+    from models import DisposalAllocation, EnrichmentCache, NavCache, PurchaseLot, SchemeAlias
+    for model in (DisposalAllocation, PurchaseLot, Transaction, Holding, SchemeAlias, Scheme, Folio, CasUpload, NavCache, EnrichmentCache):
+        session.query(model).delete()
+    session.flush()
 
     try:
         async with httpx.AsyncClient() as client:

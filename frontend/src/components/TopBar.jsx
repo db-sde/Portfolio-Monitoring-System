@@ -90,6 +90,9 @@ export default function TopBar({ investorName, statementPeriod, lastEnriched, en
           <button onClick={cancelPending} className="text-sm font-medium text-ink-3 hover:text-ink px-2 py-1.5">
             Cancel
           </button>
+          <span className="w-full text-xs text-accent-strong">
+            This replaces everything currently shown — your current statement's holdings, transactions, and gains will be gone once this one parses.
+          </span>
         </div>
       )}
     </header>
