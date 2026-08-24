@@ -320,8 +320,11 @@ async def upload_cas(
             "upload_id": existing_upload.upload_id,
         }
 
-    from models import DisposalAllocation, EnrichmentCache, NavCache, PurchaseLot, SchemeAlias
-    for model in (DisposalAllocation, PurchaseLot, Transaction, Holding, SchemeAlias, Scheme, Folio, CasUpload, NavCache, EnrichmentCache):
+    from models import DisposalAllocation, EnrichmentCache, NavCache, PurchaseLot, SchemeAlias, SchemeBenchmarkMap
+    # SchemeBenchmarkMap must go before Scheme (FKs into it) — same
+    # IntegrityError DELETE /api/all-data hit from the identical gap;
+    # fixed there and mirrored here since this wipe deletes Scheme too.
+    for model in (DisposalAllocation, PurchaseLot, Transaction, Holding, SchemeAlias, SchemeBenchmarkMap, Scheme, Folio, CasUpload, NavCache, EnrichmentCache):
         session.query(model).delete()
     session.flush()
 
