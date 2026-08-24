@@ -30,8 +30,24 @@ const PAGES = {
 // already grouped by every advisor at once; settings isn't portfolio data).
 const NO_FILTER_BAR = new Set(['portfolio-summary', 'settings'])
 
+// Sidebar navigation used to be plain useState with no URL involved at
+// all — every page lived at the same "/", so the browser's Back button
+// had nothing of this app's own to go back to (it would just leave the
+// app entirely), and reloading always landed back on Dashboard no
+// matter which page you'd been on. pageFromPath/pathFromPage are the
+// two directions of keeping `page` state in sync with the real URL via
+// the History API, so Back/Forward/reload all do what they look like
+// they should.
+function pageFromPath(pathname) {
+  const key = pathname.replace(/^\/+/, '')
+  return PAGES[key] ? key : 'dashboard'
+}
+function pathFromPage(page) {
+  return `/${page}`
+}
+
 export default function App() {
-  const [page, setPage] = useState('dashboard')
+  const [page, setPage] = useState(() => pageFromPath(window.location.pathname))
   const [config, setConfig] = useState(null)
   const [uploadInfo, setUploadInfo] = useState(null)
   const [checkingInitial, setCheckingInitial] = useState(true)
@@ -49,6 +65,25 @@ export default function App() {
     investorName: null,
     arn: null,
   })
+
+  const navigate = useCallback((nextPage) => {
+    if (nextPage === page) return
+    window.history.pushState({ page: nextPage }, '', pathFromPage(nextPage))
+    setPage(nextPage)
+  }, [page])
+
+  useEffect(() => {
+    // Establish a proper history entry for the very first page too (so
+    // the initial load isn't a state-less entry Back can't distinguish
+    // from "leave the app"), then follow the browser's own Back/Forward.
+    window.history.replaceState({ page }, '', pathFromPage(page))
+    const onPopState = (event) => {
+      setPage(event.state?.page || pageFromPath(window.location.pathname))
+    }
+    window.addEventListener('popstate', onPopState)
+    return () => window.removeEventListener('popstate', onPopState)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
 
   const loadConfig = useCallback(() => {
     api.getConfig().then(setConfig).catch(() => {})
@@ -139,7 +174,7 @@ export default function App() {
 
   return (
     <div className="flex min-h-screen">
-      <Sidebar active={page} open={sidebarOpen} onClose={() => setSidebarOpen(false)} onNavigate={(k) => { setPage(k); setSidebarOpen(false) }} />
+      <Sidebar active={page} open={sidebarOpen} onClose={() => setSidebarOpen(false)} onNavigate={(k) => { navigate(k); setSidebarOpen(false) }} />
       <div className="flex-1 flex flex-col min-w-0">
         <TopBar
           investorName={uploadInfo?.investor_name}
