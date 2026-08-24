@@ -100,11 +100,20 @@ export default function App() {
 
   const pollEnrichStatus = useCallback(() => {
     let cancelled = false
+    // 180 tries * 2s = 6 minutes — generous (the largest real portfolio
+    // enriched this session took ~6 minutes), but not unbounded: if the
+    // background task itself dies outright (an exception before it
+    // writes even one EnrichmentCache row), pending would otherwise
+    // never reach 0 and this would poll forever instead of just giving
+    // up and leaving the last-known status on screen.
+    const MAX_ATTEMPTS = 180
+    let attempts = 0
     const tick = () => {
       api.getEnrichStatus().then((status) => {
         if (cancelled) return
         setEnrichStatus(status)
-        if (status.pending > 0) setTimeout(tick, 2000)
+        attempts += 1
+        if (status.pending > 0 && attempts < MAX_ATTEMPTS) setTimeout(tick, 2000)
         else setRefreshTick((t) => t + 1)
       }).catch(() => {})
     }

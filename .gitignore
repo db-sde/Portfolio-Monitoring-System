@@ -12,3 +12,11 @@ __pycache__/
 cas_data.json
 enrichment_cache.json
 gains_data.json
+
+# Never let a real CAS statement dropped into frontend/public/ for local
+# testing get committed — that folder is served as-is by Vercel, so
+# anything here becomes a real person's financial statement, publicly
+# downloadable by URL with no auth. Caught live: a real test file sat
+# publicly reachable on the production site until this rule existed.
+frontend/public/__test_*.pdf
+frontend/public/__test_*.json

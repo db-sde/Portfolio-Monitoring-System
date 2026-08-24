@@ -125,6 +125,35 @@ scheme already flushed in the same shared session; and
 `logger.exception`, so a future failure is visible in Render's log
 viewer instead of only discoverable by directly querying the database.
 
+**Background enrichment was freezing the entire app, not just running
+slowly**: a separate, more serious incident than the one above.
+`_run_enrichment_task` was `async def`, and `BackgroundTasks` awaits an
+async task directly on the app's *main* event loop — but the work
+inside it (`enrichment_bridge.refresh_enrichment`,
+`benchmark_service.refresh_nifty50_proxy_nav`, `nav_service.store_nav_points`)
+does plain synchronous SQLAlchemy calls (`session.execute`/`add`/`flush`)
+with no `run_in_threadpool` wrapping. Every one of those blocking DB
+round trips therefore blocked the *whole* event loop, not just the
+enrichment task — confirmed live by hitting `GET /api/health` (zero DB
+dependency) during a large real portfolio's enrichment run and watching
+it hang for 60+ seconds, and separately by loading the live site itself
+and watching every request (`/api/config`, `/api/portfolio`,
+`/api/enrich/status`) sit pending with nothing resolving. For a large
+portfolio (measured at 200-370+ seconds of total enrichment work), this
+meant the app was completely unresponsive to every user, for every
+request, for minutes at a time, on every upload. Fixed by splitting
+`_run_enrichment_task` into `_run_enrichment_task_async` (the real,
+unchanged async logic) plus a new plain `def _run_enrichment_task`
+wrapper that calls `asyncio.run(_run_enrichment_task_async(...))`.
+Starlette's `BackgroundTasks` dispatches a *sync* callable through
+`run_in_threadpool` automatically — off the main event loop entirely —
+so `asyncio.run()` gives that worker thread its own private event loop
+to run the real async/sync-mixed work on, fully isolated from the loop
+serving live requests. `db.get_session()`'s underlying SQLAlchemy engine
+is a plain pooled `create_engine` (not async), so borrowing a session
+from a different thread is exactly what it's designed for — no other
+changes were needed.
+
 ## Deployment
 
 - **Backend** → Render, building `Dockerfile` at this repo's root
@@ -139,10 +168,24 @@ viewer instead of only discoverable by directly querying the database.
    `postgresql://<user>:<password>@<host>.neon.tech/<database>?sslmode=require`).
 2. **Render** → this service → *Environment* → add an environment
    variable named `DATABASE_URL` with that value.
-3. **Local dev**: `cp backend/.env.example backend/.env` and paste the
-   same connection string in as `DATABASE_URL` — `main.py` loads `.env`
+3. **Local dev**: `cp backend/.env.example backend/.env` and paste a
+   connection string in as `DATABASE_URL` — `main.py` loads `.env`
    automatically via `python-dotenv`. `.env` is gitignored; never commit
    it or paste a real connection string into chat/an issue/a PR.
+
+   **Use a separate database from Render's, not the same one.** Pointing
+   local dev at the exact same `DATABASE_URL` as production means every
+   local upload — including throwaway test files — replaces the real
+   data (see "Resetting all data" below: a new upload wipes and replaces
+   everything, there is no accumulate mode). This happened for real: a
+   local test upload silently overwrote a real investor's live data in
+   production, and it wasn't recoverable from anything this app itself
+   stores — the original CAS PDF isn't kept anywhere after import, so
+   restoring meant re-uploading it by hand. Neon's free tier supports
+   instant DB branching (Neon console → your project → **Branches** →
+   **Create branch**) — branch off production, copy *that* branch's
+   connection string into `backend/.env` instead, and local testing can
+   never touch the real data no matter what gets uploaded or deleted.
 
 Schema creation is idempotent and automatic (`db.init_db()` runs on every
 startup) — there's no separate migration step to run by hand. Neon's

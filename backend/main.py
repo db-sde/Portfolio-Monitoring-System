@@ -16,6 +16,7 @@ CAS is never read for current or historical value anywhere in this file.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import json
 import logging
@@ -207,7 +208,7 @@ def health():
 
 # --------------------------------------------------------------- upload ----
 
-async def _run_enrichment_task(scheme_ids: list[int]) -> None:
+async def _run_enrichment_task_async(scheme_ids: list[int]) -> None:
     """Two separate sessions/transactions on purpose: benchmark_service
     already retries internally and never raises, but if it somehow did,
     sharing one transaction with the per-scheme enrichment below would
@@ -237,6 +238,30 @@ async def _run_enrichment_task(scheme_ids: list[int]) -> None:
                 await enrichment_bridge.refresh_enrichment(session, schemes)
     except Exception:
         logger.exception("_run_enrichment_task failed for scheme_ids=%s", scheme_ids)
+
+
+def _run_enrichment_task(scheme_ids: list[int]) -> None:
+    """Deliberately a plain sync function, even though the real work
+    (_run_enrichment_task_async) is async — this is the entire fix for a
+    live production incident: enrichment_bridge.refresh_enrichment and
+    nav_service.store_nav_points do their SQLAlchemy work directly
+    (session.execute/add/flush), unwrapped, inside async functions. When
+    this ran as a coroutine passed to BackgroundTasks, Starlette awaits
+    async background tasks directly on the MAIN event loop — so every
+    one of those blocking DB round-trips (measured live at 200-370+
+    seconds total for a large real portfolio) blocked the ENTIRE app,
+    including totally unrelated requests like GET /api/health, for the
+    whole run. Confirmed live: the production site hung completely
+    (health check itself timing out) for the duration of one of these
+    runs, right after an upload.
+
+    Starlette's BackgroundTask dispatch runs a *sync* callable via
+    starlette.concurrency.run_in_threadpool automatically, off the main
+    event loop entirely. asyncio.run() here gives that thread its own
+    fresh event loop to run the real async work on — completely
+    isolated from the loop serving live requests, so enrichment can take
+    as long as it needs without freezing anything else."""
+    asyncio.run(_run_enrichment_task_async(scheme_ids))
 
 
 @app.post("/api/upload-cas")
@@ -714,12 +739,31 @@ def post_config(config: dict, session: Session = Depends(get_session)):
 
 @app.get("/api/enrich/status")
 def get_enrich_status(session: Session = Depends(get_session)):
-    total = session.execute(select(Scheme.scheme_id)).scalars().all()
-    enriched = session.execute(select(EnrichmentCache.scheme_id).where(EnrichmentCache.status == "ok")).scalars().all()
+    # "pending" was hardcoded to 0 — meaning the frontend's poll loop
+    # (App.jsx's pollEnrichStatus: keep polling while pending > 0, then
+    # refresh once) always saw it as already done and stopped after a
+    # single check, even while the real background enrichment task was
+    # still running for minutes on a large upload. That's very likely
+    # the actual reason "upload, see ₹0, needs a manual refresh later"
+    # kept recurring this session — not a fresh instance of the
+    # background-task bug each time, but this one poll-signal bug
+    # making every fix to that task invisible to the UI regardless.
+    #
+    # A scheme gets an enrichment_cache row the moment it's been
+    # attempted, whether it succeeded (status="ok") or genuinely
+    # couldn't be resolved (status="unavailable") — so "has any row at
+    # all" is "attempted," not "succeeded." pending = total minus
+    # attempted, which reaches 0 exactly when the background task has
+    # worked through every scheme, whatever the outcome — not stuck
+    # forever if a specific scheme can never actually succeed.
+    total = set(session.execute(select(Scheme.scheme_id)).scalars().all())
+    cache_rows = session.execute(select(EnrichmentCache.scheme_id, EnrichmentCache.status)).all()
+    attempted = {sid for sid, _status in cache_rows}
+    enriched = {sid for sid, status in cache_rows if status == "ok"}
     last_run = session.execute(select(EnrichmentCache.fetched_at).order_by(EnrichmentCache.fetched_at.desc()).limit(1)).scalar_one_or_none()
     return {
-        "total_schemes": len(total), "enriched": len(set(enriched)),
-        "failed": len(set(total) - set(enriched)), "pending": 0,
+        "total_schemes": len(total), "enriched": len(enriched),
+        "failed": len(attempted - enriched), "pending": len(total - attempted),
         "last_run": last_run.isoformat() if last_run else None,
     }
 
