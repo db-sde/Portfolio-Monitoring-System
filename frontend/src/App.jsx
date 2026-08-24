@@ -242,7 +242,7 @@ export default function App() {
             </div>
           )}
           {page === 'upload' ? (
-            <WelcomeUpload onUpload={handleUpload} uploading={uploading} error={uploadError} />
+            <WelcomeUpload onUpload={handleUpload} uploading={uploading} error={uploadError} replacing />
           ) : (
             <PageComponent filters={filters} setFilters={setFilters} config={config} refreshTick={refreshTick} onConfigSaved={loadConfig} />
           )}

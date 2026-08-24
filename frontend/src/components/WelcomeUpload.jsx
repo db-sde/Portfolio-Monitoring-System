@@ -1,6 +1,6 @@
 import { useRef, useState } from 'react'
 
-export default function WelcomeUpload({ onUpload, uploading, error }) {
+export default function WelcomeUpload({ onUpload, uploading, error, replacing = false }) {
   const fileInput = useRef(null)
   const [pendingFile, setPendingFile] = useState(null)
   const [password, setPassword] = useState('')
@@ -35,14 +35,30 @@ export default function WelcomeUpload({ onUpload, uploading, error }) {
         <span className="inline-flex items-center gap-2 text-xs font-semibold tracking-wide uppercase text-accent-strong mb-3">
           <span className="w-4 h-px bg-accent" /> CAMS · KFintech
         </span>
-        <h1 className="font-display text-3xl md:text-[2.4rem] font-extrabold text-ink leading-tight mb-3 text-balance">
-          Your whole portfolio,<br />finally in one place.
-        </h1>
-        <p className="text-ink-2 text-[15px] leading-relaxed mb-8 max-w-md mx-auto">
-          Upload your CAS statement and its password. PortfolioIQ parses it, enriches every
-          fund with live market data, and gives you XIRR, returns, risk and advisor-by-advisor
-          comparisons — kept on your own backend so you can come back to it anytime.
-        </p>
+        {replacing ? (
+          <>
+            <h1 className="font-display text-3xl md:text-[2.4rem] font-extrabold text-ink leading-tight mb-3 text-balance">
+              Upload a new statement.
+            </h1>
+            <p className="text-ink-2 text-[15px] leading-relaxed mb-8 max-w-md mx-auto">
+              This replaces what's currently loaded — every holding, transaction, and gain from
+              your current statement will be gone once this one parses. Enriches every fund with
+              live market data and gives you XIRR, returns, risk and advisor-by-advisor
+              comparisons, same as before.
+            </p>
+          </>
+        ) : (
+          <>
+            <h1 className="font-display text-3xl md:text-[2.4rem] font-extrabold text-ink leading-tight mb-3 text-balance">
+              Your whole portfolio,<br />finally in one place.
+            </h1>
+            <p className="text-ink-2 text-[15px] leading-relaxed mb-8 max-w-md mx-auto">
+              Upload your CAS statement and its password. PortfolioIQ parses it, enriches every
+              fund with live market data, and gives you XIRR, returns, risk and advisor-by-advisor
+              comparisons — kept on your own backend so you can come back to it anytime.
+            </p>
+          </>
+        )}
 
         <div className="bg-card border border-line rounded-2xl shadow-sm p-5 text-left">
           <label
@@ -127,7 +143,9 @@ export default function WelcomeUpload({ onUpload, uploading, error }) {
         <div className="mt-7 flex flex-wrap justify-center gap-x-5 gap-y-2 text-xs text-ink-3">
           <span className="inline-flex items-center gap-1.5"><Check /> Parsed on your own backend</span>
           <span className="inline-flex items-center gap-1.5"><Check /> Enriched with live fund data</span>
-          <span className="inline-flex items-center gap-1.5"><Check /> Stays put until you upload again</span>
+          <span className="inline-flex items-center gap-1.5">
+            <Check /> {replacing ? 'Replaces your current statement' : 'Stays put until you upload again'}
+          </span>
         </div>
       </div>
     </div>
