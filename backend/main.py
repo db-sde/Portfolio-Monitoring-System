@@ -23,6 +23,7 @@ import logging
 import os
 import secrets
 import tempfile
+from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -264,6 +265,65 @@ def _run_enrichment_task(scheme_ids: list[int]) -> None:
     asyncio.run(_run_enrichment_task_async(scheme_ids))
 
 
+@dataclass
+class _UploadOutcome:
+    duplicate: bool
+    upload_id: Optional[int]
+    result: Optional[ingestion.IngestResult]
+
+
+def _replace_and_ingest_sync(session: Session, content: bytes, parsed) -> _UploadOutcome:
+    """The other half of the same event-loop-blocking bug fixed above for
+    background enrichment — caught live, not just in review: a real
+    upload here returned a normal, correct-looking 200 (real investor
+    name, real holdings, no errors) while GET /api/health — zero DB
+    dependency — hung for 60+ seconds at the exact same time, and the
+    database the response described never actually reflected the
+    ingest. ingest_cas's own DB writes (session.execute/add/flush across
+    _persist_transactions, _rebuild_fifo, scheme_resolution) are plain
+    synchronous SQLAlchemy calls, same as refresh_enrichment's were —
+    running them directly inside upload_cas's async def body blocked the
+    main event loop for this request's entire ingest duration, same as
+    the background task used to.
+
+    Wrapped in a plain sync function so the caller can run it via
+    run_in_threadpool (off the main event loop, its own thread) exactly
+    like _run_enrichment_task — asyncio.run() here gives that thread its
+    own fresh event loop for ingest_cas's httpx calls, isolated from the
+    one serving every other concurrent request. A fresh httpx.AsyncClient
+    is created inside this new loop rather than reusing one from the
+    caller's loop — an AsyncClient's connection pool is bound to the loop
+    that created it and isn't valid on a different one."""
+    file_hash = hashlib.sha256(content).hexdigest()
+    existing_upload = session.execute(select(CasUpload).where(CasUpload.file_hash == file_hash)).scalar_one_or_none()
+    if existing_upload:
+        return _UploadOutcome(duplicate=True, upload_id=existing_upload.upload_id, result=None)
+
+    from models import DisposalAllocation, EnrichmentCache, NavCache, PurchaseLot, SchemeAlias, SchemeBenchmarkMap
+    # Real child-before-parent order, not a guess: the previous version
+    # here still had Scheme deleted before NavCache/EnrichmentCache
+    # (which both FK into it) despite already having fixed the
+    # SchemeBenchmarkMap gap — caught live via a real 500 on this exact
+    # endpoint, reproduced directly against a copy of the real data to
+    # get the actual IntegrityError (psycopg reported
+    # nav_cache_scheme_id_fkey specifically) rather than guessing again.
+    # Traced the complete FK graph in models.py this time instead of
+    # patching one violation at a time.
+    for model in (
+        DisposalAllocation, PurchaseLot, Transaction, SchemeAlias,
+        NavCache, EnrichmentCache, SchemeBenchmarkMap, Holding, Scheme, Folio, CasUpload,
+    ):
+        session.query(model).delete()
+    session.flush()
+
+    async def _ingest() -> ingestion.IngestResult:
+        async with httpx.AsyncClient() as client:
+            return await ingestion.ingest_cas(session, client, parsed, content, investor_id=None)
+
+    result = asyncio.run(_ingest())
+    return _UploadOutcome(duplicate=False, upload_id=None, result=result)
+
+
 @app.post("/api/upload-cas")
 async def upload_cas(
     background_tasks: BackgroundTasks,
@@ -329,49 +389,23 @@ async def upload_cas(
     # portfolio — confirmed directly after real confusion from two
     # unrelated people's holdings silently combining into one total on
     # every upload. A byte-identical re-upload is still short-circuited as
-    # a no-op "duplicate" (checked here, before anything is touched, using
-    # the same file_hash ingest_cas itself would compute) so re-uploading
-    # the same file twice doesn't wipe and immediately reimport identical
+    # a no-op "duplicate" (checked before anything is touched, using the
+    # same file_hash ingest_cas itself would compute) so re-uploading the
+    # same file twice doesn't wipe and immediately reimport identical
     # data. Any other file — even a newer statement for the same person —
     # replaces everything: config/preferences/groups survive (they're app
     # settings, not statement data), but every prior statement, holding,
     # transaction, and cached NAV/enrichment value is gone.
-    file_hash = hashlib.sha256(content).hexdigest()
-    existing_upload = session.execute(select(CasUpload).where(CasUpload.file_hash == file_hash)).scalar_one_or_none()
-    if existing_upload:
-        return {
-            "status": "duplicate",
-            "message": "This exact statement has already been imported.",
-            "upload_id": existing_upload.upload_id,
-        }
-
-    from models import DisposalAllocation, EnrichmentCache, NavCache, PurchaseLot, SchemeAlias, SchemeBenchmarkMap
-    # Real child-before-parent order, not a guess: the previous version
-    # here still had Scheme deleted before NavCache/EnrichmentCache
-    # (which both FK into it) despite already having fixed the
-    # SchemeBenchmarkMap gap — caught live via a real 500 on this exact
-    # endpoint, reproduced directly against a copy of the real data to
-    # get the actual IntegrityError (psycopg reported
-    # nav_cache_scheme_id_fkey specifically) rather than guessing again.
-    # Traced the complete FK graph in models.py this time instead of
-    # patching one violation at a time.
-    for model in (
-        DisposalAllocation, PurchaseLot, Transaction, SchemeAlias,
-        NavCache, EnrichmentCache, SchemeBenchmarkMap, Holding, Scheme, Folio, CasUpload,
-    ):
-        session.query(model).delete()
-    session.flush()
-
     try:
-        async with httpx.AsyncClient() as client:
-            result = await ingestion.ingest_cas(session, client, parsed, content, investor_id=None)
+        outcome = await run_in_threadpool(_replace_and_ingest_sync, session, content, parsed)
     except Exception:
         logger.exception("ingest_cas failed after a successful PDF parse")
         raise HTTPException(500, "The statement parsed, but importing it failed. This is a bug — the server log has the details.")
 
-    if result.duplicate:
-        return {"status": "duplicate", "message": "This exact statement has already been imported.", "upload_id": result.upload_id}
+    if outcome.duplicate:
+        return {"status": "duplicate", "message": "This exact statement has already been imported.", "upload_id": outcome.upload_id}
 
+    result = outcome.result
     scheme_ids = list({
         session.get(Holding, h.holding_id).scheme_id for h in result.holdings
     })
