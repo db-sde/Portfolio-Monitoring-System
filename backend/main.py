@@ -23,7 +23,7 @@ import logging
 import os
 import secrets
 import tempfile
-from datetime import date, datetime, timezone
+from datetime import date, datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, Optional
 
@@ -36,6 +36,7 @@ from fastapi import BackgroundTasks, Depends, FastAPI, File, Form, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from sqlalchemy import select
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 from starlette.concurrency import run_in_threadpool
 
@@ -57,6 +58,13 @@ from models import CasUpload, EnrichmentCache, Folio, Holding, IngestJob, Scheme
 
 CALCULATION_VERSION = "2.0.0"  # bumped on any change to a calculation rule (spec 22)
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
+# A "processing" ingest_jobs row older than this is treated as abandoned
+# (the process that owned it crashed or the container restarted mid-
+# ingest) rather than genuinely still running, so it can't permanently
+# block every future upload. Generous even for a large real statement's
+# worth of sequential mfapi.in resolution calls — the largest measured
+# this session was ~4 minutes.
+STALE_JOB_THRESHOLD = timedelta(minutes=15)
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("portfolioiq")
@@ -424,6 +432,29 @@ async def upload_cas(
     if not (filename.endswith(".pdf") or filename.endswith(".json")):
         raise HTTPException(400, "Upload the CAS PDF from CAMS/KFintech (or a previously-parsed CAS JSON file).")
 
+    # Reject a second upload while one's still running, checked here,
+    # before any parsing — a real incident: a client-side timeout on one
+    # upload didn't stop it running server-side, and a retry moments
+    # later raced against it, both wiping the same tables concurrently,
+    # one hitting a foreign-key violation mid-delete. Checking this
+    # early means a concurrent attempt fails in milliseconds instead of
+    # wasting a real PDF parse (measured up to ~40s for a large
+    # statement) only to be rejected at the end anyway. This alone
+    # doesn't fully close the race, though — two requests can both pass
+    # this check before either has written its own job row — so it's
+    # paired with a real database constraint below (IngestJob's partial
+    # unique index) that's the actual guarantee.
+    existing_job = session.execute(select(IngestJob).order_by(IngestJob.job_id.desc()).limit(1)).scalar_one_or_none()
+    if existing_job and existing_job.status == "processing":
+        age = datetime.utcnow() - existing_job.created_at
+        if age < STALE_JOB_THRESHOLD:
+            raise HTTPException(409, "An import is already in progress. Wait for it to finish (see the status bar) before starting another.")
+        # Older than the threshold: whatever process owned this job is
+        # gone (crashed, container restarted mid-ingest) — treat it as
+        # abandoned rather than let a dead job block every future
+        # upload forever. Falls through; cleared below like any other
+        # previous job.
+
     if filename.endswith(".json"):
         # A previously-parsed CAS JSON — useful for testing, or if
         # someone already has one from elsewhere. Re-validated through
@@ -508,17 +539,28 @@ async def upload_cas(
     session.query(IngestJob).delete()
     job = IngestJob(status="processing")
     session.add(job)
-    session.flush()  # assigns job.job_id
-    # Explicit commit here, not left to Depends(get_session)'s own
-    # end-of-request cleanup — caught live: the background task (and the
-    # client's own very first poll, moments later) both need this row to
-    # already be durably visible, and relying on FastAPI's implicit
-    # post-response commit timing was NOT reliable enough in practice —
-    # reproduced twice, the response correctly showed a fresh job_id
-    # every time, but the row was simply absent from a direct DB check
-    # made right after. Committing explicitly here removes any doubt
-    # about exactly when this specific write becomes visible.
-    session.commit()
+    try:
+        session.flush()  # assigns job.job_id
+        # Explicit commit here, not left to Depends(get_session)'s own
+        # end-of-request cleanup — caught live: the background task (and
+        # the client's own very first poll, moments later) both need
+        # this row to already be durably visible, and relying on
+        # FastAPI's implicit post-response commit timing was NOT
+        # reliable enough in practice — reproduced twice, the response
+        # correctly showed a fresh job_id every time, but the row was
+        # simply absent from a direct DB check made right after.
+        # Committing explicitly here removes any doubt about exactly
+        # when this specific write becomes visible.
+        session.commit()
+    except IntegrityError:
+        # The early "is one already processing?" check above can't
+        # fully close the race on its own — two requests can both pass
+        # it before either has written its own row. This is what
+        # actually does: IngestJob's partial unique index lets Postgres
+        # reject a second concurrent "processing" row outright, and this
+        # is that rejection landing as a clean 409 instead of a bare 500.
+        session.rollback()
+        raise HTTPException(409, "An import is already in progress. Wait for it to finish (see the status bar) before starting another.")
 
     background_tasks.add_task(_run_ingest_job_sync, job.job_id, content, parsed)
 

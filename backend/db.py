@@ -61,6 +61,17 @@ def init_db() -> None:
     the schema needs a breaking change later, that's the point to add
     Alembic rather than before it's needed."""
     Base.metadata.create_all(bind=engine)
+    # create_all() only creates whole tables that don't exist yet — it
+    # does NOT add a new index to a table that already existed before
+    # the index was added to the model. ingest_jobs's own concurrent-
+    # upload guard (a partial unique index) was added after that table
+    # had already shipped to production, so a fresh deploy gets it via
+    # create_all() above, but an already-running one needs it created
+    # explicitly. checkfirst=True makes this safe to call every startup
+    # either way — a no-op once the index exists.
+    from models import IngestJob
+    for index in IngestJob.__table__.indexes:
+        index.create(bind=engine, checkfirst=True)
 
 
 @contextmanager

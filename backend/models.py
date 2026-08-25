@@ -26,7 +26,7 @@ from typing import Optional
 
 from sqlalchemy import (
     Boolean, Date, DateTime, ForeignKey, Index, Integer, JSON, Numeric,
-    String, Text, UniqueConstraint,
+    String, Text, UniqueConstraint, text,
 )
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -113,8 +113,27 @@ class IngestJob(Base):
     "processing". No foreign keys in or out — deliberately standalone so
     it never needs to participate in the FK-ordered wipe/delete
     sequences the rest of the schema does; upload_cas simply clears any
-    previous row before creating a new one."""
+    previous row before creating a new one.
+
+    The partial unique index below is the actual guarantee behind
+    upload_cas's concurrent-upload lock, not just the application-level
+    check it also does for a fast, friendly rejection. Reproduced live:
+    a client-side timeout on one upload didn't stop it running server-
+    side, and a retry a moment later raced against it — two concurrent
+    wipes on the same tables, one hit a foreign-key violation mid-
+    delete. An in-process check alone has the same race (two requests
+    can both see "nothing running yet" before either has written its
+    own row); Postgres enforcing "at most one processing row, ever" at
+    the index level is what actually closes it — the loser's INSERT
+    fails with an IntegrityError upload_cas catches and turns into a
+    clean 409, regardless of how the two requests happened to interleave."""
     __tablename__ = "ingest_jobs"
+    __table_args__ = (
+        Index(
+            "uq_ingest_jobs_one_processing", "status",
+            unique=True, postgresql_where=text("status = 'processing'"),
+        ),
+    )
 
     job_id: Mapped[int] = mapped_column(Integer, primary_key=True)
     status: Mapped[str] = mapped_column(String, default="processing")  # processing | ok | error
