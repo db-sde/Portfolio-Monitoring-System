@@ -141,6 +141,15 @@ class IngestJob(Base):
     error_detail: Mapped[Optional[str]] = mapped_column(Text)
     created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
     completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+    # Temporary diagnostic: a live checkpoint marker for the background
+    # enrichment step specifically (distinct from `status`, which only
+    # tracks the wipe+ingest itself and is already "ok" by the time
+    # enrichment runs). Added to find a real incident where enrichment
+    # wrote zero rows for 7+ minutes with no error surfaced anywhere —
+    # this makes it possible to see exactly which step it's stuck on via
+    # a live API poll, without server log access. Fine to remove once
+    # that's diagnosed and fixed.
+    debug_stage: Mapped[Optional[str]] = mapped_column(String)
 
 
 # ---------------------------------------------------------- CAS ingestion ----

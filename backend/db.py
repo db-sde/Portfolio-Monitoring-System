@@ -72,6 +72,12 @@ def init_db() -> None:
     from models import IngestJob
     for index in IngestJob.__table__.indexes:
         index.create(bind=engine, checkfirst=True)
+    # Same story for a new COLUMN on an existing table — create_all()
+    # won't add one either. IF NOT EXISTS makes this idempotent the same
+    # way checkfirst=True does for the index above.
+    from sqlalchemy import text
+    with engine.begin() as conn:
+        conn.execute(text("ALTER TABLE ingest_jobs ADD COLUMN IF NOT EXISTS debug_stage VARCHAR"))
 
 
 @contextmanager

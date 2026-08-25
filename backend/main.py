@@ -216,7 +216,23 @@ def health():
 
 # --------------------------------------------------------------- upload ----
 
-async def _run_enrichment_task_async(scheme_ids: list[int]) -> None:
+def _mark_stage(job_id: Optional[int], stage: str) -> None:
+    """Temporary diagnostic checkpoint — see IngestJob.debug_stage's own
+    docstring. A fresh, tiny, isolated session/commit per call so this
+    can never itself be the thing that hangs or loses work; safe to call
+    from anywhere, including right before something that might fail."""
+    if job_id is None:
+        return
+    try:
+        with db.get_session() as session:
+            job = session.get(IngestJob, job_id)
+            if job:
+                job.debug_stage = stage
+    except Exception:
+        logger.exception("_mark_stage failed for job_id=%s stage=%s", job_id, stage)
+
+
+async def _run_enrichment_task_async(scheme_ids: list[int], job_id: Optional[int] = None) -> None:
     """Two separate sessions/transactions on purpose: benchmark_service
     already retries internally and never raises, but if it somehow did,
     sharing one transaction with the per-scheme enrichment below would
@@ -235,20 +251,32 @@ async def _run_enrichment_task_async(scheme_ids: list[int]) -> None:
     NAV/enrichment rows for every real scheme with no visible error;
     logging explicitly here is what would have made that diagnosable
     from Render's log viewer instead of requiring a live DB query to
-    even notice it happened."""
+    even notice it happened.
+
+    _mark_stage calls throughout are a temporary diagnostic for a real,
+    still-unexplained incident: enrichment wrote zero rows for 7+
+    minutes on a 54-scheme portfolio, no exception logged, nothing —
+    meaning it's stuck somewhere in here rather than failing outright.
+    These checkpoints make that visible via GET /api/upload-status
+    without server log access."""
+    _mark_stage(job_id, "started")
     try:
         async with httpx.AsyncClient() as client:
+            _mark_stage(job_id, "before_benchmark_nav")
             with db.get_session() as session:
                 await benchmark_service.refresh_nifty50_proxy_nav(session, client)
+            _mark_stage(job_id, "before_refresh_enrichment")
             with db.get_session() as session:
                 schemes = [session.get(Scheme, sid) for sid in scheme_ids]
                 schemes = [s for s in schemes if s is not None]
                 await enrichment_bridge.refresh_enrichment(session, schemes)
-    except Exception:
+            _mark_stage(job_id, "finished_ok")
+    except Exception as exc:
         logger.exception("_run_enrichment_task failed for scheme_ids=%s", scheme_ids)
+        _mark_stage(job_id, f"exception: {type(exc).__name__}: {exc}")
 
 
-def _run_enrichment_task(scheme_ids: list[int]) -> None:
+def _run_enrichment_task(scheme_ids: list[int], job_id: Optional[int] = None) -> None:
     """Deliberately a plain sync function, even though the real work
     (_run_enrichment_task_async) is async — this is the entire fix for a
     live production incident: enrichment_bridge.refresh_enrichment and
@@ -269,7 +297,7 @@ def _run_enrichment_task(scheme_ids: list[int]) -> None:
     fresh event loop to run the real async work on — completely
     isolated from the loop serving live requests, so enrichment can take
     as long as it needs without freezing anything else."""
-    asyncio.run(_run_enrichment_task_async(scheme_ids))
+    asyncio.run(_run_enrichment_task_async(scheme_ids, job_id))
 
 
 def _replace_and_ingest_sync(content: bytes, parsed) -> ingestion.IngestResult:
@@ -415,7 +443,7 @@ def _run_ingest_job_sync(job_id: int, content: bytes, parsed) -> None:
     # its own isolated thread/event-loop unit regardless of how it's
     # invoked, so calling it here, sequentially, after ingest finishes,
     # is exactly equivalent to how upload_cas used to schedule it.
-    _run_enrichment_task(scheme_ids)
+    _run_enrichment_task(scheme_ids, job_id)
 
 
 @app.post("/api/upload-cas")
@@ -601,9 +629,12 @@ def get_upload_status(job_id: int, session: Session = Depends(get_session)):
         raise HTTPException(404, "This upload isn't being tracked anymore — a newer upload may have started since.")
     if job.status == "processing":
         return {"status": "processing"}
+    # debug_stage is the ingest job's OWN status; enrichment keeps
+    # running after it — included here too (temporary diagnostic, see
+    # IngestJob.debug_stage) so it's visible on the same poll.
     if job.status == "error":
         return {"status": "error", "message": job.error_detail}
-    return {"status": "ok", **(job.result_json or {})}
+    return {"status": "ok", "debug_stage": job.debug_stage, **(job.result_json or {})}
 
 
 # ------------------------------------------------------------- portfolio ----
