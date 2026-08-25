@@ -272,12 +272,12 @@ class _UploadOutcome:
     result: Optional[ingestion.IngestResult]
 
 
-def _replace_and_ingest_sync(session: Session, content: bytes, parsed) -> _UploadOutcome:
+def _replace_and_ingest_sync(content: bytes, parsed) -> _UploadOutcome:
     """The other half of the same event-loop-blocking bug fixed above for
     background enrichment — caught live, not just in review: a real
     upload here returned a normal, correct-looking 200 (real investor
     name, real holdings, no errors) while GET /api/health — zero DB
-    dependency — hung for 60+ seconds at the exact same time, and the
+    dependency — hung for 127 seconds at the exact same time, and the
     database the response described never actually reflected the
     ingest. ingest_cas's own DB writes (session.execute/add/flush across
     _persist_transactions, _rebuild_fifo, scheme_resolution) are plain
@@ -286,42 +286,65 @@ def _replace_and_ingest_sync(session: Session, content: bytes, parsed) -> _Uploa
     main event loop for this request's entire ingest duration, same as
     the background task used to.
 
+    Fixing ONLY the event-loop block wasn't enough, though — caught by
+    re-testing live after that fix: /api/health stayed fully responsive
+    through the whole upload this time (no freeze at all), yet the write
+    still silently never persisted (proven by re-uploading the identical
+    file immediately after and getting a fresh "ok" ingest again instead
+    of "duplicate" — the file_hash check would have caught a real
+    committed row). The remaining bug was reusing the FastAPI-request-
+    scoped `session` (created on the main thread by Depends(get_session))
+    from inside this worker thread. SQLAlchemy's own docs are explicit
+    that a Session must not be shared across threads AT ALL, even used
+    sequentially, never concurrently — unlike a bare DBAPI connection,
+    its internal state isn't safe for that. The fix is the same pattern
+    _run_enrichment_task_async already uses successfully: open and fully
+    own a BRAND NEW session entirely within this one worker thread
+    (db.get_session() commits and closes it on the way out), rather than
+    being handed one that was created elsewhere.
+
     Wrapped in a plain sync function so the caller can run it via
-    run_in_threadpool (off the main event loop, its own thread) exactly
-    like _run_enrichment_task — asyncio.run() here gives that thread its
-    own fresh event loop for ingest_cas's httpx calls, isolated from the
-    one serving every other concurrent request. A fresh httpx.AsyncClient
-    is created inside this new loop rather than reusing one from the
+    run_in_threadpool (off the main event loop, its own thread) — same
+    as _run_enrichment_task. asyncio.run() gives this thread its own
+    fresh event loop for ingest_cas's httpx calls, isolated from the one
+    serving every other concurrent request. A fresh httpx.AsyncClient is
+    created inside this new loop rather than reusing one from the
     caller's loop — an AsyncClient's connection pool is bound to the loop
     that created it and isn't valid on a different one."""
-    file_hash = hashlib.sha256(content).hexdigest()
-    existing_upload = session.execute(select(CasUpload).where(CasUpload.file_hash == file_hash)).scalar_one_or_none()
-    if existing_upload:
-        return _UploadOutcome(duplicate=True, upload_id=existing_upload.upload_id, result=None)
+    with db.get_session() as session:
+        file_hash = hashlib.sha256(content).hexdigest()
+        existing_upload = session.execute(select(CasUpload).where(CasUpload.file_hash == file_hash)).scalar_one_or_none()
+        if existing_upload:
+            return _UploadOutcome(duplicate=True, upload_id=existing_upload.upload_id, result=None)
 
-    from models import DisposalAllocation, EnrichmentCache, NavCache, PurchaseLot, SchemeAlias, SchemeBenchmarkMap
-    # Real child-before-parent order, not a guess: the previous version
-    # here still had Scheme deleted before NavCache/EnrichmentCache
-    # (which both FK into it) despite already having fixed the
-    # SchemeBenchmarkMap gap — caught live via a real 500 on this exact
-    # endpoint, reproduced directly against a copy of the real data to
-    # get the actual IntegrityError (psycopg reported
-    # nav_cache_scheme_id_fkey specifically) rather than guessing again.
-    # Traced the complete FK graph in models.py this time instead of
-    # patching one violation at a time.
-    for model in (
-        DisposalAllocation, PurchaseLot, Transaction, SchemeAlias,
-        NavCache, EnrichmentCache, SchemeBenchmarkMap, Holding, Scheme, Folio, CasUpload,
-    ):
-        session.query(model).delete()
-    session.flush()
+        from models import DisposalAllocation, EnrichmentCache, NavCache, PurchaseLot, SchemeAlias, SchemeBenchmarkMap
+        # Real child-before-parent order, not a guess: the previous version
+        # here still had Scheme deleted before NavCache/EnrichmentCache
+        # (which both FK into it) despite already having fixed the
+        # SchemeBenchmarkMap gap — caught live via a real 500 on this exact
+        # endpoint, reproduced directly against a copy of the real data to
+        # get the actual IntegrityError (psycopg reported
+        # nav_cache_scheme_id_fkey specifically) rather than guessing again.
+        # Traced the complete FK graph in models.py this time instead of
+        # patching one violation at a time.
+        for model in (
+            DisposalAllocation, PurchaseLot, Transaction, SchemeAlias,
+            NavCache, EnrichmentCache, SchemeBenchmarkMap, Holding, Scheme, Folio, CasUpload,
+        ):
+            session.query(model).delete()
+        session.flush()
 
-    async def _ingest() -> ingestion.IngestResult:
-        async with httpx.AsyncClient() as client:
-            return await ingestion.ingest_cas(session, client, parsed, content, investor_id=None)
+        async def _ingest() -> ingestion.IngestResult:
+            async with httpx.AsyncClient() as client:
+                return await ingestion.ingest_cas(session, client, parsed, content, investor_id=None)
 
-    result = asyncio.run(_ingest())
-    return _UploadOutcome(duplicate=False, upload_id=None, result=result)
+        result = asyncio.run(_ingest())
+        # Returning here, still inside the `with` block, is deliberate:
+        # db.get_session()'s __exit__ is what commits — it must run
+        # before this function returns, or the session closes on a
+        # rollback (no exception occurred, but nothing was ever
+        # explicitly committed either) instead of persisting the ingest.
+        return _UploadOutcome(duplicate=False, upload_id=None, result=result)
 
 
 @app.post("/api/upload-cas")
@@ -397,7 +420,7 @@ async def upload_cas(
     # settings, not statement data), but every prior statement, holding,
     # transaction, and cached NAV/enrichment value is gone.
     try:
-        outcome = await run_in_threadpool(_replace_and_ingest_sync, session, content, parsed)
+        outcome = await run_in_threadpool(_replace_and_ingest_sync, content, parsed)
     except Exception:
         logger.exception("ingest_cas failed after a successful PDF parse")
         raise HTTPException(500, "The statement parsed, but importing it failed. This is a bug — the server log has the details.")
