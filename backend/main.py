@@ -269,7 +269,7 @@ async def _run_enrichment_task_async(scheme_ids: list[int], job_id: Optional[int
             with db.get_session() as session:
                 schemes = [session.get(Scheme, sid) for sid in scheme_ids]
                 schemes = [s for s in schemes if s is not None]
-                await enrichment_bridge.refresh_enrichment(session, schemes)
+                await enrichment_bridge.refresh_enrichment(session, schemes, on_stage=lambda s: _mark_stage(job_id, s))
             _mark_stage(job_id, "finished_ok")
     except Exception as exc:
         logger.exception("_run_enrichment_task failed for scheme_ids=%s", scheme_ids)

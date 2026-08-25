@@ -58,8 +58,18 @@ def get_cached_enrichment(session: Session, scheme_id: int) -> Optional[dict]:
     return None
 
 
-async def refresh_enrichment(session: Session, schemes: list[Scheme]) -> dict[int, dict]:
-    """schemes: DB Scheme rows needing enrichment. Returns {scheme_id: payload}."""
+async def refresh_enrichment(session: Session, schemes: list[Scheme], on_stage=None) -> dict[int, dict]:
+    """schemes: DB Scheme rows needing enrichment. Returns {scheme_id: payload}.
+
+    on_stage: optional callable(str) -> None, called at checkpoints —
+    temporary diagnostic for a real incident (enrichment stuck for
+    minutes with zero progress and no exception). Lets the caller record
+    progress (e.g. onto a pollable DB row) without this module needing
+    to know anything about how/where that's stored."""
+    def _stage(name: str) -> None:
+        if on_stage:
+            on_stage(name)
+
     fresh: dict[int, dict] = {}
     to_fetch: list[Scheme] = []
     for scheme in schemes:
@@ -76,9 +86,12 @@ async def refresh_enrichment(session: Session, schemes: list[Scheme]) -> dict[in
         {"amfi": s.amfi_code, "isin": s.isin, "scheme": s.name}
         for s in to_fetch if s.amfi_code
     ]
+    _stage(f"fetching_{len(targets)}_schemes")
     results = await enrichment.enrich_schemes(targets)  # {amfi_code: payload}
+    _stage(f"fetched_{len(results)}_results_persisting")
 
-    for scheme in to_fetch:
+    for i, scheme in enumerate(to_fetch):
+        _stage(f"persisting_{i}_of_{len(to_fetch)}_scheme_id_{scheme.scheme_id}")
         payload = results.get(scheme.amfi_code) if scheme.amfi_code else None
         if payload is None:
             continue
