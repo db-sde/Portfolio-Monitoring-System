@@ -78,31 +78,41 @@ async def refresh_enrichment(session: Session, schemes: list[Scheme]) -> dict[in
     ]
     results = await enrichment.enrich_schemes(targets)  # {amfi_code: payload}
 
+    # Committing after every scheme (as this used to) meant a large
+    # portfolio spent a full Neon round-trip per scheme just on commit
+    # overhead — reported live as enrichment taking minutes longer than
+    # it needed to. Batched here instead: BATCH_COMMIT_SIZE schemes'
+    # worth of writes share one commit, cutting round-trips by roughly
+    # that factor, while still bounding a connection failure's damage to
+    # at most one batch instead of either "lose everything" (a bare
+    # session.rollback() shared across the whole loop, the bug this
+    # SAVEPOINT design replaced) or "lose nothing" (the per-scheme-commit
+    # version this replaces, correct but needlessly slow).
+    BATCH_COMMIT_SIZE = 5
+    uncommitted = 0
+
     for scheme in to_fetch:
         payload = results.get(scheme.amfi_code) if scheme.amfi_code else None
         if payload is None:
             continue
         try:
             # A SAVEPOINT (begin_nested), not the bare session: this loop
-            # shares one session/transaction across every scheme in the
-            # batch, and a plain session.rollback() on a mid-loop failure
-            # would undo every earlier scheme's already-flushed writes
-            # too, not just this one's — a real bug caught before it
-            # shipped. begin_nested() scopes the rollback to just this
-            # scheme's own SAVEPOINT on exception, leaving prior schemes'
-            # flushed work in the (still-open) outer transaction intact —
-            # but that alone only protects against a *data* problem in
-            # one scheme's payload. A *connection*-level failure (a real
+            # shares one session/transaction across a whole batch, and a
+            # plain session.rollback() on a mid-batch failure would undo
+            # every earlier scheme's already-flushed writes in this SAME
+            # batch too, not just this one's — a real bug caught before
+            # it shipped. begin_nested() scopes the rollback to just this
+            # scheme's own SAVEPOINT on exception, leaving the rest of
+            # the batch's already-flushed work in the (still-open) outer
+            # transaction intact — this protects against a *data*
+            # problem in one scheme's payload, and the exception handler
+            # below only escalates to session.rollback() (losing the
+            # whole in-flight batch) for the different case this SAVEPOINT
+            # alone can't cover: a *connection*-level failure (a real
             # Neon timeout, caught live: writing one scheme's several-
             # thousand-row NAV history took long enough to hit "SSL
-            # SYSCALL error: Operation timed out") breaks the whole
-            # session, and everything still sitting uncommitted — every
-            # earlier scheme in this same loop, even ones that finished
-            # cleanly — would be lost when the loop's single trailing
-            # flush/the caller's eventual commit fails too. Committing
-            # per scheme, right after each one's SAVEPOINT releases,
-            # makes every scheme's success durable independently of
-            # whether a later one in the same batch loses its connection.
+            # SYSCALL error: Operation timed out"), which invalidates the
+            # session itself, not just the current SAVEPOINT.
             with session.begin_nested():
                 nav_history = payload.pop("_nav_history", None) or []
                 if nav_history:
@@ -130,20 +140,31 @@ async def refresh_enrichment(session: Session, schemes: list[Scheme]) -> dict[in
                         data_as_of=data_as_of, fetched_at=datetime.now(timezone.utc),
                         status="ok" if payload.get("enrichment_source") != "failed" else "unavailable",
                     ))
-            session.commit()
         except Exception:
             logger.exception(
                 "refresh_enrichment: failed to persist scheme_id=%s amfi=%s",
                 scheme.scheme_id, scheme.amfi_code,
             )
-            # rollback (not just letting the exception propagate) is what
-            # lets a scheme AFTER this one still succeed on the same
-            # session — SQLAlchemy invalidates a connection that died
-            # mid-query and transparently gets a fresh one from the pool
-            # (pool_pre_ping=True) on the session's next use, but only
-            # once the session's own error state has been cleared.
-            session.rollback()
+            # begin_nested()'s own SAVEPOINT rollback already handled a
+            # plain data/payload problem cleanly on its own — the session
+            # is still perfectly usable, so calling session.rollback()
+            # here too would be the exact bug this design exists to
+            # avoid, discarding the rest of this batch's already-flushed
+            # schemes for no reason. is_active is False specifically when
+            # the session itself is the casualty (a connection-level
+            # failure) rather than just this one scheme's SAVEPOINT — only
+            # then is losing the in-flight batch actually unavoidable.
+            if not session.is_active:
+                session.rollback()
+                uncommitted = 0
             continue
         fresh[scheme.scheme_id] = payload
+        uncommitted += 1
+        if uncommitted >= BATCH_COMMIT_SIZE:
+            session.commit()
+            uncommitted = 0
+
+    if uncommitted > 0:
+        session.commit()
 
     return fresh
