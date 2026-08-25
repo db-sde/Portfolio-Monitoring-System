@@ -509,6 +509,16 @@ async def upload_cas(
     job = IngestJob(status="processing")
     session.add(job)
     session.flush()  # assigns job.job_id
+    # Explicit commit here, not left to Depends(get_session)'s own
+    # end-of-request cleanup — caught live: the background task (and the
+    # client's own very first poll, moments later) both need this row to
+    # already be durably visible, and relying on FastAPI's implicit
+    # post-response commit timing was NOT reliable enough in practice —
+    # reproduced twice, the response correctly showed a fresh job_id
+    # every time, but the row was simply absent from a direct DB check
+    # made right after. Committing explicitly here removes any doubt
+    # about exactly when this specific write becomes visible.
+    session.commit()
 
     background_tasks.add_task(_run_ingest_job_sync, job.job_id, content, parsed)
 
