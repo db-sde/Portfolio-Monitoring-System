@@ -90,50 +90,69 @@ async def refresh_enrichment(session: Session, schemes: list[Scheme], on_stage=N
     results = await enrichment.enrich_schemes(targets)  # {amfi_code: payload}
     _stage(f"fetched_{len(results)}_results_persisting")
 
+    def _persist_unavailable(scheme: Scheme, reason: str) -> None:
+        # Shared by every "this scheme has no usable payload" case below —
+        # whichever the reason, the fix is the same: an explicit
+        # "unavailable" EnrichmentCache row, so it counts as attempted
+        # (landing in "failed") instead of silently never being recorded
+        # at all. The bug this replaces: a bare `continue` here, for ANY
+        # of these reasons, left `pending` permanently non-zero — no
+        # amount of waiting ever resolved it, since nothing was ever
+        # written for that scheme. Reproduced live twice, for two
+        # different reasons: no AMFI code at all (a SCHEME_UNRESOLVED
+        # holding), and — the more surprising one — a perfectly normal,
+        # well-known fund (valid AMFI code and ISIN, fetched successfully
+        # in isolated testing) whose fetch simply failed or raised once
+        # within a ~50-scheme concurrent batch, which is exactly the kind
+        # of transient blip mfapi.in/captnemo are documented elsewhere in
+        # this codebase to produce under concurrent load.
+        try:
+            with session.begin_nested():
+                existing = session.execute(
+                    select(EnrichmentCache).where(
+                        EnrichmentCache.scheme_id == scheme.scheme_id, EnrichmentCache.provider == PROVIDER_KEY,
+                    )
+                ).scalar_one_or_none()
+                payload = {"enrichment_source": "failed", "reason": reason}
+                if existing:
+                    existing.payload = payload
+                    existing.data_as_of = date.today()
+                    existing.fetched_at = datetime.now(timezone.utc)
+                    existing.status = "unavailable"
+                else:
+                    session.add(EnrichmentCache(
+                        scheme_id=scheme.scheme_id, provider=PROVIDER_KEY, payload=payload,
+                        data_as_of=date.today(), fetched_at=datetime.now(timezone.utc), status="unavailable",
+                    ))
+            session.commit()
+        except Exception:
+            logger.exception(
+                "refresh_enrichment: failed to persist unavailable status for scheme_id=%s (%s)",
+                scheme.scheme_id, reason,
+            )
+            session.rollback()
+
     for i, scheme in enumerate(to_fetch):
         _stage(f"persisting_{i}_of_{len(to_fetch)}_scheme_id_{scheme.scheme_id}")
         if not scheme.amfi_code:
             # No AMFI code at all (a SCHEME_UNRESOLVED holding — an old/
-            # obscure fund ingestion couldn't confirm an identity for) was
+            # obscure fund ingestion couldn't confirm an identity for) is
             # never in `targets` above, so `results` has nothing for it —
             # this isn't "not fetched yet," it's "can never be fetched."
-            # The real incident this fixes: these schemes got silently
-            # `continue`d past with no EnrichmentCache row at all, so
-            # get_enrich_status's "pending" count could never reach 0 no
-            # matter how long the batch ran — reproduced live, watched a
-            # real portfolio finish 52 of 54 schemes correctly and then
-            # sit at "2 pending" forever. Persisting an explicit
-            # "unavailable" row here — the same status a genuine fetch
-            # failure gets — makes them count as attempted (correctly
-            # landing in "failed", not stuck in "pending" forever).
-            try:
-                with session.begin_nested():
-                    existing = session.execute(
-                        select(EnrichmentCache).where(
-                            EnrichmentCache.scheme_id == scheme.scheme_id, EnrichmentCache.provider == PROVIDER_KEY,
-                        )
-                    ).scalar_one_or_none()
-                    payload = {"enrichment_source": "failed", "reason": "no AMFI code resolved for this scheme"}
-                    if existing:
-                        existing.payload = payload
-                        existing.data_as_of = date.today()
-                        existing.fetched_at = datetime.now(timezone.utc)
-                        existing.status = "unavailable"
-                    else:
-                        session.add(EnrichmentCache(
-                            scheme_id=scheme.scheme_id, provider=PROVIDER_KEY, payload=payload,
-                            data_as_of=date.today(), fetched_at=datetime.now(timezone.utc), status="unavailable",
-                        ))
-                session.commit()
-            except Exception:
-                logger.exception(
-                    "refresh_enrichment: failed to persist unavailable status for scheme_id=%s (no amfi_code)",
-                    scheme.scheme_id,
-                )
-                session.rollback()
+            _persist_unavailable(scheme, "no AMFI code resolved for this scheme")
             continue
         payload = results.get(scheme.amfi_code)
         if payload is None:
+            # A resolvable scheme whose fetch still came back empty — it
+            # either raised inside enrich_schemes's own gather()
+            # (return_exceptions=True catches that there, but the result
+            # is simply absent from `results`, same as never having been
+            # fetched at all from this function's point of view) or
+            # genuinely returned nothing. Recorded as unavailable rather
+            # than silently dropped, same reasoning as the no-AMFI-code
+            # case above — this scheme just gets another chance on the
+            # next enrichment run instead of being invisible until then.
+            _persist_unavailable(scheme, "fetch returned no data for this scheme")
             continue
         try:
             # A SAVEPOINT (begin_nested), not the bare session: this loop
