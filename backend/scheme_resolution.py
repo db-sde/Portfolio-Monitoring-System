@@ -202,12 +202,21 @@ async def resolve_scheme(
         query = _search_query_from_name(cas_scheme_name)
         if query:
             candidates = await _fetch_json_retrying(client, f"{MFAPI_BASE}/search", params={"q": query}) or []
-            for candidate in candidates[:MAX_ALTERNATE_CANDIDATES]:
-                code = candidate.get("schemeCode")
-                if code is None:
-                    continue
-                raw = await _fetch_mfapi_scheme(client, str(code))
-                if not raw:
+            # Fetched concurrently, not one at a time — a scheme with no
+            # ISIN match among the candidates (an old/retired fund a CAS
+            # still references by a since-retired AMFI code) used to
+            # exhaust up to MAX_ALTERNATE_CANDIDATES sequential fetches,
+            # each up to ~32s worst case, before giving up on this one
+            # scheme — the same bug independently reproduced live in
+            # enrichment.py's own copy of this pattern (7+ minutes stuck
+            # on a single scheme there). Fetching them all at once bounds
+            # the worst case to roughly one candidate's own timeout.
+            codes = [c.get("schemeCode") for c in candidates[:MAX_ALTERNATE_CANDIDATES] if c.get("schemeCode") is not None]
+            raws = await asyncio.gather(
+                *[_fetch_mfapi_scheme(client, str(code)) for code in codes], return_exceptions=True,
+            )
+            for code, raw in zip(codes, raws):
+                if not raw or isinstance(raw, BaseException):
                     continue
                 meta = raw.get("meta", {})
                 if cas_isin not in (meta.get("isin_growth"), meta.get("isin_div_reinvestment")):

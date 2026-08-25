@@ -347,7 +347,23 @@ async def _find_fresh_alternate(
     candidates, then accept only the one whose own ISIN — the one
     identifier that survives an AMC recode — matches what the CAS
     statement actually says for this holding. Returns the full mfapi.in
-    payload for the fresh candidate, or None if nothing matched."""
+    payload for the fresh candidate, or None if nothing matched.
+
+    Candidates are fetched concurrently, not one at a time — reproduced
+    live as a real incident: a portfolio's enrichment stuck for 7+
+    minutes with zero progress, no exception anywhere. Traced to exactly
+    this loop running sequentially: a scheme with no fresh replacement
+    (an old/retired fund — HDFC Prudence, an LIC FMP series — whose ISIN
+    matches none of the search results) used to exhaust up to
+    MAX_ALTERNATE_CANDIDATES fetches one at a time, each up to ~32s
+    worst case (3 retries * 10s timeout + delays) — up to ~320s for that
+    ONE scheme alone. Since this whole function runs inside one
+    scheme's coroutine in enrich_schemes's asyncio.gather() over the
+    entire batch, and gather() waits for its slowest member regardless
+    of how many others already finished, that one scheme was blocking
+    every other scheme's already-fetched results from ever being
+    persisted. Fetching all candidates at once bounds the worst case to
+    roughly one candidate's own timeout instead of the sum of all of them."""
     if not isin:
         return None
     query = _search_query_from_name(scheme_name)
@@ -356,12 +372,15 @@ async def _find_fresh_alternate(
     candidates = await _fetch_json_retrying(client, f"{MFAPI_BASE}/search", params={"q": query})
     if not candidates:
         return None
-    for candidate in candidates[:MAX_ALTERNATE_CANDIDATES]:
-        code = candidate.get("schemeCode")
-        if code is None:
-            continue
-        raw = await _fetch_json_retrying(client, f"{MFAPI_BASE}/{code}")
-        if not raw:
+    codes = [c.get("schemeCode") for c in candidates[:MAX_ALTERNATE_CANDIDATES] if c.get("schemeCode") is not None]
+    if not codes:
+        return None
+    raws = await asyncio.gather(
+        *[_fetch_json_retrying(client, f"{MFAPI_BASE}/{code}") for code in codes],
+        return_exceptions=True,
+    )
+    for raw in raws:
+        if not raw or isinstance(raw, BaseException):
             continue
         meta = raw.get("meta", {})
         if isin not in (meta.get("isin_growth"), meta.get("isin_div_reinvestment")):
