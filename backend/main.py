@@ -973,14 +973,30 @@ def get_enrich_status(session: Session = Depends(get_session)):
     # attempted, which reaches 0 exactly when the background task has
     # worked through every scheme, whatever the outcome — not stuck
     # forever if a specific scheme can never actually succeed.
-    total = set(session.execute(select(Scheme.scheme_id)).scalars().all())
-    cache_rows = session.execute(select(EnrichmentCache.scheme_id, EnrichmentCache.status)).all()
+    # Scoped to schemes actually HELD (referenced by at least one
+    # Holding) — not every row in the schemes table. That table also
+    # holds the Nifty 50 benchmark proxy fund (benchmark_service's
+    # _get_or_create_proxy_scheme, created the moment any benchmark
+    # XIRR is computed), which is real but enriched through a totally
+    # separate path (refresh_nifty50_proxy_nav writes straight to
+    # nav_cache) and never gets an enrichment_cache row of its own.
+    # Counting it here meant "pending" could never reach 0 — reproduced
+    # live, stuck at 1 remaining no matter how long enrichment ran,
+    # for every single portfolio, since the proxy scheme always exists
+    # once any page computes a benchmark comparison.
+    held = set(session.execute(select(Holding.scheme_id).distinct()).scalars().all())
+    cache_rows = session.execute(
+        select(EnrichmentCache.scheme_id, EnrichmentCache.status).where(EnrichmentCache.scheme_id.in_(held))
+    ).all()
     attempted = {sid for sid, _status in cache_rows}
     enriched = {sid for sid, status in cache_rows if status == "ok"}
-    last_run = session.execute(select(EnrichmentCache.fetched_at).order_by(EnrichmentCache.fetched_at.desc()).limit(1)).scalar_one_or_none()
+    last_run = session.execute(
+        select(EnrichmentCache.fetched_at).where(EnrichmentCache.scheme_id.in_(held))
+        .order_by(EnrichmentCache.fetched_at.desc()).limit(1)
+    ).scalar_one_or_none()
     return {
-        "total_schemes": len(total), "enriched": len(enriched),
-        "failed": len(attempted - enriched), "pending": len(total - attempted),
+        "total_schemes": len(held), "enriched": len(enriched),
+        "failed": len(attempted - enriched), "pending": len(held - attempted),
         "last_run": last_run.isoformat() if last_run else None,
     }
 
