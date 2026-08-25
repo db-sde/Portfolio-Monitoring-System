@@ -23,7 +23,6 @@ import logging
 import os
 import secrets
 import tempfile
-from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
@@ -54,7 +53,7 @@ import gains_service_db
 import ingestion
 import portfolio_service
 import snapshot_service
-from models import CasUpload, EnrichmentCache, Folio, Holding, Scheme, Transaction
+from models import CasUpload, EnrichmentCache, Folio, Holding, IngestJob, Scheme, Transaction
 
 CALCULATION_VERSION = "2.0.0"  # bumped on any change to a calculation rule (spec 22)
 MAX_UPLOAD_BYTES = 20 * 1024 * 1024
@@ -265,58 +264,46 @@ def _run_enrichment_task(scheme_ids: list[int]) -> None:
     asyncio.run(_run_enrichment_task_async(scheme_ids))
 
 
-@dataclass
-class _UploadOutcome:
-    duplicate: bool
-    upload_id: Optional[int]
-    result: Optional[ingestion.IngestResult]
+def _replace_and_ingest_sync(content: bytes, parsed) -> ingestion.IngestResult:
+    """The wipe + full ingest, run entirely off the main event loop in its
+    own thread with its own database session — the fix for two real,
+    separately-caught bugs:
 
+    1. ingest_cas's own DB writes (session.execute/add/flush across
+       _persist_transactions, _rebuild_fifo, scheme_resolution) are plain
+       synchronous SQLAlchemy calls. Running them directly inside
+       upload_cas's async def body used to block the main event loop for
+       the request's entire ingest duration — confirmed live: GET
+       /api/health hung for 127 seconds during one real upload.
+    2. Fixing that wasn't enough on its own — re-testing live afterward,
+       /api/health stayed responsive throughout, yet the write still
+       silently never persisted (proven by re-uploading the identical
+       file and getting a fresh "ok" ingest again instead of
+       "duplicate"). The cause was reusing the FastAPI-request-scoped
+       session (created on the main thread by Depends(get_session)) from
+       inside this worker thread — SQLAlchemy's own docs are explicit
+       that a Session must not be shared across threads at all, even
+       used sequentially, never concurrently.
 
-def _replace_and_ingest_sync(content: bytes, parsed) -> _UploadOutcome:
-    """The other half of the same event-loop-blocking bug fixed above for
-    background enrichment — caught live, not just in review: a real
-    upload here returned a normal, correct-looking 200 (real investor
-    name, real holdings, no errors) while GET /api/health — zero DB
-    dependency — hung for 127 seconds at the exact same time, and the
-    database the response described never actually reflected the
-    ingest. ingest_cas's own DB writes (session.execute/add/flush across
-    _persist_transactions, _rebuild_fifo, scheme_resolution) are plain
-    synchronous SQLAlchemy calls, same as refresh_enrichment's were —
-    running them directly inside upload_cas's async def body blocked the
-    main event loop for this request's entire ingest duration, same as
-    the background task used to.
+    Both fixed the same way: open and fully own a BRAND NEW session
+    entirely within this one worker thread (db.get_session() commits and
+    closes it on the way out) rather than being handed one created
+    elsewhere, and never let this function's own blocking work run on
+    the main event loop.
 
-    Fixing ONLY the event-loop block wasn't enough, though — caught by
-    re-testing live after that fix: /api/health stayed fully responsive
-    through the whole upload this time (no freeze at all), yet the write
-    still silently never persisted (proven by re-uploading the identical
-    file immediately after and getting a fresh "ok" ingest again instead
-    of "duplicate" — the file_hash check would have caught a real
-    committed row). The remaining bug was reusing the FastAPI-request-
-    scoped `session` (created on the main thread by Depends(get_session))
-    from inside this worker thread. SQLAlchemy's own docs are explicit
-    that a Session must not be shared across threads AT ALL, even used
-    sequentially, never concurrently — unlike a bare DBAPI connection,
-    its internal state isn't safe for that. The fix is the same pattern
-    _run_enrichment_task_async already uses successfully: open and fully
-    own a BRAND NEW session entirely within this one worker thread
-    (db.get_session() commits and closes it on the way out), rather than
-    being handed one that was created elsewhere.
-
-    Wrapped in a plain sync function so the caller can run it via
-    run_in_threadpool (off the main event loop, its own thread) — same
-    as _run_enrichment_task. asyncio.run() gives this thread its own
-    fresh event loop for ingest_cas's httpx calls, isolated from the one
-    serving every other concurrent request. A fresh httpx.AsyncClient is
-    created inside this new loop rather than reusing one from the
-    caller's loop — an AsyncClient's connection pool is bound to the loop
-    that created it and isn't valid on a different one."""
+    Now called from _run_ingest_job_sync as a background job rather than
+    awaited directly by upload_cas — see that function's docstring for
+    why: a real 50+-scheme statement takes minutes of sequential
+    mfapi.in resolution calls, long enough that Render's own reverse
+    proxy returned a 502 to the client before this could even finish,
+    independent of whether it was correct. asyncio.run() gives this
+    thread its own fresh event loop for ingest_cas's httpx calls,
+    isolated from the one serving every other concurrent request. A
+    fresh httpx.AsyncClient is created inside this new loop rather than
+    reusing one from the caller's loop — an AsyncClient's connection
+    pool is bound to the loop that created it and isn't valid on a
+    different one."""
     with db.get_session() as session:
-        file_hash = hashlib.sha256(content).hexdigest()
-        existing_upload = session.execute(select(CasUpload).where(CasUpload.file_hash == file_hash)).scalar_one_or_none()
-        if existing_upload:
-            return _UploadOutcome(duplicate=True, upload_id=existing_upload.upload_id, result=None)
-
         from models import DisposalAllocation, EnrichmentCache, NavCache, PurchaseLot, SchemeAlias, SchemeBenchmarkMap
         # Real child-before-parent order, not a guess: the previous version
         # here still had Scheme deleted before NavCache/EnrichmentCache
@@ -344,7 +331,65 @@ def _replace_and_ingest_sync(content: bytes, parsed) -> _UploadOutcome:
         # before this function returns, or the session closes on a
         # rollback (no exception occurred, but nothing was ever
         # explicitly committed either) instead of persisting the ingest.
-        return _UploadOutcome(duplicate=False, upload_id=None, result=result)
+        return result
+
+
+def _run_ingest_job_sync(job_id: int, content: bytes, parsed) -> None:
+    """The actual background work behind an upload, run after upload_cas
+    has already returned "processing" to the client. Dispatched as a
+    plain BackgroundTasks callable — Starlette runs a sync one via
+    run_in_threadpool automatically, off the main event loop, same as
+    _run_enrichment_task — so it's free to take however long a real
+    statement's sequential mfapi.in resolution needs without anyone
+    holding an HTTP connection open waiting on it.
+
+    This is the actual fix for the 502s a real ~50-scheme upload was
+    hitting: previously upload_cas awaited the equivalent of this
+    function directly, meaning the browser (and Render's own reverse
+    proxy in front of it) had to keep one HTTP request alive for the
+    entire multi-minute ingest — long enough that the proxy gave up and
+    returned a 502 before the ingest even finished, regardless of
+    whether it was correct. Now the HTTP round-trip is just the fast
+    part (parse + duplicate check); this runs after, unconstrained by
+    any request timeout, and the frontend polls GET
+    /api/upload-status/{job_id} until it's done."""
+    try:
+        result = _replace_and_ingest_sync(content, parsed)
+    except Exception:
+        logger.exception("Background ingest failed for job_id=%s", job_id)
+        with db.get_session() as session:
+            job = session.get(IngestJob, job_id)
+            if job:
+                job.status = "error"
+                job.error_detail = "The statement parsed, but importing it failed. This is a bug — the server log has the details."
+                job.completed_at = datetime.now(timezone.utc)
+        return
+
+    result_json = {
+        "investor_name": parsed.investor_info.name,
+        "statement_period": {"from": str(parsed.statement_period.from_), "to": str(parsed.statement_period.to)},
+        "total_holdings": len(result.holdings),
+        "holdings_needing_review": sum(1 for h in result.holdings if h.status != "reconciled"),
+        "warnings": result.warnings,
+        "holding_notes": [{"scheme_name": h.scheme_name, "status": h.status, "detail": h.detail} for h in result.holdings],
+    }
+    with db.get_session() as session:
+        job = session.get(IngestJob, job_id)
+        if job:
+            job.status = "ok"
+            job.result_json = result_json
+            job.completed_at = datetime.now(timezone.utc)
+        scheme_ids = list({
+            session.get(Holding, h.holding_id).scheme_id for h in result.holdings
+        })
+
+    # Direct call, not background_tasks.add_task — there's no live
+    # request to hang this off anymore by the time this runs (this
+    # function IS already the background work). _run_enrichment_task is
+    # its own isolated thread/event-loop unit regardless of how it's
+    # invoked, so calling it here, sequentially, after ingest finishes,
+    # is exactly equivalent to how upload_cas used to schedule it.
+    _run_enrichment_task(scheme_ids)
 
 
 @app.post("/api/upload-cas")
@@ -412,38 +457,67 @@ async def upload_cas(
     # portfolio — confirmed directly after real confusion from two
     # unrelated people's holdings silently combining into one total on
     # every upload. A byte-identical re-upload is still short-circuited as
-    # a no-op "duplicate" (checked before anything is touched, using the
-    # same file_hash ingest_cas itself would compute) so re-uploading the
-    # same file twice doesn't wipe and immediately reimport identical
+    # a no-op "duplicate" (checked here, before anything is touched, using
+    # the same file_hash ingest_cas itself would compute) so re-uploading
+    # the same file twice doesn't wipe and immediately reimport identical
     # data. Any other file — even a newer statement for the same person —
     # replaces everything: config/preferences/groups survive (they're app
     # settings, not statement data), but every prior statement, holding,
-    # transaction, and cached NAV/enrichment value is gone.
-    try:
-        outcome = await run_in_threadpool(_replace_and_ingest_sync, content, parsed)
-    except Exception:
-        logger.exception("ingest_cas failed after a successful PDF parse")
-        raise HTTPException(500, "The statement parsed, but importing it failed. This is a bug — the server log has the details.")
+    # transaction, and cached NAV/enrichment value is gone. This check
+    # itself is fast (one SELECT) and stays synchronous, right here —
+    # only the wipe+ingest that follows needs to be backgrounded.
+    file_hash = hashlib.sha256(content).hexdigest()
+    existing_upload = session.execute(select(CasUpload).where(CasUpload.file_hash == file_hash)).scalar_one_or_none()
+    if existing_upload:
+        return {
+            "status": "duplicate",
+            "message": "This exact statement has already been imported.",
+            "upload_id": existing_upload.upload_id,
+        }
 
-    if outcome.duplicate:
-        return {"status": "duplicate", "message": "This exact statement has already been imported.", "upload_id": outcome.upload_id}
+    # The wipe+ingest itself now runs entirely in the background (see
+    # _run_ingest_job_sync) instead of upload_cas awaiting it directly.
+    # Real reason: a real ~50-scheme statement takes minutes of
+    # sequential mfapi.in resolution calls (each call's own latency is
+    # highly variable, 1-15s, with retries on failure) — reproduced
+    # live as a 502 from Render's own reverse proxy, which gave up
+    # waiting on the response before the ingest even finished. Holding
+    # one HTTP connection open for however long that happens to take was
+    # never going to be reliable regardless of how correct the ingest
+    # logic itself is. ingest_jobs tracks only the most recent attempt
+    # (this is a single-investor tool — one statement in flight at a
+    # time), so any previous row is cleared before creating this one.
+    session.query(IngestJob).delete()
+    job = IngestJob(status="processing")
+    session.add(job)
+    session.flush()  # assigns job.job_id
 
-    result = outcome.result
-    scheme_ids = list({
-        session.get(Holding, h.holding_id).scheme_id for h in result.holdings
-    })
-    background_tasks.add_task(_run_enrichment_task, scheme_ids)
+    background_tasks.add_task(_run_ingest_job_sync, job.job_id, content, parsed)
 
-    active = sum(1 for h in result.holdings if h.status != "review_required")
     return {
-        "status": "ok",
+        "status": "processing",
+        "job_id": job.job_id,
         "investor_name": parsed.investor_info.name,
         "statement_period": {"from": parsed.statement_period.from_, "to": parsed.statement_period.to},
-        "total_holdings": len(result.holdings),
-        "holdings_needing_review": sum(1 for h in result.holdings if h.status != "reconciled"),
-        "warnings": result.warnings,
-        "holding_notes": [{"scheme_name": h.scheme_name, "status": h.status, "detail": h.detail} for h in result.holdings],
     }
+
+
+@app.get("/api/upload-status/{job_id}")
+def get_upload_status(job_id: int, session: Session = Depends(get_session)):
+    job = session.get(IngestJob, job_id)
+    if job is None:
+        # Not a 404-as-"never existed" — ingest_jobs only ever keeps the
+        # latest row, so this means a newer upload started (and cleared
+        # this one) since the client last had a job_id. The frontend
+        # only ever polls a job_id it just got from its own upload, so
+        # this should be rare in practice — a second upload started
+        # before the first's poll loop noticed it was superseded.
+        raise HTTPException(404, "This upload isn't being tracked anymore — a newer upload may have started since.")
+    if job.status == "processing":
+        return {"status": "processing"}
+    if job.status == "error":
+        return {"status": "error", "message": job.error_detail}
+    return {"status": "ok", **(job.result_json or {})}
 
 
 # ------------------------------------------------------------- portfolio ----
@@ -859,6 +933,7 @@ def delete_all_data(session: Session = Depends(get_session)):
         NavCache, EnrichmentCache, SchemeBenchmarkMap, Holding, Scheme, Folio, CasUpload,
         BenchmarkPoint, BenchmarkDefinition,
         ConfigInvestorArn, ConfigInvestor, ConfigGroup, Preference,
+        IngestJob,
     ):
         session.query(model).delete()
     return {"status": "ok", "message": "All statements, holdings, gains, config, and cached market data deleted."}

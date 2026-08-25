@@ -68,7 +68,7 @@ export default function TopBar({ investorName, statementPeriod, lastEnriched, en
             disabled={uploading || !!pendingFile}
             className="text-sm font-semibold text-ink-2 hover:text-ink border border-line rounded-lg px-3.5 py-2 disabled:opacity-50 transition-colors"
           >
-            {uploading ? 'Parsing…' : 'New statement'}
+            {uploading ? 'Importing…' : 'New statement'}
           </button>
         </div>
       </div>
@@ -85,14 +85,24 @@ export default function TopBar({ investorName, statementPeriod, lastEnriched, en
             onKeyDown={(e) => e.key === 'Enter' && submitPending()}
             className="rounded-lg border border-line px-3 py-1.5 text-sm flex-1 min-w-[160px] outline-none focus:border-accent bg-card"
           />
-          <button onClick={submitPending} className="text-sm font-semibold bg-band text-band-ink rounded-lg px-3.5 py-1.5 hover:opacity-90">
-            Parse
+          <button
+            onClick={submitPending}
+            disabled={uploading}
+            className="text-sm font-semibold bg-band text-band-ink rounded-lg px-3.5 py-1.5 hover:opacity-90 disabled:opacity-50"
+          >
+            {uploading ? 'Importing…' : 'Parse'}
           </button>
-          <button onClick={cancelPending} className="text-sm font-medium text-ink-3 hover:text-ink px-2 py-1.5">
+          <button
+            onClick={cancelPending}
+            disabled={uploading}
+            className="text-sm font-medium text-ink-3 hover:text-ink px-2 py-1.5 disabled:opacity-50"
+          >
             Cancel
           </button>
           <span className="w-full text-xs text-accent-strong">
-            This replaces everything currently shown — your current statement's holdings, transactions, and gains will be gone once this one parses.
+            {uploading
+              ? 'Resolving every fund against live market data — large statements with many funds can take a few minutes.'
+              : "This replaces everything currently shown — your current statement's holdings, transactions, and gains will be gone once this one parses."}
           </span>
         </div>
       )}

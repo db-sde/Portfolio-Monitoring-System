@@ -121,14 +121,20 @@ export default function WelcomeUpload({ onUpload, uploading, error, replacing = 
                 disabled={uploading}
                 className="rounded-lg bg-band text-band-ink font-semibold text-sm px-5 py-2.5 disabled:opacity-50 hover:opacity-90 transition-opacity"
               >
-                {uploading ? 'Parsing…' : 'Parse statement'}
+                {uploading ? 'Importing…' : 'Parse statement'}
               </button>
               <button
                 onClick={() => setPendingFile(null)}
-                className="text-sm text-ink-3 hover:text-ink px-2"
+                disabled={uploading}
+                className="text-sm text-ink-3 hover:text-ink px-2 disabled:opacity-50"
               >
                 Cancel
               </button>
+              {uploading && (
+                <span className="w-full text-xs text-ink-3">
+                  Resolving every fund against live market data — large statements with many funds can take a few minutes.
+                </span>
+              )}
             </div>
           )}
 

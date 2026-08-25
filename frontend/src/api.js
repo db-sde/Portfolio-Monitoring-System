@@ -48,6 +48,14 @@ export const api = {
     form.append('password', password)
     return request('/api/upload-cas', { method: 'POST', body: form })
   },
+  // The ingest itself now runs in the background (a real ~50-scheme
+  // statement takes minutes of sequential mfapi.in calls — long enough
+  // that Render's own proxy used to 502 before the ingest even
+  // finished). uploadCas returns almost immediately with a job_id;
+  // poll this until status leaves "processing".
+  getUploadStatus(jobId) {
+    return request(`/api/upload-status/${jobId}`)
+  },
   getPortfolio(params) {
     return request(`/api/portfolio${qs(params)}`)
   },

@@ -98,6 +98,32 @@ class Preference(Base):
     value: Mapped[dict] = mapped_column(JSON)
 
 
+class IngestJob(Base):
+    """Tracks one upload's wipe+ingest as it runs in the background.
+    upload_cas used to hold the HTTP connection open for the entire
+    ingest — fine for a small statement, but a real one with 50+ schemes
+    means minutes of sequential mfapi.in resolution calls (each call's
+    own latency is highly variable, 1-15s, with retries on failure), long
+    enough that Render's own reverse proxy gave up and returned a 502 to
+    the client before the ingest even finished — independent of whether
+    the ingest itself was correct. upload_cas now creates this row and
+    returns almost immediately (status "processing"); the real wipe+
+    ingest work happens after, off the main event loop, and the frontend
+    polls GET /api/upload-status/{job_id} until status leaves
+    "processing". No foreign keys in or out — deliberately standalone so
+    it never needs to participate in the FK-ordered wipe/delete
+    sequences the rest of the schema does; upload_cas simply clears any
+    previous row before creating a new one."""
+    __tablename__ = "ingest_jobs"
+
+    job_id: Mapped[int] = mapped_column(Integer, primary_key=True)
+    status: Mapped[str] = mapped_column(String, default="processing")  # processing | ok | error
+    result_json: Mapped[Optional[dict]] = mapped_column(JSON)
+    error_detail: Mapped[Optional[str]] = mapped_column(Text)
+    created_at: Mapped[datetime] = mapped_column(DateTime, default=_now)
+    completed_at: Mapped[Optional[datetime]] = mapped_column(DateTime)
+
+
 # ---------------------------------------------------------- CAS ingestion ----
 
 class CasUpload(Base):

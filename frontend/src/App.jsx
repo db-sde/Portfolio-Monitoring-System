@@ -148,13 +148,46 @@ export default function App() {
     }).finally(() => setCheckingInitial(false))
   }, [loadConfig])
 
+  // The wipe+ingest itself runs in the background now (a real ~50-scheme
+  // statement is minutes of sequential mfapi.in calls — long enough that
+  // Render's own reverse proxy used to return a 502 before the ingest
+  // even finished, regardless of whether it was correct). uploadCas
+  // returns almost immediately with a job_id; this polls the same way
+  // pollEnrichStatus already does, but as a Promise handleUpload can
+  // await, since — unlike enrichment — the rest of the upload flow
+  // (landing on Dashboard, showing the imported statement) can't start
+  // until ingest has actually finished.
+  const pollUploadStatus = (jobId) => new Promise((resolve, reject) => {
+    // 200 tries * 3s = 10 minutes — generous for a large real statement's
+    // worth of sequential third-party API calls, but not unbounded.
+    const MAX_ATTEMPTS = 200
+    let attempts = 0
+    const tick = () => {
+      api.getUploadStatus(jobId).then((status) => {
+        if (status.status === 'processing') {
+          attempts += 1
+          if (attempts >= MAX_ATTEMPTS) {
+            reject(new Error('This is taking much longer than usual. It may still finish in the background — check back in a few minutes.'))
+            return
+          }
+          setTimeout(tick, 3000)
+        } else if (status.status === 'error') {
+          reject(new Error(status.message || 'Importing this statement failed.'))
+        } else {
+          resolve(status)
+        }
+      }).catch(reject)
+    }
+    tick()
+  })
+
   const handleUpload = async (file, password = '') => {
     setUploading(true)
     setUploadError(null)
     setUploadNotice(null)
     try {
-      const result = await api.uploadCas(file, password)
-      if (result.status === 'duplicate') {
+      const submitted = await api.uploadCas(file, password)
+      if (submitted.status === 'duplicate') {
         // The backend's success shape (investor_name/statement_period) and
         // its duplicate shape (message/upload_id) are different — this used
         // to be read as if it were always the success shape, so a
@@ -173,6 +206,7 @@ export default function App() {
         setUploadNotice("This statement is already loaded — you're looking at its current data.")
         return
       }
+      const result = await pollUploadStatus(submitted.job_id)
       setUploadInfo({ investor_name: result.investor_name, statement_period: result.statement_period })
       setRefreshTick((t) => t + 1)
       pollEnrichStatus()
