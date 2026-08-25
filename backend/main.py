@@ -353,35 +353,53 @@ def _run_ingest_job_sync(job_id: int, content: bytes, parsed) -> None:
     part (parse + duplicate check); this runs after, unconstrained by
     any request timeout, and the frontend polls GET
     /api/upload-status/{job_id} until it's done."""
+    # Everything after a successful ingest — including marking the job
+    # "ok" — is inside this SAME try/except on purpose. A first version
+    # split these into two separate try blocks, and the second one (job
+    # status update + scheme_id lookup) had a bug that raised inside
+    # `with db.get_session() as session:` — db.get_session()'s own
+    # except-and-rollback swallowed that exception's effect on the DB
+    # (the "ok" write never committed) while the bare exception still
+    # propagated out of a BackgroundTasks callable with nowhere to
+    # surface it, so the job sat at "processing" forever despite the
+    # ingest itself having genuinely succeeded (confirmed live: a
+    # re-upload of the same file correctly came back "duplicate",
+    # proving the data really did commit — only the job row's own status
+    # update was silently lost). One try/except around the whole
+    # post-ingest sequence means ANY failure here — expected or not —
+    # reliably lands as job.status="error" with the real exception
+    # message, never a silent stuck-forever "processing".
     try:
         result = _replace_and_ingest_sync(content, parsed)
-    except Exception:
-        logger.exception("Background ingest failed for job_id=%s", job_id)
+        result_json = {
+            "investor_name": parsed.investor_info.name,
+            "statement_period": {"from": str(parsed.statement_period.from_), "to": str(parsed.statement_period.to)},
+            "total_holdings": len(result.holdings),
+            "holdings_needing_review": sum(1 for h in result.holdings if h.status != "reconciled"),
+            "warnings": result.warnings,
+            "holding_notes": [{"scheme_name": h.scheme_name, "status": h.status, "detail": h.detail} for h in result.holdings],
+        }
         with db.get_session() as session:
+            scheme_ids = list({
+                session.get(Holding, h.holding_id).scheme_id for h in result.holdings
+            })
             job = session.get(IngestJob, job_id)
             if job:
-                job.status = "error"
-                job.error_detail = "The statement parsed, but importing it failed. This is a bug — the server log has the details."
+                job.status = "ok"
+                job.result_json = result_json
                 job.completed_at = datetime.now(timezone.utc)
+    except Exception as exc:
+        logger.exception("Background ingest failed for job_id=%s", job_id)
+        try:
+            with db.get_session() as session:
+                job = session.get(IngestJob, job_id)
+                if job:
+                    job.status = "error"
+                    job.error_detail = f"{type(exc).__name__}: {exc}"
+                    job.completed_at = datetime.now(timezone.utc)
+        except Exception:
+            logger.exception("Also failed to record the error status for job_id=%s", job_id)
         return
-
-    result_json = {
-        "investor_name": parsed.investor_info.name,
-        "statement_period": {"from": str(parsed.statement_period.from_), "to": str(parsed.statement_period.to)},
-        "total_holdings": len(result.holdings),
-        "holdings_needing_review": sum(1 for h in result.holdings if h.status != "reconciled"),
-        "warnings": result.warnings,
-        "holding_notes": [{"scheme_name": h.scheme_name, "status": h.status, "detail": h.detail} for h in result.holdings],
-    }
-    with db.get_session() as session:
-        job = session.get(IngestJob, job_id)
-        if job:
-            job.status = "ok"
-            job.result_json = result_json
-            job.completed_at = datetime.now(timezone.utc)
-        scheme_ids = list({
-            session.get(Holding, h.holding_id).scheme_id for h in result.holdings
-        })
 
     # Direct call, not background_tasks.add_task — there's no live
     # request to hang this off anymore by the time this runs (this
