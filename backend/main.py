@@ -452,8 +452,13 @@ async def upload_cas(
         # Older than the threshold: whatever process owned this job is
         # gone (crashed, container restarted mid-ingest) — treat it as
         # abandoned rather than let a dead job block every future
-        # upload forever. Falls through; cleared below like any other
-        # previous job.
+        # upload forever. Deleted explicitly, here, rather than by the
+        # generic "clear finished jobs" delete below — that one
+        # deliberately excludes status="processing" rows (see its own
+        # comment for why), so a stale-but-still-"processing" row like
+        # this one needs its own removal or nothing would ever clear it.
+        session.delete(existing_job)
+        session.flush()
 
     if filename.endswith(".json"):
         # A previously-parsed CAS JSON — useful for testing, or if
@@ -535,8 +540,19 @@ async def upload_cas(
     # never going to be reliable regardless of how correct the ingest
     # logic itself is. ingest_jobs tracks only the most recent attempt
     # (this is a single-investor tool — one statement in flight at a
-    # time), so any previous row is cleared before creating this one.
-    session.query(IngestJob).delete()
+    # time), so any previous FINISHED row is cleared before creating
+    # this one — status != "processing" is deliberate, not incidental:
+    # an earlier version deleted unconditionally here, which silently
+    # defeated the whole concurrent-upload lock below. A second request
+    # that raced past the early check above would reach this exact line
+    # and delete the FIRST request's still-running "processing" row
+    # right before inserting its own, so the unique index never even
+    # got a chance to reject anything — both requests "succeeded" with
+    # different job_ids, confirmed live. Excluding "processing" here
+    # means a still-running job is never touched by this cleanup, so if
+    # two requests really do race to this point, the second's INSERT
+    # collides with the first's still-present row and the index catches it.
+    session.query(IngestJob).filter(IngestJob.status != "processing").delete()
     job = IngestJob(status="processing")
     session.add(job)
     try:
