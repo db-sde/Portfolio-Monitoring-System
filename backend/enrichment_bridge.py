@@ -92,7 +92,47 @@ async def refresh_enrichment(session: Session, schemes: list[Scheme], on_stage=N
 
     for i, scheme in enumerate(to_fetch):
         _stage(f"persisting_{i}_of_{len(to_fetch)}_scheme_id_{scheme.scheme_id}")
-        payload = results.get(scheme.amfi_code) if scheme.amfi_code else None
+        if not scheme.amfi_code:
+            # No AMFI code at all (a SCHEME_UNRESOLVED holding — an old/
+            # obscure fund ingestion couldn't confirm an identity for) was
+            # never in `targets` above, so `results` has nothing for it —
+            # this isn't "not fetched yet," it's "can never be fetched."
+            # The real incident this fixes: these schemes got silently
+            # `continue`d past with no EnrichmentCache row at all, so
+            # get_enrich_status's "pending" count could never reach 0 no
+            # matter how long the batch ran — reproduced live, watched a
+            # real portfolio finish 52 of 54 schemes correctly and then
+            # sit at "2 pending" forever. Persisting an explicit
+            # "unavailable" row here — the same status a genuine fetch
+            # failure gets — makes them count as attempted (correctly
+            # landing in "failed", not stuck in "pending" forever).
+            try:
+                with session.begin_nested():
+                    existing = session.execute(
+                        select(EnrichmentCache).where(
+                            EnrichmentCache.scheme_id == scheme.scheme_id, EnrichmentCache.provider == PROVIDER_KEY,
+                        )
+                    ).scalar_one_or_none()
+                    payload = {"enrichment_source": "failed", "reason": "no AMFI code resolved for this scheme"}
+                    if existing:
+                        existing.payload = payload
+                        existing.data_as_of = date.today()
+                        existing.fetched_at = datetime.now(timezone.utc)
+                        existing.status = "unavailable"
+                    else:
+                        session.add(EnrichmentCache(
+                            scheme_id=scheme.scheme_id, provider=PROVIDER_KEY, payload=payload,
+                            data_as_of=date.today(), fetched_at=datetime.now(timezone.utc), status="unavailable",
+                        ))
+                session.commit()
+            except Exception:
+                logger.exception(
+                    "refresh_enrichment: failed to persist unavailable status for scheme_id=%s (no amfi_code)",
+                    scheme.scheme_id,
+                )
+                session.rollback()
+            continue
+        payload = results.get(scheme.amfi_code)
         if payload is None:
             continue
         try:
