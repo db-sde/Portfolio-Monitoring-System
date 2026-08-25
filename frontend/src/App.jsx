@@ -27,9 +27,9 @@ const PAGES = {
 }
 
 // Pages that don't use the level/advisor filter bar at all (summary is
-// already grouped by every advisor at once; settings isn't portfolio data;
-// upload is the drop-box screen, not a portfolio view).
-const NO_FILTER_BAR = new Set(['portfolio-summary', 'settings', 'upload'])
+// already grouped by every advisor at once; settings isn't portfolio data).
+// "upload" never reaches this set — it's handled before the shell renders.
+const NO_FILTER_BAR = new Set(['portfolio-summary', 'settings'])
 
 // Sidebar navigation used to be plain useState with no URL involved at
 // all — every page lived at the same "/", so the browser's Back button
@@ -199,11 +199,19 @@ export default function App() {
     return <WelcomeUpload onUpload={handleUpload} uploading={uploading} error={uploadError || initialLoadError} />
   }
 
-  // "upload" isn't in PAGES — it's the drop-box screen (WelcomeUpload),
-  // rendered inline below rather than as a PageComponent so it can still
-  // sit inside the normal sidebar/top-bar shell once data exists (only
-  // the true no-data-yet case above renders it full-screen, standalone).
-  const PageComponent = page === 'upload' ? null : PAGES[page]
+  // "/" is always the bare drop-box screen, full-screen and standalone —
+  // no sidebar, no topbar, no investor name/enrich badge — even once
+  // data exists. It used to sit inside the normal shell in that case
+  // (so the topbar's own already-loaded investor name stayed visible
+  // while replacing), but that read as a stray "preloaded statement"
+  // showing up unexplained the moment the app opened — reported live.
+  // "upload" isn't in PAGES for this reason: it's handled here, before
+  // the shell below, rather than as a PageComponent inside it.
+  if (page === 'upload') {
+    return <WelcomeUpload onUpload={handleUpload} uploading={uploading} error={uploadError} replacing />
+  }
+
+  const PageComponent = PAGES[page]
 
   return (
     <div className="flex min-h-screen">
@@ -241,11 +249,7 @@ export default function App() {
               />
             </div>
           )}
-          {page === 'upload' ? (
-            <WelcomeUpload onUpload={handleUpload} uploading={uploading} error={uploadError} replacing />
-          ) : (
-            <PageComponent filters={filters} setFilters={setFilters} config={config} refreshTick={refreshTick} onConfigSaved={loadConfig} />
-          )}
+          <PageComponent filters={filters} setFilters={setFilters} config={config} refreshTick={refreshTick} onConfigSaved={loadConfig} />
         </main>
       </div>
     </div>
