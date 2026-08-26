@@ -35,6 +35,13 @@ from models import Scheme, SchemeAlias
 MFAPI_BASE = "https://api.mfapi.in/mf"
 STALE_NAV_DAYS = 10
 MAX_ALTERNATE_CANDIDATES = 10
+# enrichment.py's own ENRICH_CONCURRENCY_LIMIT fix has the full story: an
+# unbounded asyncio.gather across every scheme in one portfolio (up to
+# 54, live) overwhelms mfapi.in enough that a meaningful fraction of a
+# large batch fails outright, retries included — this is the same
+# pattern applied here, at the same limit, for prefetch_mfapi_schemes'
+# own whole-portfolio gather.
+PREFETCH_CONCURRENCY_LIMIT = 8
 
 
 @dataclass
@@ -120,7 +127,13 @@ async def prefetch_mfapi_schemes(client: httpx.AsyncClient, amfi_codes: list[str
     codes = [c for c in dict.fromkeys(amfi_codes) if c]  # de-dup, preserve order, drop falsy
     if not codes:
         return {}
-    results = await asyncio.gather(*[_fetch_mfapi_scheme(client, code) for code in codes])
+    semaphore = asyncio.Semaphore(PREFETCH_CONCURRENCY_LIMIT)
+
+    async def _fetch_bounded(code: str) -> Optional[dict]:
+        async with semaphore:
+            return await _fetch_mfapi_scheme(client, code)
+
+    results = await asyncio.gather(*[_fetch_bounded(code) for code in codes])
     return dict(zip(codes, results))
 
 

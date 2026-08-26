@@ -89,6 +89,20 @@ REQUEST_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 # for good — if mfdata.in ever comes back, a quick successful response
 # is still well within 3s.
 MFDATA_TIMEOUT = httpx.Timeout(3.0, connect=2.0)
+# _fetch_json_retrying's own docstring already documented this exact
+# failure mode (mfapi.in/captnemo "intermittently fail... when hit
+# concurrently for several schemes at once") but only mitigated it with
+# retries, not a concurrency limit — reproduced live on a real 54-scheme
+# batch: 22 completely ordinary, well-known funds (HDFC Large Cap,
+# Aditya Birla Sun Life Flexi Cap, ...) failed BOTH mfapi.in and
+# captnemo simultaneously in the same run, while a same-day retry of
+# just 2-3 schemes succeeded cleanly every time. Firing all N schemes'
+# requests via one unbounded asyncio.gather (up to 3 external hosts
+# each, so 3*N simultaneous outbound connections for a 54-scheme
+# portfolio) is what a 3-retry policy alone can't fix, since retrying
+# into the same overloaded burst just fails again. Capping how many
+# schemes are in flight at once is the actual fix.
+ENRICH_CONCURRENCY_LIMIT = 8
 
 # Risk-free rate for Sharpe/Sortino. 6% reproduces fundlens.lovable.app's
 # displayed Sharpe/Sortino for a real fund (#122639) almost to the second
@@ -736,6 +750,17 @@ async def enrich_schemes(schemes: list[dict]) -> dict[str, dict]:
             # series for every fund, and this way a portfolio with 20
             # holdings costs 1 extra request, not 20.
             benchmark_nav_history = await _get_benchmark_nav_history(client, cache)
+            # A fresh Semaphore per call, not a module-level one: this
+            # runs inside a background task's own short-lived event loop
+            # (asyncio.run() per enrichment run — see main.py), and a
+            # Semaphore created before any loop exists risks binding to
+            # the wrong one.
+            semaphore = asyncio.Semaphore(ENRICH_CONCURRENCY_LIMIT)
+
+            async def _enrich_one_bounded(s: dict) -> dict:
+                async with semaphore:
+                    return await _enrich_one(client, s["amfi"], s.get("isin"), s.get("scheme", ""), benchmark_nav_history)
+
             # return_exceptions=True is load-bearing, not defensive
             # boilerplate: without it, one scheme raising (a real
             # incident — one bad fund in a 14-scheme real-portfolio batch
@@ -744,8 +769,7 @@ async def enrich_schemes(schemes: list[dict]) -> dict[str, dict]:
             # result the moment any single coroutine raises) blows up the
             # whole batch instead of failing just that one scheme.
             fetched = await asyncio.gather(*[
-                _enrich_one(client, s["amfi"], s.get("isin"), s.get("scheme", ""), benchmark_nav_history)
-                for s in to_fetch
+                _enrich_one_bounded(s) for s in to_fetch
             ], return_exceptions=True)
         for scheme, data in zip(to_fetch, fetched):
             amfi = scheme["amfi"]

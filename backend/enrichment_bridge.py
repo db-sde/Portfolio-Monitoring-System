@@ -50,10 +50,22 @@ def _is_fresh(fetched_at: Optional[datetime]) -> bool:
 
 
 def get_cached_enrichment(session: Session, scheme_id: int) -> Optional[dict]:
+    # status == "ok" is the real gate here, not just freshness — this is
+    # what refresh_enrichment (below) calls to decide "do I need to
+    # re-fetch this scheme," and a cached FAILURE inside the same 24h
+    # window used to look just as valid as a cached success, so a
+    # scheme that failed once got silently treated as "already handled"
+    # for a full day. Reproduced live: POST /api/enrich/retry ran
+    # cleanly and reported success, but every one of the 24 schemes it
+    # was meant to retry came straight back out of this cache unchanged
+    # — retry was a complete no-op until the 24h window happened to
+    # expire on its own. main.py's own read of this (Fund Summary,
+    # display-only) isn't affected: an "unavailable" payload's fields
+    # are already all None, identical to getting nothing back here.
     row = session.execute(
         select(EnrichmentCache).where(EnrichmentCache.scheme_id == scheme_id, EnrichmentCache.provider == PROVIDER_KEY)
     ).scalar_one_or_none()
-    if row and _is_fresh(row.fetched_at):
+    if row and row.status == "ok" and _is_fresh(row.fetched_at):
         return row.payload
     return None
 
