@@ -1,7 +1,7 @@
 import { useRef, useState } from 'react'
 import { formatDateTimeIST } from './IndianNumber'
 
-export default function TopBar({ investorName, statementPeriod, lastEnriched, enrichStatus, onUpload, uploading, onMenuClick }) {
+export default function TopBar({ investorName, statementPeriod, lastEnriched, enrichStatus, onUpload, uploading, onMenuClick, onRetryEnrichment, retryingEnrichment }) {
   const fileInput = useRef(null)
   const [pendingFile, setPendingFile] = useState(null)
   const [password, setPassword] = useState('')
@@ -61,6 +61,24 @@ export default function TopBar({ investorName, statementPeriod, lastEnriched, en
               <svg width="12" height="12" viewBox="0 0 24 24" className="animate-spin"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="3" strokeDasharray="42" strokeDashoffset="14" strokeLinecap="round" /></svg>
               Enriching {enrichStatus.total_schemes - enrichStatus.pending}/{enrichStatus.total_schemes}
             </span>
+          )}
+          {enrichStatus && (enrichStatus.failed > 0 || enrichStatus.pending > 0) && onRetryEnrichment && (
+            // A scheme can end up "failed" (attempted, couldn't resolve —
+            // often just a transient blip on mfapi.in/captnemo) or,
+            // rarer but real, "pending" forever with no active job behind
+            // it at all — reproduced live: a perfectly normal, fetchable
+            // fund never got an enrichment_cache row, no exception
+            // logged, no amount of waiting fixed it. Previously the only
+            // recovery was a full re-upload; this re-attempts just the
+            // schemes still missing, in place.
+            <button
+              onClick={onRetryEnrichment}
+              disabled={retryingEnrichment}
+              className="hidden sm:inline-flex items-center gap-1.5 text-xs font-medium text-ink-2 hover:text-ink border border-line rounded-full px-2.5 py-1 disabled:opacity-50 transition-colors"
+              title={`${enrichStatus.failed} couldn't be enriched, ${enrichStatus.pending} still pending — retry them`}
+            >
+              {retryingEnrichment ? 'Retrying…' : `Retry ${enrichStatus.failed + enrichStatus.pending} unresolved`}
+            </button>
           )}
           <input ref={fileInput} type="file" accept="application/pdf,.pdf,.json" className="hidden" onChange={handleFile} />
           <button

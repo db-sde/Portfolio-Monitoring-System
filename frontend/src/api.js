@@ -104,6 +104,9 @@ export const api = {
   getEnrichStatus() {
     return request('/api/enrich/status')
   },
+  retryEnrichment() {
+    return request('/api/enrich/retry', { method: 'POST' })
+  },
   // Full reset (spec 19) — wipes everything a plain new upload leaves
   // alone too: config, groups/investors/ARNs, preferences. Had no UI
   // path at all until now (backend-only, curl/API-client only), found

@@ -300,6 +300,41 @@ def _run_enrichment_task(scheme_ids: list[int], job_id: Optional[int] = None) ->
     asyncio.run(_run_enrichment_task_async(scheme_ids, job_id))
 
 
+def _run_enrich_retry_job_sync(job_id: int, scheme_ids: list[int]) -> None:
+    """Background work behind POST /api/enrich/retry — same job-row
+    lifecycle as _run_ingest_job_sync (status ok/error + completed_at)
+    but skipping the wipe+reingest entirely, since a retry is for the
+    class of bug where the CAS data itself is already correct and only
+    the market-data side (a scheme that silently never got an
+    enrichment_cache row at all — reproduced live, twice, for two
+    different underlying reasons, on two different real schemes, with
+    no exception ever logged) needs another pass. _run_enrichment_task
+    itself never raises — any internal failure lands in its own
+    debug_stage trail instead — so job.status="ok" here means "this
+    retry ran," the same way it does after a normal upload's enrichment
+    step; per-scheme success/failure is still visible via
+    GET /api/enrich/status afterward, not folded into this job's status."""
+    try:
+        _run_enrichment_task(scheme_ids, job_id)
+        with db.get_session() as session:
+            job = session.get(IngestJob, job_id)
+            if job:
+                job.status = "ok"
+                job.result_json = {"retried_scheme_count": len(scheme_ids)}
+                job.completed_at = datetime.now(timezone.utc)
+    except Exception as exc:
+        logger.exception("Background enrichment retry failed for job_id=%s", job_id)
+        try:
+            with db.get_session() as session:
+                job = session.get(IngestJob, job_id)
+                if job:
+                    job.status = "error"
+                    job.error_detail = f"{type(exc).__name__}: {exc}"
+                    job.completed_at = datetime.now(timezone.utc)
+        except Exception:
+            logger.exception("Also failed to record the error status for retry job_id=%s", job_id)
+
+
 def _replace_and_ingest_sync(content: bytes, parsed) -> ingestion.IngestResult:
     """The wipe + full ingest, run entirely off the main event loop in its
     own thread with its own database session — the fix for two real,
@@ -1030,6 +1065,54 @@ def get_enrich_status(session: Session = Depends(get_session)):
         "failed": len(attempted - enriched), "pending": len(held - attempted),
         "last_run": last_run.isoformat() if last_run else None,
     }
+
+
+@app.post("/api/enrich/retry")
+def retry_enrichment(background_tasks: BackgroundTasks, session: Session = Depends(get_session)):
+    """Self-serve recovery for a bug class reproduced live twice: a
+    scheme that's genuinely fetchable (valid AMFI code, real data on
+    mfapi.in, confirmed by hand) simply never gets an enrichment_cache
+    row at all — no exception logged anywhere, not a timeout, nothing
+    that a longer wait would fix. Before this endpoint, the only way to
+    recover was a full re-upload (wipes and reparses the whole
+    statement, unnecessary busywork since the CAS data was never wrong)
+    or a developer running a one-off script directly against the
+    database. This re-attempts only the schemes /api/enrich/status
+    itself reports as not "ok" (pending — no row yet — or failed/
+    unavailable), so it's a targeted top-up, not a full reprocess."""
+    held = set(session.execute(select(Holding.scheme_id).distinct()).scalars().all())
+    cache_rows = session.execute(
+        select(EnrichmentCache.scheme_id, EnrichmentCache.status).where(EnrichmentCache.scheme_id.in_(held))
+    ).all()
+    enriched = {sid for sid, status in cache_rows if status == "ok"}
+    scheme_ids = list(held - enriched)
+    if not scheme_ids:
+        return {"status": "ok", "message": "Everything is already enriched.", "count": 0}
+
+    # Same concurrency guard as upload_cas: a retry dispatches the same
+    # background enrichment work an upload does, so it must never run
+    # concurrently with either an active upload's own enrichment pass or
+    # another retry — both would share/mutate the same DB rows.
+    existing_job = session.execute(select(IngestJob).order_by(IngestJob.job_id.desc()).limit(1)).scalar_one_or_none()
+    if existing_job and existing_job.status == "processing":
+        age = datetime.utcnow() - existing_job.created_at
+        if age < STALE_JOB_THRESHOLD:
+            raise HTTPException(409, "An import or enrichment run is already in progress. Wait for it to finish before retrying.")
+        session.delete(existing_job)
+        session.flush()
+
+    session.query(IngestJob).filter(IngestJob.status != "processing").delete()
+    job = IngestJob(status="processing")
+    session.add(job)
+    try:
+        session.flush()
+        session.commit()
+    except IntegrityError:
+        session.rollback()
+        raise HTTPException(409, "An import or enrichment run is already in progress. Wait for it to finish before retrying.")
+
+    background_tasks.add_task(_run_enrich_retry_job_sync, job.job_id, scheme_ids)
+    return {"status": "processing", "job_id": job.job_id, "count": len(scheme_ids)}
 
 
 # -------------------------------------------------------------- deletion ----

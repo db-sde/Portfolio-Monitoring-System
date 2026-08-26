@@ -121,6 +121,17 @@ export default function App() {
     return () => { cancelled = true }
   }, [])
 
+  const [retrying, setRetrying] = useState(false)
+  const handleRetryEnrichment = useCallback(() => {
+    setRetrying(true)
+    api.retryEnrichment()
+      .then((res) => {
+        if (res.count > 0) pollEnrichStatus()
+      })
+      .catch(() => {})
+      .finally(() => setRetrying(false))
+  }, [pollEnrichStatus])
+
   useEffect(() => {
     loadConfig()
     api.getEnrichStatus().then(setEnrichStatus).catch(() => {})
@@ -259,6 +270,8 @@ export default function App() {
           onUpload={handleUpload}
           uploading={uploading}
           onMenuClick={() => setSidebarOpen(true)}
+          onRetryEnrichment={handleRetryEnrichment}
+          retryingEnrichment={retrying}
         />
         {uploadError && (
           <div className="mx-4 md:mx-6 mt-4 rounded-lg border border-bad/20 bg-bad-tint text-bad text-sm px-4 py-2.5">
