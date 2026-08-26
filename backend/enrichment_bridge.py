@@ -176,7 +176,22 @@ async def refresh_enrichment(session: Session, schemes: list[Scheme], on_stage=N
             # makes every scheme's success durable independently of
             # whether a later one in the same batch loses its connection.
             with session.begin_nested():
-                nav_history = payload.pop("_nav_history", None) or []
+                # payload is looked up from `results` by amfi_code, and two
+                # DIFFERENT schemes can legitimately share one amfi_code —
+                # mfapi.in issues a single code per fund with two ISINs
+                # (isin_growth vs isin_div_reinvestment) for a dividend/IDCW
+                # plan's payout vs reinvestment variants. Both scheme rows
+                # then get the SAME dict object out of `results`. A `.pop()`
+                # here used to mutate that shared dict in place, so whichever
+                # scheme was processed first drained `_nav_history` for
+                # itself and left the second scheme's copy permanently
+                # empty — reproduced live: scheme_id 1520 ended up with all
+                # 5021 NAV points, scheme_id 1524 (same amfi_code 100120)
+                # got zero, so its holding valued at Rs.0 despite showing
+                # enrichment status "ok". `.get()` (never mutating the
+                # shared dict) plus building a separate dict for what gets
+                # persisted keeps every scheme sharing a code independent.
+                nav_history = payload.get("_nav_history") or []
                 if nav_history:
                     points = []
                     for row in nav_history:
@@ -185,6 +200,7 @@ async def refresh_enrichment(session: Session, schemes: list[Scheme], on_stage=N
                             points.append((d, Decimal(str(row["nav"]))))
                     nav_service.store_nav_points(session, scheme.scheme_id, points)
 
+                cache_payload = {k: v for k, v in payload.items() if k != "_nav_history"}
                 existing = session.execute(
                     select(EnrichmentCache).where(
                         EnrichmentCache.scheme_id == scheme.scheme_id, EnrichmentCache.provider == PROVIDER_KEY,
@@ -192,15 +208,15 @@ async def refresh_enrichment(session: Session, schemes: list[Scheme], on_stage=N
                 ).scalar_one_or_none()
                 data_as_of = date.today()
                 if existing:
-                    existing.payload = payload
+                    existing.payload = cache_payload
                     existing.data_as_of = data_as_of
                     existing.fetched_at = datetime.now(timezone.utc)
-                    existing.status = "ok" if payload.get("enrichment_source") != "failed" else "unavailable"
+                    existing.status = "ok" if cache_payload.get("enrichment_source") != "failed" else "unavailable"
                 else:
                     session.add(EnrichmentCache(
-                        scheme_id=scheme.scheme_id, provider=PROVIDER_KEY, payload=payload,
+                        scheme_id=scheme.scheme_id, provider=PROVIDER_KEY, payload=cache_payload,
                         data_as_of=data_as_of, fetched_at=datetime.now(timezone.utc),
-                        status="ok" if payload.get("enrichment_source") != "failed" else "unavailable",
+                        status="ok" if cache_payload.get("enrichment_source") != "failed" else "unavailable",
                     ))
             session.commit()
         except Exception:
@@ -216,6 +232,6 @@ async def refresh_enrichment(session: Session, schemes: list[Scheme], on_stage=N
             # once the session's own error state has been cleared.
             session.rollback()
             continue
-        fresh[scheme.scheme_id] = payload
+        fresh[scheme.scheme_id] = cache_payload
 
     return fresh
