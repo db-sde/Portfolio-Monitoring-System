@@ -705,12 +705,16 @@ async def _enrich_one(
     # is both the single biggest speed win available and the main way
     # to stop provoking the throttling in the first place.
     mfapi_raw = None
+    # Tracks whether `nav_history` is something we just downloaded (and
+    # so the caller still needs to store) versus history it already had.
+    history_is_new = False
     if cached_nav_history and not _is_stale(cached_nav_history[-1]["date"]):
         nav_history = cached_nav_history
         sources_used.append("nav_cache")
     else:
         mfapi_raw = await _fetch_json_retrying(client, f"{MFAPI_BASE}/{amfi_code}")
         nav_history = _extract_mfapi_nav_history(mfapi_raw) if mfapi_raw else []
+        history_is_new = bool(nav_history)
         # Falling back to what we already had beats returning nothing: a
         # throttled fetch shouldn't erase a perfectly good stored history
         # and downgrade this scheme to "unavailable" on the dashboard.
@@ -726,6 +730,10 @@ async def _enrich_one(
         if alt_raw:
             mfapi_raw = alt_raw
             nav_history = _extract_mfapi_nav_history(mfapi_raw)
+            # Recovered from a different AMFI code — genuinely new data
+            # the caller has never stored, so it must be returned even
+            # though a cached (stale) series existed for this scheme.
+            history_is_new = bool(nav_history)
 
     computed_std_dev: Optional[float] = None
     if mfapi_raw:
@@ -795,7 +803,15 @@ async def _enrich_one(
 
     fields["enriched_at"] = datetime.now(timezone.utc).isoformat()
     fields["enrichment_source"] = "+".join(sources_used) if sources_used else "failed"
-    fields["_nav_history"] = nav_history  # not part of the public `enriched` shape; consumed by portfolio.py
+    # Only NEWLY FETCHED history is handed back. Not part of the public
+    # `enriched` shape either way — it exists so the caller can persist
+    # what we just downloaded. When the series came out of the caller's
+    # own cache it is already stored, so returning it would mean shipping
+    # a second full copy of every scheme's history (~100MB across a real
+    # portfolio) back to a caller that would then diff it against the
+    # database and write nothing. Omitting it removes that duplicate
+    # outright, which matters inside a 512MB container.
+    fields["_nav_history"] = nav_history if history_is_new else []
     return fields
 
 
@@ -816,7 +832,21 @@ async def _get_benchmark_nav_history(client: httpx.AsyncClient, cache: dict) -> 
     from the last successful fetch, regardless of its own age, since a
     day-old benchmark series is still far better for beta/alpha than
     none at all (the index barely moves day to day relative to the 3y
-    window these ratios use anyway)."""
+    window these ratios use anyway).
+
+    A still-fresh cached series is now returned WITHOUT refetching, not
+    just used as a failure fallback. Previously every call re-downloaded
+    the full index history unconditionally, which was near-free when
+    enrich_schemes ran once per portfolio — but the caller now processes
+    schemes in batches to bound memory, so "once per call" became once
+    per batch: five ~500KB downloads of an identical series per run, and
+    five more chances to trip the rate limiting this module works hard
+    to avoid. Reusing a fresh copy is consistent with this function's own
+    reasoning above — a day-old benchmark is explicitly fine for a 3-year
+    ratio window — and the fetch still happens the moment it goes stale."""
+    cached = cache.get(BENCHMARK_CACHE_KEY)
+    if cached and _is_fresh(cached) and cached.get("data"):
+        return cached["data"]
     raw = await _fetch_json_retrying(client, f"{MFAPI_BASE}/{BENCHMARK_AMFI_CODE}")
     history = _extract_mfapi_nav_history(raw) if raw else []
     if history:
