@@ -55,7 +55,7 @@ export default function WelcomeUpload({ onUpload, uploading, error, replacing = 
             <p className="text-ink-2 text-[15px] leading-relaxed mb-8 max-w-md mx-auto">
               Upload your CAS statement and its password. PortfolioIQ parses it, enriches every
               fund with live market data, and gives you XIRR, returns, risk and advisor-by-advisor
-              comparisons — kept on your own backend so you can come back to it anytime.
+              comparisons — for as long as you're here. Come back later and you'll parse it fresh.
             </p>
           </>
         )}
@@ -150,7 +150,12 @@ export default function WelcomeUpload({ onUpload, uploading, error, replacing = 
           <span className="inline-flex items-center gap-1.5"><Check /> Parsed on your own backend</span>
           <span className="inline-flex items-center gap-1.5"><Check /> Enriched with live fund data</span>
           <span className="inline-flex items-center gap-1.5">
-            <Check /> {replacing ? 'Replaces your current statement' : 'Stays put until you upload again'}
+            {/* "Stays put until you upload again" was true when the app
+                restored your last parse on load. It no longer does —
+                every fresh visit starts at this screen — so promising
+                persistence here would be the UI describing behaviour
+                the app doesn't have. */}
+            <Check /> {replacing ? 'Replaces your current statement' : 'Yours for this visit'}
           </span>
         </div>
       </div>

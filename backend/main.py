@@ -591,10 +591,22 @@ async def upload_cas(
     file_hash = hashlib.sha256(content).hexdigest()
     existing_upload = session.execute(select(CasUpload).where(CasUpload.file_hash == file_hash)).scalar_one_or_none()
     if existing_upload:
+        # Carries investor_name/statement_period exactly like the success
+        # response below. The app no longer restores a previous parse on
+        # page load (a returning visitor always starts at the parse
+        # screen), so "duplicate" is now a perfectly ordinary outcome:
+        # someone comes back and parses the same statement again. Without
+        # these fields the client had nothing to render and left them
+        # stranded on the upload screen being told their statement was
+        # already loaded while showing none of it. Both values come from
+        # the file just parsed, not from the stored row, so they describe
+        # what the user actually submitted.
         return {
             "status": "duplicate",
             "message": "This exact statement has already been imported.",
             "upload_id": existing_upload.upload_id,
+            "investor_name": parsed.investor_info.name,
+            "statement_period": {"from": parsed.statement_period.from_, "to": parsed.statement_period.to},
         }
 
     # The wipe+ingest itself now runs entirely in the background (see

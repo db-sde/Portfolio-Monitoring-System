@@ -54,6 +54,44 @@ function pathFromPage(page) {
   return page === 'upload' ? '/' : `/${page}`
 }
 
+// "Has a statement been parsed in THIS browser session?" — the flag that
+// separates "reloaded the page mid-use" (keep showing it) from "came
+// back later" (offer to parse again). sessionStorage, not localStorage,
+// precisely because it dies with the tab.
+//
+// Every access is guarded: sessionStorage doesn't merely return null
+// when unavailable, it THROWS on access in a browser set to block site
+// data and in some private-browsing modes. An unguarded read here would
+// take the whole app down on load for those users. Failing closed (as
+// if nothing was parsed) is the right fallback — worst case someone is
+// asked to parse again, which is this flow's normal behaviour anyway.
+const PARSED_THIS_SESSION_KEY = 'portfolioiq.parsedThisSession'
+
+function hasParsedThisSession() {
+  try {
+    return window.sessionStorage.getItem(PARSED_THIS_SESSION_KEY) === '1'
+  } catch {
+    return false
+  }
+}
+
+function markParsedThisSession() {
+  try {
+    window.sessionStorage.setItem(PARSED_THIS_SESSION_KEY, '1')
+  } catch {
+    // Non-fatal: the current render already shows the parsed statement.
+    // Only a later reload would fall back to the parse screen.
+  }
+}
+
+function clearParsedThisSession() {
+  try {
+    window.sessionStorage.removeItem(PARSED_THIS_SESSION_KEY)
+  } catch {
+    /* nothing to clear if storage is unavailable */
+  }
+}
+
 export default function App() {
   const [page, setPage] = useState(() => pageFromPath(window.location.pathname))
   const [config, setConfig] = useState(null)
@@ -134,27 +172,55 @@ export default function App() {
 
   useEffect(() => {
     loadConfig()
+
+    // This app parses a statement per visit; it is not somewhere your
+    // portfolio lives between visits. The database still holds the last
+    // parse (it has to — every page reads from it while you're using
+    // the app), but arriving fresh must never silently restore it.
+    // Previously this fetched the portfolio on mount and, if any data
+    // existed, dropped you straight into someone's dashboard without
+    // your having uploaded anything this visit.
+    //
+    // hasParsedThisSession() is the whole distinction, and sessionStorage
+    // is what makes it exactly right: it survives a refresh and in-app
+    // navigation (so reloading mid-use keeps your statement on screen —
+    // that's a normal thing to do while enrichment is still filling in),
+    // and it is dropped when the tab closes, which is precisely "the
+    // user left". A returning visitor lands on the parse screen and
+    // chooses to parse again.
+    if (!hasParsedThisSession()) {
+      // Cheap liveness check in place of the portfolio fetch: a broken
+      // backend must still be visible on load. A real incident (the
+      // server rejecting everything with 500 "API_KEY is not set")
+      // looked exactly like an empty account, with nothing on screen
+      // saying otherwise — so this failure is surfaced through the same
+      // banner WelcomeUpload renders for a failed upload, rather than
+      // being discovered only by trying to upload. Using /api/config
+      // instead of /api/portfolio also drops a multi-second query from
+      // the load path of a visitor who is about to upload anyway.
+      api.getConfig()
+        .catch((err) => setInitialLoadError(err.message || 'Could not reach the backend.'))
+        .finally(() => setCheckingInitial(false))
+      return
+    }
+
     api.getEnrichStatus().then(setEnrichStatus).catch(() => {})
     api.getPortfolio({ include_zero_value: true }).then((p) => {
-      // Postgres just has empty tables before the first upload — unlike
-      // the old cas_data.json-missing 404, this endpoint always returns
-      // 200. holdings_coverage_through (null until a CAS has actually
-      // been imported) is what distinguishes "nothing uploaded yet" from
-      // "uploaded, but every holding got filtered out."
-      if (!p.holdings_coverage_through) return
+      // holdings_coverage_through is null until a CAS has actually been
+      // imported — the difference between "nothing uploaded" and
+      // "uploaded, but every holding filtered out". If this session
+      // thinks it parsed but the data is gone (wiped from Settings, or
+      // replaced by an upload in another tab), drop the marker so the
+      // next load correctly offers to parse instead of showing nothing.
+      if (!p.holdings_coverage_through) {
+        clearParsedThisSession()
+        return
+      }
       setUploadInfo({
         investor_name: (p.investor_names || []).join(', ') || undefined,
         statement_period: { from: p.holdings_coverage_from, to: p.holdings_coverage_through },
       })
     }).catch((err) => {
-      // A failed request here used to be swallowed identically to "no
-      // data yet" — a real incident (the backend rejecting every
-      // request with 500 "API_KEY is not set") looked exactly like an
-      // empty account, with no indication anything was actually wrong.
-      // Surfaced through the same error banner WelcomeUpload already
-      // renders for a failed upload, so a misconfigured/unreachable
-      // backend is visible on page load, not just discoverable by
-      // trying to upload and having that fail too.
       setInitialLoadError(err.message || 'Could not reach the backend.')
     }).finally(() => setCheckingInitial(false))
   }, [loadConfig])
@@ -199,25 +265,29 @@ export default function App() {
     try {
       const submitted = await api.uploadCas(file, password)
       if (submitted.status === 'duplicate') {
-        // The backend's success shape (investor_name/statement_period) and
-        // its duplicate shape (message/upload_id) are different — this used
-        // to be read as if it were always the success shape, so a
-        // duplicate's undefined investor_name/statement_period got set
-        // silently and nothing on screen indicated the upload had actually
-        // been rejected. A user re-uploading (or uploading a file that
-        // happened to already be in the system) saw no error, no change,
-        // and no explanation — exactly what "I uploaded a different file
-        // and everything stayed the same" describes.
-        //
-        // This isn't a failure, though — the data already on screen *is*
-        // this exact statement, correctly. A red error banner claiming
-        // something went wrong (and implying nothing was ever imported)
-        // is the wrong tone for "you're already looking at this"; a
-        // neutral notice is what's actually true here.
-        setUploadNotice("This statement is already loaded — you're looking at its current data.")
+        // Not a failure, and no longer a dead end. Since a fresh visit
+        // always starts at the parse screen, the ordinary way to come
+        // back to your own statement is to submit it again — which
+        // lands here. The parsed data for this exact file is already in
+        // the database and correct, so the honest outcome is to show
+        // it: same as a successful parse, minus the wait. Previously
+        // this returned without setting uploadInfo, which (once page
+        // load stopped restoring state) left the user stuck on the
+        // upload screen being told their statement was already loaded
+        // while none of it was on screen.
+        setUploadNotice('Already parsed — showing your statement.')
+        markParsedThisSession()
+        setUploadInfo({
+          investor_name: submitted.investor_name,
+          statement_period: submitted.statement_period,
+        })
+        setRefreshTick((t) => t + 1)
+        pollEnrichStatus()
+        if (page === 'upload') navigate('dashboard')
         return
       }
       const result = await pollUploadStatus(submitted.job_id)
+      markParsedThisSession()
       setUploadInfo({ investor_name: result.investor_name, statement_period: result.statement_period })
       setRefreshTick((t) => t + 1)
       pollEnrichStatus()
