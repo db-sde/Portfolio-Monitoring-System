@@ -19,6 +19,7 @@ no duplicate transactions; same result after re-import").
 from __future__ import annotations
 
 import hashlib
+import logging
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
@@ -28,11 +29,15 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+import enrichment
+import nav_service
 from fifo import DISPOSAL_TYPES, LOT_CREATING_TYPES, NON_TAXABLE_REDUCTION_TYPES, LotInput, run_fifo
 from models import (
     CasUpload, DisposalAllocation, Folio, Holding, PurchaseLot, Transaction,
 )
 from scheme_resolution import prefetch_mfapi_schemes, resolve_scheme
+
+logger = logging.getLogger("portfolioiq")
 
 RECONCILIATION_TOLERANCE = Decimal("0.001")  # units; casparser's own Decimal rounding noise floor
 
@@ -66,6 +71,26 @@ def _derive_plan_option(scheme_name: str) -> tuple[str, str]:
 def _asset_class(scheme_type: Optional[str]) -> str:
     t = (scheme_type or "").upper()
     return t if t in ("EQUITY", "DEBT") else "OTHER"
+
+
+def _store_prefetched_nav_history(session: Session, scheme_id: int, raw: dict) -> None:
+    """Persist the NAV series out of an mfapi.in response we already
+    fetched for scheme resolution (see the call site for why). Failure
+    here is deliberately swallowed: this is a pure head start for
+    enrichment, which re-fetches anything missing on its own, so a
+    problem storing it must never be able to fail an otherwise-good
+    CAS import."""
+    try:
+        points = []
+        for row in enrichment._extract_mfapi_nav_history(raw):
+            d = enrichment._parse_nav_date(row["date"])
+            if d is not None:
+                points.append((d, Decimal(str(row["nav"]))))
+        if points:
+            summary = nav_service.get_stored_nav_summary(session, [scheme_id]).get(scheme_id)
+            nav_service.store_nav_points(session, scheme_id, points, stored_summary=summary)
+    except Exception:
+        logger.exception("Could not store prefetched NAV history for scheme_id=%s", scheme_id)
 
 
 def _get_or_create_folio(session: Session, investor_id: Optional[int], folio_number: str, amc: str) -> Folio:
@@ -371,5 +396,21 @@ async def ingest_cas(
                 holding_id=holding.holding_id, scheme_name=scheme.scheme,
                 status=holding.reconciliation_status, detail=detail,
             ))
+
+            # Keep the NAV history that prefetch_mfapi_schemes ALREADY
+            # downloaded for this scheme. Each of those responses carries
+            # the fund's entire NAV series (~5,000 points, ~500KB), but
+            # resolution only ever reads `meta` to confirm an ISIN and
+            # then throws the rest away — so enrichment, minutes later,
+            # re-downloaded the exact same ~27MB across the portfolio.
+            # That doubled both the wall time and, worse, the request
+            # load on a host measured to rate-limit hard under exactly
+            # this traffic (502s, then refused connections, then a ~225s
+            # lockout), which is the root cause of enrichment's
+            # "different schemes fail each run" behaviour. Storing it
+            # here costs nothing extra — we already paid for the bytes.
+            raw = prefetched_mfapi.get(scheme.amfi) if scheme.amfi else None
+            if raw:
+                _store_prefetched_nav_history(session, resolution.scheme.scheme_id, raw)
 
     return result

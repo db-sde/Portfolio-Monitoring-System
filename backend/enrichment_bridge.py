@@ -39,6 +39,11 @@ logger = logging.getLogger("portfolioiq")
 
 CACHE_TTL_HOURS = 24
 PROVIDER_KEY = "mfapi.in+captnemo"
+# How many schemes' cache rows to commit per round trip. Small enough
+# that a failure (and the individual-retry fallback it triggers) stays
+# cheap, large enough to collapse most of the per-scheme commit latency
+# that dominated this module's runtime. See _commit_chunk.
+COMMIT_CHUNK_SIZE = 10
 
 
 def _is_fresh(fetched_at: Optional[datetime]) -> bool:
@@ -70,6 +75,23 @@ def get_cached_enrichment(session: Session, scheme_id: int) -> Optional[dict]:
     return None
 
 
+def get_cached_enrichments(session: Session, scheme_ids: list[int]) -> dict[int, dict]:
+    """get_cached_enrichment for many schemes in one query. Same gate
+    (status "ok" and still fresh); only the round-trip count differs."""
+    if not scheme_ids:
+        return {}
+    rows = session.execute(
+        select(EnrichmentCache).where(
+            EnrichmentCache.scheme_id.in_(scheme_ids), EnrichmentCache.provider == PROVIDER_KEY,
+        )
+    ).scalars()
+    return {
+        row.scheme_id: row.payload
+        for row in rows
+        if row.status == "ok" and _is_fresh(row.fetched_at)
+    }
+
+
 async def refresh_enrichment(session: Session, schemes: list[Scheme], on_stage=None) -> dict[int, dict]:
     """schemes: DB Scheme rows needing enrichment. Returns {scheme_id: payload}.
 
@@ -82,25 +104,129 @@ async def refresh_enrichment(session: Session, schemes: list[Scheme], on_stage=N
         if on_stage:
             on_stage(name)
 
+    # One query for every scheme's cache row, not get_cached_enrichment
+    # per scheme. Profiling the real 53-scheme run put 135 of its ~176
+    # seconds inside psycopg's connection wait, spread over ~545 round
+    # trips at ~250ms each — the cost here is the NUMBER of trips to
+    # Neon, not the data. Loops of individually-cheap single-row queries
+    # are what actually made enrichment slow.
+    scheme_ids = [s.scheme_id for s in schemes]
+    all_rows = {
+        row.scheme_id: row
+        for row in session.execute(
+            select(EnrichmentCache).where(
+                EnrichmentCache.scheme_id.in_(scheme_ids), EnrichmentCache.provider == PROVIDER_KEY,
+            )
+        ).scalars()
+    }
+
     fresh: dict[int, dict] = {}
     to_fetch: list[Scheme] = []
     for scheme in schemes:
-        cached = get_cached_enrichment(session, scheme.scheme_id)
-        if cached is not None:
-            fresh[scheme.scheme_id] = cached
+        row = all_rows.get(scheme.scheme_id)
+        # Same gate as get_cached_enrichment (status must be "ok", not
+        # merely recent) — kept identical deliberately, since a cached
+        # FAILURE counting as "already handled" is exactly the bug that
+        # made the retry endpoint a silent no-op.
+        if row is not None and row.status == "ok" and _is_fresh(row.fetched_at):
+            fresh[scheme.scheme_id] = row.payload
         else:
             to_fetch.append(scheme)
 
     if not to_fetch:
         return fresh
 
-    targets = [
-        {"amfi": s.amfi_code, "isin": s.isin, "scheme": s.name}
-        for s in to_fetch if s.amfi_code
-    ]
+    # Hand enrichment.py the NAV history we already hold, so a scheme
+    # whose stored series is current skips its mfapi.in fetch entirely
+    # rather than re-downloading ~500KB it already has. Read here rather
+    # than inside enrichment.py deliberately: that module owns no DB
+    # session and shouldn't start — this bridge is the layer that knows
+    # about Postgres, exactly as its docstring describes.
+    fetch_ids = [s.scheme_id for s in to_fetch]
+    stored_summaries = nav_service.get_stored_nav_summary(session, fetch_ids)
+    stored_histories = nav_service.get_nav_histories(session, fetch_ids)
+    targets = []
+    for s in to_fetch:
+        if not s.amfi_code:
+            continue
+        target = {"amfi": s.amfi_code, "isin": s.isin, "scheme": s.name}
+        history = stored_histories.get(s.scheme_id)
+        if history:
+            target["nav_history"] = history
+        targets.append(target)
     _stage(f"fetching_{len(targets)}_schemes")
     results = await enrichment.enrich_schemes(targets)  # {amfi_code: payload}
     _stage(f"fetched_{len(results)}_results_persisting")
+
+    # Reuse the rows already loaded above rather than re-querying them
+    # per scheme in the persist loop. Safe to hold these ORM objects
+    # across the loop's per-scheme commits because the session is
+    # configured expire_on_commit=False (see db.py), so a commit doesn't
+    # invalidate them.
+    existing_rows = all_rows
+
+    def _write_row(scheme_id: int, cache_payload: dict, status: str) -> None:
+        """Stage one scheme's cache row on the session. No commit — the
+        caller decides when to flush a whole chunk (see _commit_chunk)."""
+        existing = existing_rows.get(scheme_id)
+        if existing is not None:
+            existing.payload = cache_payload
+            existing.data_as_of = date.today()
+            existing.fetched_at = datetime.now(timezone.utc)
+            existing.status = status
+        else:
+            row = EnrichmentCache(
+                scheme_id=scheme_id, provider=PROVIDER_KEY, payload=cache_payload,
+                data_as_of=date.today(), fetched_at=datetime.now(timezone.utc), status=status,
+            )
+            session.add(row)
+            existing_rows[scheme_id] = row
+
+    def _commit_chunk(chunk: list[tuple[int, dict, str]]) -> None:
+        """Commit a batch of staged rows in ONE round trip, falling back
+        to one-at-a-time if that fails.
+
+        Committing per scheme was costing ~1.1s each against Neon (a
+        BEGIN/UPDATE/COMMIT round trip apiece at ~250ms), about 59s of a
+        53-scheme run, purely in latency. Batching alone would be a
+        straight trade of durability for speed — and a batch commit that
+        fails would lose every scheme in it, which is exactly the
+        regression a previous attempt at batching here caused (zero rows
+        written, silently). The fallback is what makes it safe rather
+        than a gamble: if the batch fails, roll back, then re-apply and
+        commit each scheme on its own, so one bad row costs only itself
+        and the rest still persist. Fast in the normal case, no worse
+        than the old behaviour in the bad one.
+
+        Re-reading each row inside the fallback matters: a rollback
+        reverts the in-memory ORM objects too (and expunges newly-added
+        ones), so `existing_rows` can't be trusted afterwards and the
+        retry has to start from what's actually in the database."""
+        if not chunk:
+            return
+        try:
+            session.commit()
+            return
+        except Exception:
+            logger.exception(
+                "refresh_enrichment: batch commit of %d schemes failed — retrying individually", len(chunk),
+            )
+            session.rollback()
+        for scheme_id, cache_payload, status in chunk:
+            try:
+                existing_rows[scheme_id] = session.execute(
+                    select(EnrichmentCache).where(
+                        EnrichmentCache.scheme_id == scheme_id, EnrichmentCache.provider == PROVIDER_KEY,
+                    )
+                ).scalar_one_or_none()
+                _write_row(scheme_id, cache_payload, status)
+                session.commit()
+            except Exception:
+                logger.exception("refresh_enrichment: failed to persist scheme_id=%s", scheme_id)
+                session.rollback()
+
+    # Staged rows not yet committed, flushed every COMMIT_CHUNK_SIZE.
+    pending: list[tuple[int, dict, str]] = []
 
     def _persist_unavailable(scheme: Scheme, reason: str) -> None:
         # Shared by every "this scheme has no usable payload" case below —
@@ -118,31 +244,9 @@ async def refresh_enrichment(session: Session, schemes: list[Scheme], on_stage=N
         # within a ~50-scheme concurrent batch, which is exactly the kind
         # of transient blip mfapi.in/captnemo are documented elsewhere in
         # this codebase to produce under concurrent load.
-        try:
-            with session.begin_nested():
-                existing = session.execute(
-                    select(EnrichmentCache).where(
-                        EnrichmentCache.scheme_id == scheme.scheme_id, EnrichmentCache.provider == PROVIDER_KEY,
-                    )
-                ).scalar_one_or_none()
-                payload = {"enrichment_source": "failed", "reason": reason}
-                if existing:
-                    existing.payload = payload
-                    existing.data_as_of = date.today()
-                    existing.fetched_at = datetime.now(timezone.utc)
-                    existing.status = "unavailable"
-                else:
-                    session.add(EnrichmentCache(
-                        scheme_id=scheme.scheme_id, provider=PROVIDER_KEY, payload=payload,
-                        data_as_of=date.today(), fetched_at=datetime.now(timezone.utc), status="unavailable",
-                    ))
-            session.commit()
-        except Exception:
-            logger.exception(
-                "refresh_enrichment: failed to persist unavailable status for scheme_id=%s (%s)",
-                scheme.scheme_id, reason,
-            )
-            session.rollback()
+        payload = {"enrichment_source": "failed", "reason": reason}
+        _write_row(scheme.scheme_id, payload, "unavailable")
+        pending.append((scheme.scheme_id, payload, "unavailable"))
 
     for i, scheme in enumerate(to_fetch):
         _stage(f"persisting_{i}_of_{len(to_fetch)}_scheme_id_{scheme.scheme_id}")
@@ -167,73 +271,52 @@ async def refresh_enrichment(session: Session, schemes: list[Scheme], on_stage=N
             _persist_unavailable(scheme, "fetch returned no data for this scheme")
             continue
         try:
-            # A SAVEPOINT (begin_nested), not the bare session: this loop
-            # shares one session/transaction across every scheme in the
-            # batch, and a plain session.rollback() on a mid-loop failure
-            # would undo every earlier scheme's already-flushed writes
-            # too, not just this one's — a real bug caught before it
-            # shipped. begin_nested() scopes the rollback to just this
-            # scheme's own SAVEPOINT on exception, leaving prior schemes'
-            # flushed work in the (still-open) outer transaction intact —
-            # but that alone only protects against a *data* problem in
-            # one scheme's payload. A *connection*-level failure (a real
-            # Neon timeout, caught live: writing one scheme's several-
-            # thousand-row NAV history took long enough to hit "SSL
-            # SYSCALL error: Operation timed out") breaks the whole
-            # session, and everything still sitting uncommitted — every
-            # earlier scheme in this same loop, even ones that finished
-            # cleanly — would be lost when the loop's single trailing
-            # flush/the caller's eventual commit fails too. Committing
-            # per scheme, right after each one's SAVEPOINT releases,
-            # makes every scheme's success durable independently of
-            # whether a later one in the same batch loses its connection.
-            with session.begin_nested():
-                # payload is looked up from `results` by amfi_code, and two
-                # DIFFERENT schemes can legitimately share one amfi_code —
-                # mfapi.in issues a single code per fund with two ISINs
-                # (isin_growth vs isin_div_reinvestment) for a dividend/IDCW
-                # plan's payout vs reinvestment variants. Both scheme rows
-                # then get the SAME dict object out of `results`. A `.pop()`
-                # here used to mutate that shared dict in place, so whichever
-                # scheme was processed first drained `_nav_history` for
-                # itself and left the second scheme's copy permanently
-                # empty — reproduced live: scheme_id 1520 ended up with all
-                # 5021 NAV points, scheme_id 1524 (same amfi_code 100120)
-                # got zero, so its holding valued at Rs.0 despite showing
-                # enrichment status "ok". `.get()` (never mutating the
-                # shared dict) plus building a separate dict for what gets
-                # persisted keeps every scheme sharing a code independent.
-                nav_history = payload.get("_nav_history") or []
-                if nav_history:
-                    points = []
-                    for row in nav_history:
-                        d = enrichment._parse_nav_date(row["date"])
-                        if d is not None:
-                            points.append((d, Decimal(str(row["nav"]))))
-                    nav_service.store_nav_points(session, scheme.scheme_id, points)
+            # No SAVEPOINT here any more, deliberately. One was added
+            # back when this loop shared a single transaction across
+            # every scheme, to stop one scheme's rollback discarding
+            # earlier schemes' uncommitted work. _commit_chunk's
+            # individual-retry fallback now covers that case directly,
+            # and a SAVEPOINT plus its RELEASE cost two extra round
+            # trips per scheme (~250ms each against Neon, roughly 26s
+            # across a 53-scheme portfolio) to defend against it.
+            #
+            # payload is looked up from `results` by amfi_code, and two
+            # DIFFERENT schemes can legitimately share one amfi_code —
+            # mfapi.in issues a single code per fund with two ISINs
+            # (isin_growth vs isin_div_reinvestment) for a dividend/IDCW
+            # plan's payout vs reinvestment variants. Both scheme rows
+            # then get the SAME dict object out of `results`. A `.pop()`
+            # here used to mutate that shared dict in place, so whichever
+            # scheme was processed first drained `_nav_history` for
+            # itself and left the second scheme's copy permanently
+            # empty — reproduced live: scheme_id 1520 ended up with all
+            # 5021 NAV points, scheme_id 1524 (same amfi_code 100120)
+            # got zero, so its holding valued at Rs.0 despite showing
+            # enrichment status "ok". `.get()` (never mutating the
+            # shared dict) plus building a separate dict for what gets
+            # persisted keeps every scheme sharing a code independent.
+            nav_history = payload.get("_nav_history") or []
+            if nav_history:
+                points = []
+                for row in nav_history:
+                    d = enrichment._parse_nav_date(row["date"])
+                    if d is not None:
+                        points.append((d, Decimal(str(row["nav"]))))
+                # stored_summary turns this from "rewrite the whole
+                # history" into "append whatever's actually new" —
+                # see store_nav_points. Usually nothing on a re-run.
+                nav_service.store_nav_points(
+                    session, scheme.scheme_id, points,
+                    stored_summary=stored_summaries.get(scheme.scheme_id),
+                )
 
-                cache_payload = {k: v for k, v in payload.items() if k != "_nav_history"}
-                existing = session.execute(
-                    select(EnrichmentCache).where(
-                        EnrichmentCache.scheme_id == scheme.scheme_id, EnrichmentCache.provider == PROVIDER_KEY,
-                    )
-                ).scalar_one_or_none()
-                data_as_of = date.today()
-                if existing:
-                    existing.payload = cache_payload
-                    existing.data_as_of = data_as_of
-                    existing.fetched_at = datetime.now(timezone.utc)
-                    existing.status = "ok" if cache_payload.get("enrichment_source") != "failed" else "unavailable"
-                else:
-                    session.add(EnrichmentCache(
-                        scheme_id=scheme.scheme_id, provider=PROVIDER_KEY, payload=cache_payload,
-                        data_as_of=data_as_of, fetched_at=datetime.now(timezone.utc),
-                        status="ok" if cache_payload.get("enrichment_source") != "failed" else "unavailable",
-                    ))
-            session.commit()
+            cache_payload = {k: v for k, v in payload.items() if k != "_nav_history"}
+            status = "ok" if cache_payload.get("enrichment_source") != "failed" else "unavailable"
+            _write_row(scheme.scheme_id, cache_payload, status)
+            pending.append((scheme.scheme_id, cache_payload, status))
         except Exception:
             logger.exception(
-                "refresh_enrichment: failed to persist scheme_id=%s amfi=%s",
+                "refresh_enrichment: failed to stage scheme_id=%s amfi=%s",
                 scheme.scheme_id, scheme.amfi_code,
             )
             # rollback (not just letting the exception propagate) is what
@@ -241,9 +324,18 @@ async def refresh_enrichment(session: Session, schemes: list[Scheme], on_stage=N
             # session — SQLAlchemy invalidates a connection that died
             # mid-query and transparently gets a fresh one from the pool
             # (pool_pre_ping=True) on the session's next use, but only
-            # once the session's own error state has been cleared.
+            # once the session's own error state has been cleared. Any
+            # rows staged alongside this one are reverted by that
+            # rollback too, so they're dropped from `pending` rather than
+            # left there claiming to be written.
             session.rollback()
+            pending.clear()
             continue
         fresh[scheme.scheme_id] = cache_payload
 
+        if len(pending) >= COMMIT_CHUNK_SIZE:
+            _commit_chunk(pending)
+            pending = []
+
+    _commit_chunk(pending)
     return fresh

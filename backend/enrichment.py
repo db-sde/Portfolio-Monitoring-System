@@ -66,6 +66,7 @@ import asyncio
 import json
 import logging
 import os
+import random
 import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
@@ -89,6 +90,18 @@ REQUEST_TIMEOUT = httpx.Timeout(10.0, connect=5.0)
 # for good — if mfdata.in ever comes back, a quick successful response
 # is still well within 3s.
 MFDATA_TIMEOUT = httpx.Timeout(3.0, connect=2.0)
+# ...and now not called at all by default. Re-confirmed live from this
+# machine, three different scheme codes, every one of them failing to
+# connect at all (not a 4xx/5xx — no TCP connection established, the
+# full timeout burned each time). It has never once returned data in
+# this app's history. Left behind an env flag rather than deleted
+# outright: the extraction/merge code for it is written and correct, so
+# if the host ever comes back this is a one-variable change rather than
+# a rewrite — but it should not cost every scheme on every run a
+# multi-second wait for a host confirmed dead. That wait was pure,
+# unconditional latency on the critical path of the slowest operation
+# in the app.
+MFDATA_ENABLED = os.environ.get("MFDATA_ENABLED", "").lower() in ("1", "true", "yes")
 # _fetch_json_retrying's own docstring already documented this exact
 # failure mode (mfapi.in/captnemo "intermittently fail... when hit
 # concurrently for several schemes at once") but only mitigated it with
@@ -202,40 +215,92 @@ def _is_fresh(entry: dict) -> bool:
 
 # ------------------------------------------------------------ fetchers ----
 
+async def _fetch_json_result(
+    client: httpx.AsyncClient, url: str, timeout: httpx.Timeout = REQUEST_TIMEOUT, **kwargs
+) -> tuple[Optional[Any], bool, float]:
+    """Returns (data, retryable, retry_after_seconds).
+
+    Classifying the failure matters — a bare "returned None" conflates
+    three completely different situations that need opposite handling,
+    and treating them identically is what made this module's failures
+    look random. Measured directly against mfapi.in: under sustained
+    load it degrades 200 -> 502 -> refusing TCP connections outright,
+    then stays blocked for ~225 SECONDS before recovering. A 404 (this
+    scheme code genuinely doesn't exist there) must NOT be retried at
+    all; a 429/5xx must be retried, but only after backing off long
+    enough to be worth it. The old code retried both identically, 3
+    times, 1 second apart — which for a rate-limited host is just three
+    more requests into the wall that blocked us."""
+    try:
+        resp = await client.get(url, timeout=timeout, **kwargs)
+        if resp.status_code == 200:
+            return resp.json(), False, 0.0
+        # Retry-After is the server telling us exactly how long to wait —
+        # honouring it is strictly better than any backoff we'd guess.
+        retry_after = 0.0
+        raw_retry_after = resp.headers.get("retry-after")
+        if raw_retry_after:
+            try:
+                retry_after = float(raw_retry_after)
+            except ValueError:
+                retry_after = 0.0
+        retryable = resp.status_code == 429 or resp.status_code >= 500
+        return None, retryable, retry_after
+    except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError):
+        # Transport-level failure — a timeout or a refused/dropped
+        # connection is exactly what this host does when it's throttling
+        # us, so it's retryable rather than a verdict about the URL.
+        return None, True, 0.0
+    except (httpx.HTTPError, ValueError):
+        # Anything else (including a 200 whose body isn't valid JSON):
+        # not obviously transient, don't hammer it.
+        return None, False, 0.0
+
+
 async def _fetch_json(
     client: httpx.AsyncClient, url: str, timeout: httpx.Timeout = REQUEST_TIMEOUT, **kwargs
 ) -> Optional[Any]:
-    try:
-        resp = await client.get(url, timeout=timeout, **kwargs)
-        if resp.status_code != 200:
-            return None
-        return resp.json()
-    except (httpx.HTTPError, ValueError):
-        return None
+    data, _retryable, _retry_after = await _fetch_json_result(client, url, timeout=timeout, **kwargs)
+    return data
 
 
 FETCH_RETRY_ATTEMPTS = 3
-FETCH_RETRY_DELAY_SECONDS = 1.0
+FETCH_RETRY_BASE_DELAY_SECONDS = 1.0
+FETCH_RETRY_MAX_DELAY_SECONDS = 8.0
 
 
 async def _fetch_json_retrying(client: httpx.AsyncClient, url: str, **kwargs) -> Optional[Any]:
-    """Like _fetch_json, but retries a few times on failure. For mfapi.in
-    and captnemo specifically — both confirmed reachable in general, but
-    observed live to intermittently fail or return partial data when hit
-    concurrently for several schemes at once (a portfolio's whole
-    enrichment batch fires every scheme's requests via asyncio.gather).
+    """Like _fetch_json, but retries transient failures with exponential
+    backoff and jitter. For mfapi.in and captnemo specifically — both
+    confirmed reachable in general, but measured live to rate-limit hard
+    under a whole portfolio's worth of concurrent requests (see
+    _fetch_json_result: 502s, then refused connections, then a ~225s
+    lockout).
+
+    Both halves of "exponential + jitter" are load-bearing here, for
+    different reasons. Exponential: a fixed 1s delay is far too short
+    for a host that stays angry for minutes, so all three attempts
+    burned inside the same failure window and the call failed anyway.
+    Jitter: without it, N schemes that failed together in the same
+    concurrent batch all sleep the same 1s and then retry at the same
+    instant — the retry burst is as synchronised as the burst that
+    caused the throttling, which is what turns one transient blip into
+    a batch-wide failure. Randomising each waiter's delay spreads them.
+
     Deliberately NOT used for the mfdata.in probe in _enrich_one: that
-    host is confirmed permanently down (Cloudflare 522, see module
-    docstring), so retrying it would just add latency to every single
-    scheme for a call that's never going to succeed."""
-    result = None
+    host is confirmed permanently down (see module docstring), so
+    retrying it would just add latency for a call that never succeeds."""
     for attempt in range(FETCH_RETRY_ATTEMPTS):
-        result = await _fetch_json(client, url, **kwargs)
-        if result is not None:
-            return result
-        if attempt < FETCH_RETRY_ATTEMPTS - 1:
-            await asyncio.sleep(FETCH_RETRY_DELAY_SECONDS)
-    return result
+        data, retryable, retry_after = await _fetch_json_result(client, url, **kwargs)
+        if data is not None:
+            return data
+        if not retryable or attempt == FETCH_RETRY_ATTEMPTS - 1:
+            return None
+        delay = retry_after or min(
+            FETCH_RETRY_BASE_DELAY_SECONDS * (2 ** attempt), FETCH_RETRY_MAX_DELAY_SECONDS
+        )
+        await asyncio.sleep(delay * (0.5 + random.random()))
+    return None
 
 
 def _num(value: Any) -> Optional[float]:
@@ -612,19 +677,46 @@ def _compute_risk_ratios(
 async def _enrich_one(
     client: httpx.AsyncClient, amfi_code: str, isin: Optional[str], scheme_name: str,
     benchmark_nav_history: Optional[list[dict]] = None,
+    cached_nav_history: Optional[list[dict]] = None,
 ) -> dict:
+    """cached_nav_history: this scheme's NAV history already held in our
+    own database, oldest-first, same shape _extract_mfapi_nav_history
+    produces. When it's present and current, the whole mfapi.in history
+    fetch is skipped — see the comment at the fetch below."""
     sources_used = []
 
-    mfdata_raw = await _fetch_json(client, f"{MFDATA_BASE}/schemes/{amfi_code}", timeout=MFDATA_TIMEOUT)
     fields = dict(ENRICHED_FIELD_DEFAULTS)
     fields["returns"] = dict(ENRICHED_FIELD_DEFAULTS["returns"])
     fields["risk"] = dict(ENRICHED_FIELD_DEFAULTS["risk"])
-    if mfdata_raw:
-        fields.update(_extract_mfdata_fields(mfdata_raw))
-        sources_used.append("mfdata.in")
+    if MFDATA_ENABLED:
+        mfdata_raw = await _fetch_json(client, f"{MFDATA_BASE}/schemes/{amfi_code}", timeout=MFDATA_TIMEOUT)
+        if mfdata_raw:
+            fields.update(_extract_mfdata_fields(mfdata_raw))
+            sources_used.append("mfdata.in")
 
-    mfapi_raw = await _fetch_json_retrying(client, f"{MFAPI_BASE}/{amfi_code}")
-    nav_history = _extract_mfapi_nav_history(mfapi_raw) if mfapi_raw else []
+    # A scheme's NAV history is append-only: past NAVs never change, so
+    # history we already have in nav_cache is permanently valid and only
+    # ever needs new points added to the end. When ours is already
+    # current, re-downloading the whole thing (a ~500KB response, 5000+
+    # points, per scheme) buys literally nothing — and doing it for
+    # every scheme in a portfolio is precisely the traffic that gets
+    # this app rate-limited, which is the real cause of enrichment's
+    # "worked last time, failed this time" behaviour. Skipping it here
+    # is both the single biggest speed win available and the main way
+    # to stop provoking the throttling in the first place.
+    mfapi_raw = None
+    if cached_nav_history and not _is_stale(cached_nav_history[-1]["date"]):
+        nav_history = cached_nav_history
+        sources_used.append("nav_cache")
+    else:
+        mfapi_raw = await _fetch_json_retrying(client, f"{MFAPI_BASE}/{amfi_code}")
+        nav_history = _extract_mfapi_nav_history(mfapi_raw) if mfapi_raw else []
+        # Falling back to what we already had beats returning nothing: a
+        # throttled fetch shouldn't erase a perfectly good stored history
+        # and downgrade this scheme to "unavailable" on the dashboard.
+        if not nav_history and cached_nav_history:
+            nav_history = cached_nav_history
+            sources_used.append("nav_cache")
     if not nav_history or _is_stale(nav_history[-1]["date"]):
         # The AMFI code the CAS statement embeds has stopped publishing
         # NAVs — almost always an old code an AMC merger/rename retired
@@ -641,6 +733,17 @@ async def _enrich_one(
         if not fields.get("category"):
             fields["category"] = meta.get("scheme_category")
         sources_used.append("mfapi.in")
+    # Gated on nav_history, NOT on mfapi_raw: everything below derives
+    # purely from the NAV series, and it's identical data whether it
+    # arrived from a fresh fetch or straight out of nav_cache. Keying it
+    # to the raw response (as it was, when a response was the only way
+    # to have a series at all) would mean every cache hit silently
+    # skipped every returns/risk computation and reported a scheme with
+    # a full history as having no data — the exact class of silent,
+    # shape-dependent blanking this module has been bitten by before.
+    # Only the `meta` category lookup above genuinely needs the raw
+    # response, so only that stays behind the mfapi_raw check.
+    if nav_history:
         # Stored as ISO regardless of mfapi.in's own DD-MM-YYYY format —
         # every consumer (frontend date parsing, JSON) can rely on one
         # unambiguous shape rather than re-detecting it downstream.
@@ -727,9 +830,16 @@ async def _get_benchmark_nav_history(client: httpx.AsyncClient, cache: dict) -> 
 
 
 async def enrich_schemes(schemes: list[dict]) -> dict[str, dict]:
-    """schemes: list of {"amfi": str, "isin": str, "scheme": str}. Returns
-    {amfi_code: enriched_fields_dict}, using the on-disk cache wherever
-    it's still fresh, and updating it with anything newly fetched."""
+    """schemes: list of {"amfi": str, "isin": str, "scheme": str,
+    "nav_history": Optional[list[dict]]}. Returns {amfi_code:
+    enriched_fields_dict}, using the on-disk cache wherever it's still
+    fresh, and updating it with anything newly fetched.
+
+    "nav_history" is optional and purely a performance path: this scheme's
+    NAV series as already stored in the caller's database. Supplying it
+    lets a scheme whose history is already current skip its mfapi.in
+    fetch entirely (see _enrich_one) — correctness is identical either
+    way, since it's the same append-only series from the same source."""
     cache = _load_cache()
     results: dict[str, dict] = {}
     to_fetch = []
@@ -759,7 +869,10 @@ async def enrich_schemes(schemes: list[dict]) -> dict[str, dict]:
 
             async def _enrich_one_bounded(s: dict) -> dict:
                 async with semaphore:
-                    return await _enrich_one(client, s["amfi"], s.get("isin"), s.get("scheme", ""), benchmark_nav_history)
+                    return await _enrich_one(
+                        client, s["amfi"], s.get("isin"), s.get("scheme", ""), benchmark_nav_history,
+                        cached_nav_history=s.get("nav_history"),
+                    )
 
             # return_exceptions=True is load-bearing, not defensive
             # boilerplate: without it, one scheme raising (a real

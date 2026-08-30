@@ -86,15 +86,85 @@ def _txn_cash_flow(txn: Transaction) -> Optional[Decimal]:
     return None
 
 
-def compute_holding_metrics(session: Session, holding_id: int, valuation_date: date) -> HoldingMetrics:
-    holding = session.get(Holding, holding_id)
-    folio = session.get(Folio, holding.folio_id)
-    scheme = session.get(Scheme, holding.scheme_id)
-    flags: list[DataQualityFlag] = []
+@dataclass
+class PortfolioContext:
+    """Everything compute_holding_metrics needs for a whole set of
+    holdings, loaded in a fixed handful of queries instead of six per
+    holding.
 
-    lots = list(session.execute(
-        select(PurchaseLot).where(PurchaseLot.holding_id == holding_id, PurchaseLot.remaining_units > 0)
-    ).scalars())
+    Why this exists: computing one page of holdings issued ~6 round
+    trips each (holding, folio, scheme, lots, NAV, transactions), and
+    profiling a real 65-holding portfolio put 106 of its 107 seconds
+    inside psycopg's connection wait across 383 of them — pure network
+    latency to Neon at ~277ms a trip, with essentially no computation
+    behind it. The per-holding functions were each individually cheap
+    and obviously correct, which is exactly why this stayed invisible:
+    nothing is slow until you count the round trips.
+    """
+    holdings: dict[int, Holding]
+    folios: dict[int, Folio]
+    schemes: dict[int, Scheme]
+    lots: dict[int, list[PurchaseLot]]
+    navs: dict[int, nav_service.NavPoint]
+    transactions: dict[int, list[Transaction]]
+
+
+def build_context(session: Session, holding_ids: list[int], valuation_date: date) -> PortfolioContext:
+    """Six batched queries for any number of holdings. Transactions are
+    included because the XIRR path needs them; they're grouped by
+    holding here so that path stays a dict lookup."""
+    if not holding_ids:
+        return PortfolioContext({}, {}, {}, {}, {}, {})
+
+    holdings = {
+        h.holding_id: h
+        for h in session.execute(select(Holding).where(Holding.holding_id.in_(holding_ids))).scalars()
+    }
+    folio_ids = {h.folio_id for h in holdings.values()}
+    scheme_ids = {h.scheme_id for h in holdings.values()}
+    folios = {
+        f.folio_id: f for f in session.execute(select(Folio).where(Folio.folio_id.in_(folio_ids))).scalars()
+    }
+    schemes = {
+        s.scheme_id: s for s in session.execute(select(Scheme).where(Scheme.scheme_id.in_(scheme_ids))).scalars()
+    }
+
+    lots: dict[int, list[PurchaseLot]] = {}
+    for lot in session.execute(
+        select(PurchaseLot).where(PurchaseLot.holding_id.in_(holding_ids), PurchaseLot.remaining_units > 0)
+    ).scalars():
+        lots.setdefault(lot.holding_id, []).append(lot)
+
+    transactions: dict[int, list[Transaction]] = {}
+    for txn in session.execute(
+        select(Transaction).where(Transaction.holding_id.in_(holding_ids)).order_by(Transaction.date)
+    ).scalars():
+        transactions.setdefault(txn.holding_id, []).append(txn)
+
+    navs = nav_service.get_navs_on_or_before(session, list(scheme_ids), valuation_date)
+    return PortfolioContext(holdings, folios, schemes, lots, navs, transactions)
+
+
+def compute_holding_metrics(
+    session: Session, holding_id: int, valuation_date: date, ctx: Optional[PortfolioContext] = None,
+) -> HoldingMetrics:
+    """ctx: optional prefetched data from build_context. Purely a
+    performance path — with it, this function makes no queries at all;
+    without it, it loads exactly what it always did, so single-holding
+    callers keep working unchanged."""
+    if ctx is not None:
+        holding = ctx.holdings.get(holding_id) or session.get(Holding, holding_id)
+        folio = ctx.folios.get(holding.folio_id) or session.get(Folio, holding.folio_id)
+        scheme = ctx.schemes.get(holding.scheme_id) or session.get(Scheme, holding.scheme_id)
+        lots = ctx.lots.get(holding_id, [])
+    else:
+        holding = session.get(Holding, holding_id)
+        folio = session.get(Folio, holding.folio_id)
+        scheme = session.get(Scheme, holding.scheme_id)
+        lots = list(session.execute(
+            select(PurchaseLot).where(PurchaseLot.holding_id == holding_id, PurchaseLot.remaining_units > 0)
+        ).scalars())
+    flags: list[DataQualityFlag] = []
 
     balance_units = sum((l.remaining_units for l in lots), ZERO)
     remaining_purchase_value = sum((l.remaining_cost for l in lots), ZERO)
@@ -107,7 +177,10 @@ def compute_holding_metrics(session: Session, holding_id: int, valuation_date: d
         if balance_units > 0 else None
     )
 
-    nav_point = nav_service.get_nav_on_or_before(session, holding.scheme_id, valuation_date)
+    nav_point = (
+        ctx.navs.get(holding.scheme_id) if ctx is not None
+        else nav_service.get_nav_on_or_before(session, holding.scheme_id, valuation_date)
+    )
     current_nav = nav_point.nav if nav_point else None
     current_nav_date = nav_point.resolved_date if nav_point else None
     if current_nav is None and balance_units > 0:
@@ -126,9 +199,12 @@ def compute_holding_metrics(session: Session, holding_id: int, valuation_date: d
     xirr_pct = None
     blocking_codes = {"CAS_RECONCILIATION_FAILED", "INCOMPLETE_OPENING_HISTORY", "SCHEME_UNRESOLVED", "FIFO_SHORTFALL"}
     if not any(f.code in blocking_codes for f in flags):
-        transactions = list(session.execute(
-            select(Transaction).where(Transaction.holding_id == holding_id).order_by(Transaction.date)
-        ).scalars())
+        transactions = (
+            ctx.transactions.get(holding_id, []) if ctx is not None
+            else list(session.execute(
+                select(Transaction).where(Transaction.holding_id == holding_id).order_by(Transaction.date)
+            ).scalars())
+        )
         cashflows: list[tuple[date, Decimal]] = []
         for t in transactions:
             cf = _txn_cash_flow(t)
@@ -157,7 +233,8 @@ def compute_all_holdings(
     session: Session, valuation_date: date, include_zero_value: bool = False,
 ) -> list[HoldingMetrics]:
     holding_ids = list(session.execute(select(Holding.holding_id)).scalars())
-    results = [compute_holding_metrics(session, hid, valuation_date) for hid in holding_ids]
+    ctx = build_context(session, holding_ids, valuation_date)
+    results = [compute_holding_metrics(session, hid, valuation_date, ctx) for hid in holding_ids]
     if not include_zero_value:
         results = [r for r in results if r.balance_units > 0]
     return results
@@ -175,12 +252,20 @@ class AggregateTotals:
 
 def aggregate(
     session: Session, holdings: list[HoldingMetrics], valuation_date: date,
+    ctx: Optional[PortfolioContext] = None,
 ) -> AggregateTotals:
     """Spec 9.6: sums for invested/current/gain, gain/invested for
     absolute return, current-value-weighted average for days held, and
     XIRR recalculated from ALL consolidated cash flows — never an
     average of the individual holdings' own XIRRs (spec 9.5, 22:
-    'Do not calculate weighted-average XIRR or CAGR')."""
+    'Do not calculate weighted-average XIRR or CAGR').
+
+    ctx: optional prefetched data from build_context, same performance-
+    only contract as compute_holding_metrics. It matters more here than
+    it looks: /api/portfolio calls this four times (one per asset-class
+    bucket plus the grand total), so the transaction query below ran
+    once per holding per bucket — four full passes over the portfolio's
+    transactions per page load."""
     invested = sum((h.remaining_purchase_value for h in holdings), ZERO)
     current = sum((h.current_value for h in holdings), ZERO)
     gain = current - invested
@@ -195,9 +280,12 @@ def aggregate(
 
     cashflows: list[tuple[date, Decimal]] = []
     for hid in {h.holding_id for h in holdings}:
-        transactions = list(session.execute(
-            select(Transaction).where(Transaction.holding_id == hid).order_by(Transaction.date)
-        ).scalars())
+        transactions = (
+            ctx.transactions.get(hid, []) if ctx is not None
+            else list(session.execute(
+                select(Transaction).where(Transaction.holding_id == hid).order_by(Transaction.date)
+            ).scalars())
+        )
         for t in transactions:
             cf = _txn_cash_flow(t)
             if cf is not None:

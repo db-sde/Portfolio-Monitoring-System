@@ -19,7 +19,7 @@ from __future__ import annotations
 from dataclasses import dataclass, field
 from datetime import date
 from decimal import Decimal
-from typing import Optional
+from typing import TYPE_CHECKING, Optional
 
 from sqlalchemy import select
 from sqlalchemy.orm import Session
@@ -27,6 +27,9 @@ from sqlalchemy.orm import Session
 import nav_service
 import xirr_engine
 from models import Folio, Holding, Scheme, Transaction
+
+if TYPE_CHECKING:  # import only for the type annotation — avoids a runtime cycle
+    import portfolio_service
 
 ZERO = Decimal("0")
 BUCKET_KEYS = ("EQUITY", "HYBRID", "DEBT", "total")
@@ -75,22 +78,57 @@ def _bucket_for(asset_class: Optional[str]) -> str:
 
 def compute_snapshot(
     session: Session, holding_ids: list[int], start_date: Optional[date], end_date: date,
+    ctx: Optional["portfolio_service.PortfolioContext"] = None,
 ) -> dict[str, dict]:
+    """ctx: optional prefetched holdings/schemes/transactions from
+    portfolio_service.build_context — performance only, same contract as
+    compute_holding_metrics. This function ran five queries per holding
+    (holding, scheme, transactions, and a NAV lookup at each of the two
+    period ends), and /api/portfolio/snapshot calls it TWICE (the chosen
+    period and since-inception), so a 65-holding portfolio issued ~650
+    round trips to render one page — measured at 142s, the slowest
+    endpoint in the app once the others were batched.
+
+    The two NAV lookups stay per-scheme rather than joining the shared
+    context: they resolve at start_date and end_date, which are specific
+    to this call, whereas ctx.navs holds a single valuation date. They
+    are batched here per date instead."""
     buckets: dict[str, BucketSnapshot] = {k: BucketSnapshot() for k in (*BUCKET_KEYS[:-1], "total")}
 
+    if ctx is not None:
+        holdings = {hid: ctx.holdings.get(hid) for hid in holding_ids}
+        scheme_ids = [h.scheme_id for h in holdings.values() if h is not None]
+    else:
+        holdings = {
+            h.holding_id: h
+            for h in session.execute(select(Holding).where(Holding.holding_id.in_(holding_ids))).scalars()
+        }
+        scheme_ids = [h.scheme_id for h in holdings.values()]
+
+    opening_navs = (
+        nav_service.get_navs_on_or_before(session, scheme_ids, start_date) if start_date else {}
+    )
+    closing_navs = nav_service.get_navs_on_or_before(session, scheme_ids, end_date)
+
     for holding_id in holding_ids:
-        holding = session.get(Holding, holding_id)
-        scheme = session.get(Scheme, holding.scheme_id)
-        transactions = list(session.execute(
-            select(Transaction).where(Transaction.holding_id == holding_id).order_by(Transaction.date)
-        ).scalars())
+        holding = holdings.get(holding_id) or session.get(Holding, holding_id)
+        if holding is None:
+            continue
+        if ctx is not None:
+            scheme = ctx.schemes.get(holding.scheme_id) or session.get(Scheme, holding.scheme_id)
+            transactions = ctx.transactions.get(holding_id, [])
+        else:
+            scheme = session.get(Scheme, holding.scheme_id)
+            transactions = list(session.execute(
+                select(Transaction).where(Transaction.holding_id == holding_id).order_by(Transaction.date)
+            ).scalars())
 
         opening_units = _units_at(transactions, start_date) if start_date else ZERO
-        opening_point = nav_service.get_nav_on_or_before(session, holding.scheme_id, start_date) if start_date else None
+        opening_point = opening_navs.get(holding.scheme_id) if start_date else None
         opening_value = (opening_units * opening_point.nav) if (start_date and opening_point) else ZERO
 
         closing_units = _units_at(transactions, end_date)
-        closing_point = nav_service.get_nav_on_or_before(session, holding.scheme_id, end_date)
+        closing_point = closing_navs.get(holding.scheme_id)
         closing_value = (closing_units * closing_point.nav) if closing_point else ZERO
 
         period = {"purchase": ZERO, "switch_in": ZERO, "switch_out": ZERO, "div_payout": ZERO, "redemption": ZERO}

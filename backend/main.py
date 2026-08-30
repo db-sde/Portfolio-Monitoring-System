@@ -267,8 +267,13 @@ async def _run_enrichment_task_async(scheme_ids: list[int], job_id: Optional[int
                 await benchmark_service.refresh_nifty50_proxy_nav(session, client)
             _mark_stage(job_id, "before_refresh_enrichment")
             with db.get_session() as session:
-                schemes = [session.get(Scheme, sid) for sid in scheme_ids]
-                schemes = [s for s in schemes if s is not None]
+                # One query, not session.get() per id: each of those is a
+                # separate ~250ms round trip to Neon, so a 53-scheme
+                # portfolio spent ~13s here just collecting rows it was
+                # about to hand straight to refresh_enrichment.
+                schemes = list(session.execute(
+                    select(Scheme).where(Scheme.scheme_id.in_(scheme_ids))
+                ).scalars())
                 await enrichment_bridge.refresh_enrichment(session, schemes, on_stage=lambda s: _mark_stage(job_id, s))
             _mark_stage(job_id, "finished_ok")
     except Exception as exc:
@@ -686,7 +691,8 @@ def get_portfolio(
     holding_ids = _scope_holding_ids(session, level, group_name, investor_name, arn)
     if holding_ids is None:
         holding_ids = _all_holding_ids(session)
-    all_metrics = [portfolio_service.compute_holding_metrics(session, hid, val_date) for hid in holding_ids]
+    _ctx = portfolio_service.build_context(session, holding_ids, val_date)
+    all_metrics = [portfolio_service.compute_holding_metrics(session, hid, val_date, _ctx) for hid in holding_ids]
     if not include_zero_value:
         all_metrics = [m for m in all_metrics if m.balance_units > 0]
 
@@ -708,7 +714,7 @@ def get_portfolio(
         buckets[_asset_class_bucket(m.asset_class)].append(m)
 
     def _agg_dict(metrics: list[portfolio_service.HoldingMetrics]) -> dict:
-        agg = portfolio_service.aggregate(session, metrics, val_date)
+        agg = portfolio_service.aggregate(session, metrics, val_date, _ctx)
         return {
             "invested_value": agg.invested_value, "current_value": agg.current_value, "gain": agg.gain,
             "absolute_return_pct": agg.absolute_return_pct, "weighted_days_held": agg.weighted_days_held,
@@ -759,8 +765,12 @@ def get_snapshot(
     end = date.fromisoformat(end_date) if end_date else date.today()
     start = date.fromisoformat(start_date) if start_date else None
 
-    given_period = snapshot_service.compute_snapshot(session, holding_ids, start, end)
-    since_inception = snapshot_service.compute_snapshot(session, holding_ids, None, end)
+    # One shared context across BOTH snapshot passes — they cover the
+    # same holdings and differ only in start date, so the holdings,
+    # schemes and transactions behind them are identical.
+    _ctx = portfolio_service.build_context(session, holding_ids, end)
+    given_period = snapshot_service.compute_snapshot(session, holding_ids, start, end, _ctx)
+    since_inception = snapshot_service.compute_snapshot(session, holding_ids, None, end, _ctx)
 
     def _fmt(bucket: dict) -> dict:
         return {k: (str(v) if isinstance(v, type(date.today())) else v) for k, v in bucket.items()}
@@ -786,8 +796,9 @@ def get_portfolio_summary(session: Session = Depends(get_session)):
                 holding_ids = list(session.execute(select(Holding.holding_id).where(Holding.advisor_arn == arn)).scalars())
                 if not holding_ids:
                     continue
-                metrics = [portfolio_service.compute_holding_metrics(session, hid, date.today()) for hid in holding_ids]
-                agg = portfolio_service.aggregate(session, metrics, date.today())
+                _ctx = portfolio_service.build_context(session, holding_ids, date.today())
+                metrics = [portfolio_service.compute_holding_metrics(session, hid, date.today(), _ctx) for hid in holding_ids]
+                agg = portfolio_service.aggregate(session, metrics, date.today(), _ctx)
                 external_flows = _external_cashflows(session, holding_ids)
 
                 nifty50 = benchmark_service.simulate_benchmark_xirr(session, external_flows, date.today(), "Nifty 50")
@@ -806,8 +817,9 @@ def get_portfolio_summary(session: Session = Depends(get_session)):
 
             blended = None
             if all_records_holding_ids:
-                all_metrics = [portfolio_service.compute_holding_metrics(session, hid, date.today()) for hid in all_records_holding_ids]
-                blended = portfolio_service.aggregate(session, all_metrics, date.today()).xirr_pct
+                _all_ctx = portfolio_service.build_context(session, all_records_holding_ids, date.today())
+                all_metrics = [portfolio_service.compute_holding_metrics(session, hid, date.today(), _all_ctx) for hid in all_records_holding_ids]
+                blended = portfolio_service.aggregate(session, all_metrics, date.today(), _all_ctx).xirr_pct
 
             investors_out.append({
                 "investor_name": investor.get("investor_name"),
@@ -850,16 +862,24 @@ def get_fund_summary(
     if holding_ids is None:
         holding_ids = _all_holding_ids(session)
     seen: dict[int, dict] = {}
+    _ctx = portfolio_service.build_context(session, holding_ids, date.today())
+    # Holding, Scheme and the enrichment payload all come from batched
+    # lookups rather than three more round trips per holding — same
+    # reason build_context exists (see its docstring).
+    _payloads = enrichment_bridge.get_cached_enrichments(
+        session, [h.scheme_id for h in _ctx.holdings.values()]
+    )
     for hid in holding_ids:
-        m = portfolio_service.compute_holding_metrics(session, hid, date.today())
+        m = portfolio_service.compute_holding_metrics(session, hid, date.today(), _ctx)
         if not include_zero_value and m.balance_units <= 0:
             continue
-        holding = session.get(Holding, hid)
+        holding = _ctx.holdings.get(hid) or session.get(Holding, hid)
         if holding.scheme_id in seen:
             continue
-        payload = enrichment_bridge.get_cached_enrichment(session, holding.scheme_id) or {}
+        payload = _payloads.get(holding.scheme_id) or {}
+        scheme_row = _ctx.schemes.get(holding.scheme_id) or session.get(Scheme, holding.scheme_id)
         seen[holding.scheme_id] = {
-            "scheme_name": m.scheme_name, "amfi": session.get(Scheme, holding.scheme_id).amfi_code,
+            "scheme_name": m.scheme_name, "amfi": scheme_row.amfi_code,
             "is_held": True, "corpus_cr": payload.get("corpus_cr"),
             "largecap_pct": payload.get("largecap_pct"), "midcap_pct": payload.get("midcap_pct"),
             "smallcap_pct": payload.get("smallcap_pct"),
@@ -884,7 +904,8 @@ def get_exposure(
     holding_ids = _scope_holding_ids(session, level, group_name, investor_name, arn)
     if holding_ids is None:
         holding_ids = _all_holding_ids(session)
-    metrics = [portfolio_service.compute_holding_metrics(session, hid, date.today()) for hid in holding_ids]
+    _ctx = portfolio_service.build_context(session, holding_ids, date.today())
+    metrics = [portfolio_service.compute_holding_metrics(session, hid, date.today(), _ctx) for hid in holding_ids]
     result = exposure_service.compute_exposure(metrics)
     return {
         **_response_meta(session),
@@ -910,19 +931,28 @@ def get_transactions(
         holding_ids = _all_holding_ids(session)
     out = []
     config = config_service.load_config(session)
+    # Was five round trips per holding — Holding, Scheme, Folio, and the
+    # SAME transactions query run twice (once to total units, once to
+    # emit rows). On a 65-holding portfolio that alone made this the
+    # slowest endpoint in the app at ~79s, essentially all of it Neon
+    # latency. build_context fetches all of it in a fixed handful of
+    # queries; see its docstring.
+    ctx = portfolio_service.build_context(session, holding_ids, date.today())
     for hid in holding_ids:
-        holding = session.get(Holding, hid)
-        m_balance = sum((
-            t.units for t in session.execute(select(Transaction).where(Transaction.holding_id == hid)).scalars()
-            if t.units is not None
-        ), portfolio_service.ZERO)
+        holding = ctx.holdings.get(hid)
+        if holding is None:
+            continue
+        holding_txns = ctx.transactions.get(hid, [])
+        m_balance = sum(
+            (t.units for t in holding_txns if t.units is not None), portfolio_service.ZERO,
+        )
         if not include_zero_value and m_balance <= 0:
             continue
-        scheme = session.get(Scheme, holding.scheme_id)
-        folio = session.get(Folio, holding.folio_id)
+        scheme = ctx.schemes.get(holding.scheme_id)
+        folio = ctx.folios.get(holding.folio_id)
         group_name_r, investor_name_r = config_service.find_owner_for_arn(config, holding.advisor_arn) if holding.advisor_arn else (None, None)
         advisor_label = config_service.find_arn_label(config, holding.advisor_arn) if holding.advisor_arn else None
-        for t in session.execute(select(Transaction).where(Transaction.holding_id == hid)).scalars():
+        for t in holding_txns:
             out.append({
                 "date": t.date.isoformat(), "type": t.type, "description": t.description,
                 "amount": t.amount, "units": t.units, "nav": t.nav, "balance": t.balance,
@@ -993,17 +1023,23 @@ def get_112a_csv(
 
 @app.get("/api/data-quality")
 def get_data_quality(session: Session = Depends(get_session)):
-    holding_ids = _all_holding_ids(session)
-    issues = []
-    for hid in holding_ids:
-        holding = session.get(Holding, hid)
-        if holding.reconciliation_status != "reconciled":
-            scheme = session.get(Scheme, holding.scheme_id)
-            folio = session.get(Folio, holding.folio_id)
-            issues.append({
-                "holding_id": hid, "scheme_name": scheme.name, "folio": folio.normalized_folio,
-                "status": holding.reconciliation_status,
-            })
+    # One query for the unreconciled holdings, joined to the scheme and
+    # folio they need — rather than loading every holding one by one and
+    # then two more rows for each problem found. Only the holdings that
+    # actually have an issue are fetched at all.
+    rows = session.execute(
+        select(Holding, Scheme, Folio)
+        .join(Scheme, Scheme.scheme_id == Holding.scheme_id)
+        .join(Folio, Folio.folio_id == Holding.folio_id)
+        .where(Holding.reconciliation_status != "reconciled")
+    ).all()
+    issues = [
+        {
+            "holding_id": holding.holding_id, "scheme_name": scheme.name,
+            "folio": folio.normalized_folio, "status": holding.reconciliation_status,
+        }
+        for holding, scheme, folio in rows
+    ]
     return {**_response_meta(session), "issues": issues}
 
 

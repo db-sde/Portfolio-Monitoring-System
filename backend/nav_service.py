@@ -21,7 +21,7 @@ from datetime import date, datetime, timezone
 from decimal import Decimal
 from typing import Optional
 
-from sqlalchemy import select
+from sqlalchemy import func, select
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.orm import Session
 
@@ -65,6 +65,31 @@ def get_latest_nav(session: Session, scheme_id: int) -> Optional[NavPoint]:
     return get_nav_on_or_before(session, scheme_id, date.today())
 
 
+def get_navs_on_or_before(
+    session: Session, scheme_ids: list[int], requested_date: date
+) -> dict[int, NavPoint]:
+    """get_nav_on_or_before for many schemes in ONE query, via Postgres
+    DISTINCT ON. Same semantics per scheme — the latest point at or
+    before requested_date, never a future NAV (spec 7.1) — just resolved
+    for the whole set at once instead of a round trip each. Called once
+    per page render rather than once per holding."""
+    if not scheme_ids:
+        return {}
+    rows = session.execute(
+        select(NavCache)
+        .where(NavCache.scheme_id.in_(scheme_ids), NavCache.nav_date <= requested_date)
+        .distinct(NavCache.scheme_id)
+        .order_by(NavCache.scheme_id, NavCache.nav_date.desc())
+    ).scalars()
+    return {
+        row.scheme_id: NavPoint(
+            scheme_id=row.scheme_id, requested_date=requested_date,
+            resolved_date=row.nav_date, nav=row.nav, source=row.source,
+        )
+        for row in rows
+    }
+
+
 # 500 was too conservative in practice: a real 52-scheme portfolio (some
 # funds with 20+ years of daily NAV history, ~5,000+ rows each) took
 # 262s to enrich — 23s of that was the concurrent mfapi.in fetch, the
@@ -81,8 +106,61 @@ def get_latest_nav(session: Session, scheme_id: int) -> Optional[NavPoint]:
 NAV_UPSERT_BATCH_SIZE = 8000
 
 
+def get_nav_history(session: Session, scheme_id: int) -> list[dict]:
+    """This scheme's full stored NAV series, oldest-first, in the same
+    {"date": ISO str, "nav": float} shape enrichment.py builds from an
+    mfapi.in response — so it can be handed straight back to
+    enrich_schemes as `nav_history` and used in place of re-fetching.
+    Measured: reading a 5,200-point history from Neon takes ~1.1s versus
+    a ~500KB HTTP round trip to a host that rate-limits us."""
+    rows = session.execute(
+        select(NavCache.nav_date, NavCache.nav).where(NavCache.scheme_id == scheme_id).order_by(NavCache.nav_date)
+    ).all()
+    return [{"date": nav_date.isoformat(), "nav": float(nav)} for nav_date, nav in rows]
+
+
+def get_nav_histories(session: Session, scheme_ids: list[int]) -> dict[int, list[dict]]:
+    """get_nav_history for many schemes in ONE query instead of one per
+    scheme. Against Neon the per-query latency dominates the payload:
+    53 separate history reads measured 16.8s versus 12.4s batched, and
+    the equivalent per-scheme metadata lookups went 13.9s -> 0.5s. The
+    full series is returned deliberately — max drawdown is computed over
+    a fund's ENTIRE history, so truncating to a few recent years to save
+    bandwidth would quietly change a reported figure rather than just
+    making things faster."""
+    if not scheme_ids:
+        return {}
+    rows = session.execute(
+        select(NavCache.scheme_id, NavCache.nav_date, NavCache.nav)
+        .where(NavCache.scheme_id.in_(scheme_ids))
+        .order_by(NavCache.scheme_id, NavCache.nav_date)
+    ).all()
+    out: dict[int, list[dict]] = {}
+    for scheme_id, nav_date, nav in rows:
+        out.setdefault(scheme_id, []).append({"date": nav_date.isoformat(), "nav": float(nav)})
+    return out
+
+
+def get_stored_nav_summary(session: Session, scheme_ids: list[int]) -> dict[int, tuple[Optional[date], int]]:
+    """{scheme_id: (max_nav_date, row_count)} for many schemes in ONE
+    aggregate query. Deliberately an aggregate rather than reading the
+    rows themselves: this is used to decide how much of an incoming
+    history actually needs writing, so it must be far cheaper than the
+    write it's trying to avoid — a few dozen rows back, whatever the
+    portfolio's total (197,600 rows here)."""
+    if not scheme_ids:
+        return {}
+    rows = session.execute(
+        select(NavCache.scheme_id, func.max(NavCache.nav_date), func.count())
+        .where(NavCache.scheme_id.in_(scheme_ids))
+        .group_by(NavCache.scheme_id)
+    ).all()
+    return {scheme_id: (max_date, count) for scheme_id, max_date, count in rows}
+
+
 def store_nav_points(
-    session: Session, scheme_id: int, points: list[tuple[date, Decimal]], source: str = "mfapi.in"
+    session: Session, scheme_id: int, points: list[tuple[date, Decimal]], source: str = "mfapi.in",
+    stored_summary: Optional[tuple[Optional[date], int]] = None,
 ) -> None:
     """Upsert a batch of (date, nav) points for one scheme in single
     multi-row statements rather than one round-trip per point — a
@@ -92,9 +170,32 @@ def store_nav_points(
     points are immutable in practice (a past NAV never changes), but
     this upserts rather than insert-if-missing so a corrected re-fetch
     (integrity-error recovery, spec 7.3) can still overwrite a bad
-    cached value without a separate delete step."""
+    cached value without a separate delete step.
+
+    stored_summary: optional (max_stored_date, stored_row_count) for this
+    scheme, from get_stored_nav_summary. When supplied, only genuinely
+    new points are written instead of the whole history every time. This
+    was the single largest cost in the entire enrichment run — measured
+    at 3.8s per scheme to re-upsert an unchanged 5,202-point history,
+    roughly 205s across a real 54-scheme portfolio, spent rewriting rows
+    to the values they already held. Past NAVs are immutable, so on a
+    re-run there is usually nothing to write at all."""
     if not points:
         return
+    if stored_summary is not None:
+        max_stored_date, stored_count = stored_summary
+        if max_stored_date is not None:
+            new_points = [(d, nav) for d, nav in points if d > max_stored_date]
+            # Only take the cheap append-only path when the stored row
+            # count is exactly consistent with "everything up to
+            # max_stored_date is already present". If it isn't, an
+            # earlier write left a gap mid-history, and topping up only
+            # the tail would preserve that gap forever — fall through to
+            # the full upsert, which self-heals it.
+            if stored_count == len(points) - len(new_points):
+                if not new_points:
+                    return
+                points = new_points
     now = datetime.now(timezone.utc)
     for i in range(0, len(points), NAV_UPSERT_BATCH_SIZE):
         chunk = points[i:i + NAV_UPSERT_BATCH_SIZE]
