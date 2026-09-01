@@ -38,7 +38,6 @@ from fastapi.responses import JSONResponse
 from sqlalchemy import select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
-from starlette.concurrency import run_in_threadpool
 
 from casparser import read_cas_pdf
 from casparser.enums import TransactionType
@@ -410,7 +409,100 @@ def _replace_and_ingest_sync(content: bytes, parsed) -> ingestion.IngestResult:
         return result
 
 
-def _run_ingest_job_sync(job_id: int, content: bytes, parsed) -> None:
+def _stored_investor_name(upload: CasUpload) -> Optional[str]:
+    """Investor name for an already-imported statement, read back from
+    the parse we stored rather than re-parsing the file. The duplicate
+    branch used to take this from a freshly-parsed CASData, which isn't
+    available there any more — and re-parsing just to label a duplicate
+    would reintroduce the very wait that made uploads time out."""
+    raw = upload.raw_parsed_json or {}
+    if isinstance(raw, dict):
+        info = raw.get("investor_info")
+        if isinstance(info, dict):
+            return info.get("name")
+    return None
+
+
+class _UserFacingParseError(Exception):
+    """A parse failure whose message is meant for the person who
+    uploaded (wrong password, wrong kind of file). These used to be
+    HTTPExceptions raised from the request; now that parsing happens in
+    the background job, they reach the client through the job row's
+    error_detail, which GET /api/upload-status returns as `message`."""
+
+
+def _parse_upload(content: bytes, filename: str, password: str):
+    """Bytes -> CASData. This is the slow part of an upload and is
+    deliberately called from the background job, never from the request
+    handler. Raises _UserFacingParseError with a message fit to show
+    as-is."""
+    if filename.endswith(".json"):
+        # A previously-parsed CAS JSON — useful for testing, or if
+        # someone already has one from elsewhere. Re-validated through
+        # the same CASData pydantic model read_cas_pdf itself returns
+        # (Decimal/date fields coerce correctly from JSON strings/numbers
+        # via pydantic, same as any other CASData construction), so
+        # everything downstream sees an identical shape either way.
+        try:
+            raw_dict = json.loads(content)
+        except json.JSONDecodeError:
+            raise _UserFacingParseError("That doesn't look like valid JSON.")
+        try:
+            parsed = CASData.model_validate(raw_dict)
+        except Exception as exc:
+            # Just the missing/invalid field names, not pydantic's full
+            # multi-line dump. This message is now rendered in the UI's
+            # error banner (parse failures reach the client through the
+            # job row), where a raw ValidationError repr — five stanzas
+            # with docs URLs — is unreadable. The full detail is still in
+            # the server log via the logger.info in the caller.
+            fields = ", ".join(
+                sorted({".".join(str(p) for p in e.get("loc", ())) for e in getattr(exc, "errors", lambda: [])()})
+            )
+            detail = f" (missing or invalid: {fields})" if fields else ""
+            raise _UserFacingParseError(
+                f"That JSON isn't a parsed CAS statement{detail}."
+            )
+    else:
+        with tempfile.TemporaryDirectory(prefix="portfolioiq-") as tmp:
+            pdf_path = Path(tmp) / "statement.pdf"
+            pdf_path.write_bytes(content)
+            try:
+                # A plain synchronous call now, not run_in_threadpool:
+                # this whole function already runs on a worker thread
+                # (see _run_ingest_job_sync's docstring), so there is no
+                # event loop here to keep unblocked.
+                parsed = read_cas_pdf(str(pdf_path), password)
+            except CASParseError as exc:
+                if "password" in str(exc).lower():
+                    raise _UserFacingParseError("That password didn't work. Double check it and try again.")
+                raise _UserFacingParseError(
+                    "We couldn't read this as a CAS statement. Make sure it's the unmodified PDF from CAMS or KFintech."
+                )
+            except ParserException:
+                raise _UserFacingParseError("This statement couldn't be parsed.")
+            except Exception:
+                # Anything else — a casparser internal error on a real-world
+                # PDF shape the CASParseError/ParserException catches above
+                # don't cover — must not surface as a bare, undiagnosable 500.
+                # Logged with the full traceback (visible in Render's log
+                # viewer) so a report of "upload failed" is actually
+                # debuggable instead of a dead end.
+                logger.exception("read_cas_pdf failed on an uncategorised exception")
+                raise _UserFacingParseError(
+                    "This statement couldn't be parsed. If this keeps happening, it's a bug — the server log has the details."
+                )
+
+    if isinstance(parsed, NSDLCASData):
+        raise _UserFacingParseError(
+            "This looks like an NSDL/CDSL demat statement. PortfolioIQ currently analyses "
+            "CAMS/KFintech mutual-fund statements only."
+        )
+    _fix_segregation_classification(parsed)
+    return parsed
+
+
+def _run_ingest_job_sync(job_id: int, content: bytes, filename: str, password: str) -> None:
     """The actual background work behind an upload, run after upload_cas
     has already returned "processing" to the client. Dispatched as a
     plain BackgroundTasks callable — Starlette runs a sync one via
@@ -446,6 +538,7 @@ def _run_ingest_job_sync(job_id: int, content: bytes, parsed) -> None:
     # reliably lands as job.status="error" with the real exception
     # message, never a silent stuck-forever "processing".
     try:
+        parsed = _parse_upload(content, filename, password)
         result = _replace_and_ingest_sync(content, parsed)
         result_json = {
             "investor_name": parsed.investor_info.name,
@@ -465,13 +558,23 @@ def _run_ingest_job_sync(job_id: int, content: bytes, parsed) -> None:
                 job.result_json = result_json
                 job.completed_at = datetime.now(timezone.utc)
     except Exception as exc:
-        logger.exception("Background ingest failed for job_id=%s", job_id)
+        # A _UserFacingParseError is an expected outcome (wrong password,
+        # wrong kind of file), not a defect: its message is already
+        # written for the person who uploaded, so it's stored verbatim
+        # instead of prefixed with a class name, and logged without a
+        # traceback.
+        if isinstance(exc, _UserFacingParseError):
+            logger.info("Upload job_id=%s rejected: %s", job_id, exc)
+            detail = str(exc)
+        else:
+            logger.exception("Background ingest failed for job_id=%s", job_id)
+            detail = f"{type(exc).__name__}: {exc}"
         try:
             with db.get_session() as session:
                 job = session.get(IngestJob, job_id)
                 if job:
                     job.status = "error"
-                    job.error_detail = f"{type(exc).__name__}: {exc}"
+                    job.error_detail = detail
                     job.completed_at = datetime.now(timezone.utc)
         except Exception:
             logger.exception("Also failed to record the error status for job_id=%s", job_id)
@@ -528,51 +631,15 @@ async def upload_cas(
         session.delete(existing_job)
         session.flush()
 
-    if filename.endswith(".json"):
-        # A previously-parsed CAS JSON — useful for testing, or if
-        # someone already has one from elsewhere. Re-validated through
-        # the same CASData pydantic model read_cas_pdf itself returns
-        # (Decimal/date fields coerce correctly from JSON strings/numbers
-        # via pydantic, same as any other CASData construction), so
-        # everything downstream sees an identical shape either way.
-        try:
-            raw_dict = json.loads(content)
-        except json.JSONDecodeError:
-            raise HTTPException(400, "That doesn't look like valid JSON.")
-        try:
-            parsed = CASData.model_validate(raw_dict)
-        except Exception as exc:
-            raise HTTPException(422, f"That JSON doesn't match the expected CAS data shape: {exc}")
-    else:
-        with tempfile.TemporaryDirectory(prefix="portfolioiq-") as tmp:
-            pdf_path = Path(tmp) / "statement.pdf"
-            pdf_path.write_bytes(content)
-            try:
-                parsed = await run_in_threadpool(read_cas_pdf, str(pdf_path), password)
-            except CASParseError as exc:
-                message = str(exc)
-                if "password" in message.lower():
-                    raise HTTPException(401, "That password didn't work. Double check it and try again.")
-                raise HTTPException(422, "We couldn't read this as a CAS statement. Make sure it's the unmodified PDF from CAMS or KFintech.")
-            except ParserException:
-                raise HTTPException(422, "This statement couldn't be parsed.")
-            except Exception:
-                # Anything else — a casparser internal error on a real-world
-                # PDF shape the CASParseError/ParserException catches above
-                # don't cover — must not surface as a bare, undiagnosable 500.
-                # Logged with the full traceback (visible in Render's log
-                # viewer) so a report of "upload failed" is actually
-                # debuggable instead of a dead end.
-                logger.exception("read_cas_pdf failed on an uncategorised exception")
-                raise HTTPException(422, "This statement couldn't be parsed. If this keeps happening, it's a bug — the server log has the details.")
-
-    if isinstance(parsed, NSDLCASData):
-        raise HTTPException(
-            422,
-            "This looks like an NSDL/CDSL demat statement. PortfolioIQ currently analyses "
-            "CAMS/KFintech mutual-fund statements only.",
-        )
-    _fix_segregation_classification(parsed)
+    # NOTE: the statement is NOT parsed here any more — see
+    # _parse_upload, now called from inside the background job. Parsing
+    # is the slow step (a real 94-scheme statement spent long enough in
+    # read_cas_pdf that Render's proxy gave up and returned 502 to the
+    # browser) and holding the request open for it meant the user saw a
+    # failure for an import that then completed perfectly server-side:
+    # job "ok", 105 holdings, enrichment finished. Everything this
+    # handler still does before responding is cheap — size/type checks,
+    # a SHA-256 over bytes already in memory, and two small queries.
 
     # Replace-on-upload, not accumulate: this is meant to be a
     # one-statement-at-a-time analyser, not an ever-growing multi-investor
@@ -605,8 +672,11 @@ async def upload_cas(
             "status": "duplicate",
             "message": "This exact statement has already been imported.",
             "upload_id": existing_upload.upload_id,
-            "investor_name": parsed.investor_info.name,
-            "statement_period": {"from": parsed.statement_period.from_, "to": parsed.statement_period.to},
+            "investor_name": _stored_investor_name(existing_upload),
+            "statement_period": {
+                "from": existing_upload.period_from.isoformat() if existing_upload.period_from else None,
+                "to": existing_upload.period_to.isoformat() if existing_upload.period_to else None,
+            },
         }
 
     # The wipe+ingest itself now runs entirely in the background (see
@@ -658,14 +728,14 @@ async def upload_cas(
         session.rollback()
         raise HTTPException(409, "An import is already in progress. Wait for it to finish (see the status bar) before starting another.")
 
-    background_tasks.add_task(_run_ingest_job_sync, job.job_id, content, parsed)
+    background_tasks.add_task(_run_ingest_job_sync, job.job_id, content, filename, password)
 
-    return {
-        "status": "processing",
-        "job_id": job.job_id,
-        "investor_name": parsed.investor_info.name,
-        "statement_period": {"from": parsed.statement_period.from_, "to": parsed.statement_period.to},
-    }
+    # No investor_name/statement_period here any more: both need the
+    # parse, which is precisely what this endpoint no longer waits for.
+    # The client polls GET /api/upload-status/{job_id} and reads them
+    # from the finished job's result_json — where it already got every
+    # other field it shows after an import.
+    return {"status": "processing", "job_id": job.job_id}
 
 
 @app.get("/api/upload-status/{job_id}")
