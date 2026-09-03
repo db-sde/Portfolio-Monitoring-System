@@ -218,10 +218,13 @@ def _get_or_create_folio(
     return folio
 
 
-def _get_or_create_holding(
+def _stage_holding(
     session: Session, caches: _IngestCaches, folio_id: int, scheme_id: int,
     plan: str, option: str, advisor_arn: Optional[str],
 ) -> Holding:
+    """Return this holding, adding it to the session if it's new — but
+    WITHOUT flushing. The caller flushes once for the whole statement, so
+    holding_id is unset until then; nothing here may read it."""
     key = (folio_id, scheme_id, plan, option)
     existing = caches.holdings.get(key)
     if existing:
@@ -232,7 +235,6 @@ def _get_or_create_holding(
         folio_id=folio_id, scheme_id=scheme_id, plan=plan, option=option, advisor_arn=advisor_arn,
     )
     session.add(holding)
-    session.flush()  # assigns holding_id, which transactions/lots need
     caches.holdings[key] = holding
     return holding
 
@@ -269,20 +271,21 @@ def _transaction_fingerprint(t) -> tuple:
     return (t.date, t.type, t.amount, t.units, t.nav, t.occurrence_index)
 
 
-def _persist_transactions(
+def _stage_transactions(
     session: Session, caches: _IngestCaches, holding: Holding, scheme, upload_id: int,
-) -> list[Transaction]:
-    """Insert any transaction rows not already present (by fingerprint),
-    and return the FULL set for this holding (old + new) so FIFO always
-    runs against the complete ledger, not just this upload's rows.
+) -> tuple[list[Transaction], list[Transaction]]:
+    """Add any transaction rows not already present (by fingerprint) to
+    the session, WITHOUT flushing, and return (existing, added).
 
-    One SELECT for the whole holding, not one per incoming transaction —
-    the original per-row lookup was a real N+1 query pattern that took
-    ~145s to import 120 transactions across 5 funds in testing (each
-    round-trip to Neon adds real network latency; 120 of them serialised
-    is what actually blew through Render's request timeout in
-    production, not casparser or the ingestion logic itself). Duplicate
-    detection now happens against an in-memory set built from one query."""
+    Duplicate detection is against an in-memory set, not a query per row
+    — the original per-row lookup was a real N+1 pattern that took ~145s
+    to import 120 transactions across 5 funds. The caller flushes once
+    for the whole statement and then calls _finalize_transactions, which
+    is where transaction_id becomes available; nothing here may read it.
+
+    The holding may itself be pending (no holding_id yet), so rows are
+    linked via the `holding` relationship rather than holding_id —
+    SQLAlchemy fills the foreign key in when it flushes the parent."""
     existing_rows = caches.transactions.get(holding.holding_id, [])
     existing_fingerprints = {_transaction_fingerprint(t) for t in existing_rows}
     added: list[Transaction] = []
@@ -298,7 +301,7 @@ def _persist_transactions(
         fingerprint = (*key, occurrence_index)
         if fingerprint not in existing_fingerprints:
             row = Transaction(
-                holding_id=holding.holding_id,
+                holding=holding,
                 date=_as_date(txn.date),
                 type=txn.type,
                 amount=txn.amount,
@@ -313,13 +316,19 @@ def _persist_transactions(
             session.add(row)
             added.append(row)
             existing_fingerprints.add(fingerprint)  # guards against a duplicate row within this same upload
-    session.flush()
-    # Sorted in memory rather than re-SELECTed. The re-read existed to
-    # return old + new rows in ledger order, but both halves are already
-    # in hand — the preloaded existing rows and the ones just added —
-    # and after the flush above the new ones have their generated ids.
-    # That removed one full round trip per scheme purely to fetch rows
-    # this process had just written.
+    return list(existing_rows), added
+
+
+def _finalize_transactions(
+    caches: _IngestCaches, holding: Holding,
+    existing_rows: list[Transaction], added: list[Transaction],
+) -> list[Transaction]:
+    """The full ledger for this holding in FIFO order, called after the
+    caller's single flush has assigned transaction_ids.
+
+    Assembled in memory rather than re-SELECTed: both halves are already
+    in hand, and re-reading rows this process just wrote cost a round
+    trip per scheme."""
     combined = list(existing_rows) + added
     # transaction_id is load-bearing in this sort key, not a tidy-up.
     # occurrence_index is only unique WITHIN a (date, type, amount,
@@ -340,26 +349,32 @@ def _persist_transactions(
     return combined
 
 
-def _rebuild_fifo(
-    session: Session, caches: _IngestCaches, holding: Holding, transactions: list[Transaction],
-) -> tuple[Decimal, dict]:
-    """Delete and recreate every lot/allocation for this holding from its
-    full transaction set — see module docstring for why full rebuild
-    rather than incremental patching."""
-    # Skipped entirely for a holding that has no lots yet — on the normal
-    # upload path (which wipes every table first) that is every holding,
-    # so these two DELETEs plus their flush were three round trips per
-    # scheme spent deleting nothing. caches.holdings_with_lots comes from
-    # one query up front; a holding is added to it below once it has lots,
-    # so a re-import within the same run still tears down correctly.
-    if holding.holding_id in caches.holdings_with_lots:
-        session.query(DisposalAllocation).filter(
-            DisposalAllocation.lot_id.in_(
-                select(PurchaseLot.lot_id).where(PurchaseLot.holding_id == holding.holding_id)
-            )
-        ).delete(synchronize_session=False)
-        session.query(PurchaseLot).filter(PurchaseLot.holding_id == holding.holding_id).delete(synchronize_session=False)
-        session.flush()
+def _teardown_existing_fifo(session: Session, holding_ids: list[int]) -> None:
+    """Drop lots and allocations for every holding being rebuilt, in two
+    statements for the whole statement rather than two per holding.
+
+    Only holdings that actually have lots are passed in — on the normal
+    upload path (which wipes every table first) that list is empty and
+    this is a no-op, where it used to be three round trips per scheme
+    spent deleting nothing."""
+    if not holding_ids:
+        return
+    session.query(DisposalAllocation).filter(
+        DisposalAllocation.lot_id.in_(
+            select(PurchaseLot.lot_id).where(PurchaseLot.holding_id.in_(holding_ids))
+        )
+    ).delete(synchronize_session=False)
+    session.query(PurchaseLot).filter(PurchaseLot.holding_id.in_(holding_ids)).delete(synchronize_session=False)
+    session.flush()
+
+
+def _stage_fifo_lots(
+    session: Session, holding: Holding, transactions: list[Transaction],
+):
+    """Run FIFO for one holding and add its PurchaseLot rows WITHOUT
+    flushing. Returns (fifo_result, lot_rows, derived_closing_units) so
+    the caller can stage every holding's lots first, flush once to get
+    lot_ids, and only then create allocations."""
 
     # casparser signs units/amount by cash-flow direction (a REDEMPTION's
     # units and amount are both negative) — fifo.py's model wants plain
@@ -418,7 +433,7 @@ def _rebuild_fifo(
     lot_rows: list[PurchaseLot] = []
     for lot in result.lots:
         row = PurchaseLot(
-            holding_id=holding.holding_id, transaction_id=lot.transaction_id,
+            holding=holding, transaction_id=lot.transaction_id,
             acquired_date=lot.acquired_date, original_units=lot.original_units,
             remaining_units=lot.remaining_units, purchase_nav=lot.purchase_nav,
             purchase_amount=lot.purchase_amount, remaining_cost=lot.remaining_cost,
@@ -426,8 +441,15 @@ def _rebuild_fifo(
         )
         session.add(row)
         lot_rows.append(row)
-    session.flush()
 
+    derived_closing_units = sum((l.remaining_units for l in lot_rows), Decimal("0"))
+    return result, lot_rows, derived_closing_units
+
+
+def _stage_fifo_allocations(session: Session, result, lot_rows: list[PurchaseLot]) -> None:
+    """Create one holding's DisposalAllocation rows. Called only after
+    the caller has flushed every holding's lots, since each allocation
+    needs its lot's generated lot_id."""
     for alloc in result.allocations:
         session.add(DisposalAllocation(
             disposal_transaction_id=alloc.disposal_transaction_id,
@@ -435,15 +457,6 @@ def _rebuild_fifo(
             allocated_units=alloc.allocated_units, allocated_cost=alloc.allocated_cost,
             sale_value=alloc.sale_value, realized_gain=alloc.realized_gain, sold_date=alloc.sold_date,
         ))
-    session.flush()
-
-    if lot_rows:
-        # This holding now has lots, so a later rebuild in the same run
-        # must do the teardown skipped above.
-        caches.holdings_with_lots.add(holding.holding_id)
-
-    derived_closing_units = sum((l.remaining_units for l in lot_rows), Decimal("0"))
-    return derived_closing_units, result.shortfalls
 
 
 async def ingest_cas(
@@ -497,6 +510,19 @@ async def ingest_cas(
         )
         _precreate_folios(session, caches, parsed, investor_id)
 
+    # Restructured into passes, and the reason is round trips. Doing all
+    # of this per scheme meant a session.flush() per holding, per
+    # transaction batch, and twice per FIFO rebuild — each one its own
+    # ~300ms trip to Neon purely to obtain generated ids. Measured on a
+    # real 65-scheme statement, ~356 of the remaining 431 trips were
+    # these flushes. Grouping the work so every holding is inserted in
+    # one flush, every transaction in the next, and lots/allocations in
+    # two more turns ~356 trips into 4, because SQLAlchemy emits one
+    # multi-row INSERT ... RETURNING per flush regardless of how many
+    # rows are pending.
+    #
+    # Pass 1: resolve schemes and stage holdings (no ids needed yet).
+    work: list[dict] = []
     for folio in parsed.folios:
         with timer.phase("folio_upsert"):
             folio_row = _get_or_create_folio(session, caches, investor_id, folio.folio, folio.amc)
@@ -510,75 +536,124 @@ async def ingest_cas(
                     cas_rta_code=scheme.rta_code, plan=plan, option=option, asset_class=asset_class,
                     prefetched_mfapi=prefetched_mfapi, scheme_cache=caches.schemes_by_isin,
                 )
-            with timer.phase("holding_upsert"):
-                holding = _get_or_create_holding(
+            with timer.phase("stage_holdings"):
+                holding = _stage_holding(
                     session, caches, folio_row.folio_id, resolution.scheme.scheme_id, plan, option, scheme.advisor,
                 )
+            work.append({
+                "scheme": scheme, "resolution": resolution, "holding": holding,
+            })
 
-            with timer.phase("persist_transactions"):
-                transactions = _persist_transactions(session, caches, holding, scheme, upload.upload_id)
-            with timer.phase("rebuild_fifo"):
-                derived_closing_units, shortfalls = _rebuild_fifo(session, caches, holding, transactions)
+    # One flush for every holding in the statement, assigning holding_id.
+    with timer.phase("flush_holdings"):
+        session.flush()
 
-            delta = (scheme.close or Decimal("0")) - derived_closing_units
-            has_lot_creating_txn = any(t.type in LOT_CREATING_TYPES for t in transactions)
-            opening_nonzero_no_history = (scheme.open or Decimal("0")) != 0 and not has_lot_creating_txn
+    # Pass 2: stage transactions for every holding, then one flush to
+    # assign transaction_ids (which FIFO's lots reference).
+    for item in work:
+        with timer.phase("stage_transactions"):
+            item["existing_txns"], item["added_txns"] = _stage_transactions(
+                session, caches, item["holding"], item["scheme"], upload.upload_id,
+            )
+    with timer.phase("flush_transactions"):
+        session.flush()
 
-            # Distinct spec-17 error codes, not one generic "review_required"
-            # bucket — SCHEME_UNRESOLVED/FIFO_SHORTFALL/
-            # CAS_RECONCILIATION_FAILED each mean a different thing to a
-            # consumer of this API and need to stay distinguishable.
-            code = None
-            if resolution.confidence == "needs_review":
-                holding.reconciliation_status = "review_required"
-                code = "SCHEME_UNRESOLVED"
-                detail = f"Scheme identity not confirmed by ISIN (method={resolution.method}) — needs manual mapping."
-            elif shortfalls:
-                holding.reconciliation_status = "review_required"
-                code = "FIFO_SHORTFALL"
-                detail = f"Disposal(s) sold more units than known lots covered ({shortfalls})."
-            elif opening_nonzero_no_history:
-                holding.reconciliation_status = "incomplete_opening_history"
-                code = "INCOMPLETE_OPENING_HISTORY"
-                detail = (
-                    f"Opening balance of {scheme.open} units has no purchase history in any imported "
-                    "CAS — cost basis, XIRR and gains are unavailable for this holding (spec 6.5)."
+    for item in work:
+        item["transactions"] = _finalize_transactions(
+            caches, item["holding"], item["existing_txns"], item["added_txns"],
+        )
+
+    # Pass 3: rebuild FIFO. Teardown for every holding that already had
+    # lots happens in one pair of statements, then every holding's lots
+    # are staged and flushed together, and only then can allocations be
+    # created — each needs its lot's generated lot_id.
+    with timer.phase("fifo_teardown"):
+        _teardown_existing_fifo(
+            session,
+            [i["holding"].holding_id for i in work if i["holding"].holding_id in caches.holdings_with_lots],
+        )
+    for item in work:
+        with timer.phase("stage_fifo_lots"):
+            item["fifo"], item["lot_rows"], item["derived_units"] = _stage_fifo_lots(
+                session, item["holding"], item["transactions"],
+            )
+    with timer.phase("flush_lots"):
+        session.flush()
+    for item in work:
+        with timer.phase("stage_fifo_allocations"):
+            _stage_fifo_allocations(session, item["fifo"], item["lot_rows"])
+        if item["lot_rows"]:
+            caches.holdings_with_lots.add(item["holding"].holding_id)
+    with timer.phase("flush_allocations"):
+        session.flush()
+
+    # Pass 4: reconciliation verdicts and NAV, now that everything the
+    # verdict depends on exists.
+    for item in work:
+        scheme, resolution = item["scheme"], item["resolution"]
+        holding, transactions = item["holding"], item["transactions"]
+        derived_closing_units = item["derived_units"]
+        shortfalls = item["fifo"].shortfalls
+
+        delta = (scheme.close or Decimal("0")) - derived_closing_units
+        has_lot_creating_txn = any(t.type in LOT_CREATING_TYPES for t in transactions)
+        opening_nonzero_no_history = (scheme.open or Decimal("0")) != 0 and not has_lot_creating_txn
+
+        # Distinct spec-17 error codes, not one generic "review_required"
+        # bucket — SCHEME_UNRESOLVED/FIFO_SHORTFALL/
+        # CAS_RECONCILIATION_FAILED each mean a different thing to a
+        # consumer of this API and need to stay distinguishable.
+        code = None
+        if resolution.confidence == "needs_review":
+            holding.reconciliation_status = "review_required"
+            code = "SCHEME_UNRESOLVED"
+            detail = f"Scheme identity not confirmed by ISIN (method={resolution.method}) — needs manual mapping."
+        elif shortfalls:
+            holding.reconciliation_status = "review_required"
+            code = "FIFO_SHORTFALL"
+            detail = f"Disposal(s) sold more units than known lots covered ({shortfalls})."
+        elif opening_nonzero_no_history:
+            holding.reconciliation_status = "incomplete_opening_history"
+            code = "INCOMPLETE_OPENING_HISTORY"
+            detail = (
+                f"Opening balance of {scheme.open} units has no purchase history in any imported "
+                "CAS — cost basis, XIRR and gains are unavailable for this holding (spec 6.5)."
+            )
+        elif abs(delta) > RECONCILIATION_TOLERANCE:
+            holding.reconciliation_status = "review_required"
+            code = "CAS_RECONCILIATION_FAILED"
+            detail = f"Derived units ({derived_closing_units}) vs CAS-printed close ({scheme.close}): delta {delta}"
+        else:
+            holding.reconciliation_status = "reconciled"
+            detail = None
+
+        holding.data_quality_code = code
+        holding.data_quality_detail = detail
+
+        result.holdings.append(HoldingIngestNote(
+            holding_id=holding.holding_id, scheme_name=scheme.scheme,
+            status=holding.reconciliation_status, detail=detail,
+        ))
+
+        # Keep the NAV history that prefetch_mfapi_schemes ALREADY
+        # downloaded for this scheme. Each of those responses carries
+        # the fund's entire NAV series (~5,000 points, ~500KB), but
+        # resolution only ever reads `meta` to confirm an ISIN and
+        # then throws the rest away — so enrichment, minutes later,
+        # re-downloaded the exact same ~27MB across the portfolio.
+        # That doubled both the wall time and, worse, the request
+        # load on a host measured to rate-limit hard under exactly
+        # this traffic (502s, then refused connections, then a ~225s
+        # lockout), which is the root cause of enrichment's
+        # "different schemes fail each run" behaviour. Storing it
+        # here costs nothing extra — we already paid for the bytes.
+        raw = prefetched_mfapi.get(scheme.amfi) if scheme.amfi else None
+        if raw:
+            with timer.phase("store_nav_history"):
+                _store_prefetched_nav_history(
+                    session, resolution.scheme.scheme_id, raw,
+                    stored_summary=nav_summaries.get(resolution.scheme.scheme_id),
                 )
-            elif abs(delta) > RECONCILIATION_TOLERANCE:
-                holding.reconciliation_status = "review_required"
-                code = "CAS_RECONCILIATION_FAILED"
-                detail = f"Derived units ({derived_closing_units}) vs CAS-printed close ({scheme.close}): delta {delta}"
-            else:
-                holding.reconciliation_status = "reconciled"
-                detail = None
-
-            holding.data_quality_code = code
-            holding.data_quality_detail = detail
-
-            result.holdings.append(HoldingIngestNote(
-                holding_id=holding.holding_id, scheme_name=scheme.scheme,
-                status=holding.reconciliation_status, detail=detail,
-            ))
-
-            # Keep the NAV history that prefetch_mfapi_schemes ALREADY
-            # downloaded for this scheme. Each of those responses carries
-            # the fund's entire NAV series (~5,000 points, ~500KB), but
-            # resolution only ever reads `meta` to confirm an ISIN and
-            # then throws the rest away — so enrichment, minutes later,
-            # re-downloaded the exact same ~27MB across the portfolio.
-            # That doubled both the wall time and, worse, the request
-            # load on a host measured to rate-limit hard under exactly
-            # this traffic (502s, then refused connections, then a ~225s
-            # lockout), which is the root cause of enrichment's
-            # "different schemes fail each run" behaviour. Storing it
-            # here costs nothing extra — we already paid for the bytes.
-            raw = prefetched_mfapi.get(scheme.amfi) if scheme.amfi else None
-            if raw:
-                with timer.phase("store_nav_history"):
-                    _store_prefetched_nav_history(
-                        session, resolution.scheme.scheme_id, raw,
-                        stored_summary=nav_summaries.get(resolution.scheme.scheme_id),
-                    )
 
     logger.info("ingest_cas timing: %s", timer.summary())
 
