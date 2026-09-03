@@ -367,6 +367,13 @@ async def refresh_enrichment(session: Session, schemes: list[Scheme], on_stage=N
             history = stored_histories.get(s.scheme_id)
             if history:
                 target["nav_history"] = history
+            # Carry forward a category we already learned. It's stable
+            # fund metadata, and knowing it lets _enrich_one skip the
+            # small /latest metadata fetch it would otherwise make when
+            # NAV comes from cache.
+            previous = existing_rows.get(s.scheme_id)
+            if previous is not None and (previous.payload or {}).get("category"):
+                target["category"] = previous.payload["category"]
             targets.append(target)
         _stage(f"fetching_{batch_start + len(batch)}_of_{len(to_fetch)}_schemes")
         results = await enrichment.enrich_schemes(targets)  # {amfi_code: payload}

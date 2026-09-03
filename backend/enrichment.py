@@ -678,14 +678,21 @@ async def _enrich_one(
     client: httpx.AsyncClient, amfi_code: str, isin: Optional[str], scheme_name: str,
     benchmark_nav_history: Optional[list[dict]] = None,
     cached_nav_history: Optional[list[dict]] = None,
+    known_category: Optional[str] = None,
 ) -> dict:
     """cached_nav_history: this scheme's NAV history already held in our
     own database, oldest-first, same shape _extract_mfapi_nav_history
     produces. When it's present and current, the whole mfapi.in history
-    fetch is skipped — see the comment at the fetch below."""
+    fetch is skipped — see the comment at the fetch below.
+
+    known_category: this scheme's category from a previous enrichment.
+    Category is stable fund metadata, so carrying it forward avoids
+    re-fetching it once it has been learned."""
     sources_used = []
 
     fields = dict(ENRICHED_FIELD_DEFAULTS)
+    if known_category:
+        fields["category"] = known_category
     fields["returns"] = dict(ENRICHED_FIELD_DEFAULTS["returns"])
     fields["risk"] = dict(ENRICHED_FIELD_DEFAULTS["risk"])
     if MFDATA_ENABLED:
@@ -711,6 +718,19 @@ async def _enrich_one(
     if cached_nav_history and not _is_stale(cached_nav_history[-1]["date"]):
         nav_history = cached_nav_history
         sources_used.append("nav_cache")
+        # Serving NAV from cache skips the full fetch — but `meta` came
+        # with that fetch, and it is the only source of scheme_category.
+        # Caught by auditing the result of the caching work: 28 schemes
+        # enriched purely from nav_cache, and 30 of 53 ended up with no
+        # category at all, blanking that column on the Fund Summary page.
+        # /latest carries the identical meta block for 369 bytes against
+        # the full history's 199,604 (a 540x saving), so the category is
+        # recovered without reinstating the download this cache exists to
+        # avoid. Skipped entirely when the caller already knows the
+        # category from a previous run, so this costs one small request
+        # per scheme once, not on every enrichment.
+        if not fields.get("category"):
+            mfapi_raw = await _fetch_json_retrying(client, f"{MFAPI_BASE}/{amfi_code}/latest")
     else:
         mfapi_raw = await _fetch_json_retrying(client, f"{MFAPI_BASE}/{amfi_code}")
         nav_history = _extract_mfapi_nav_history(mfapi_raw) if mfapi_raw else []
@@ -901,6 +921,7 @@ async def enrich_schemes(schemes: list[dict]) -> dict[str, dict]:
                 async with semaphore:
                     return await _enrich_one(
                         client, s["amfi"], s.get("isin"), s.get("scheme", ""), benchmark_nav_history,
+                        known_category=s.get("category"),
                         cached_nav_history=s.get("nav_history"),
                     )
 
