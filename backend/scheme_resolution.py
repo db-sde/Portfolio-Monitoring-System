@@ -90,6 +90,7 @@ async def _fetch_mfapi_scheme(client: httpx.AsyncClient, code: str) -> Optional[
 def _find_or_create_canonical_scheme(
     session: Session, isin: Optional[str], amfi_code: Optional[str], name: str,
     plan: Optional[str], option: Optional[str], asset_class: Optional[str],
+    scheme_cache: Optional[dict] = None,
 ) -> Scheme:
     """Every path in resolve_scheme() that confirms an identity ends up
     here: find the existing canonical row for this ISIN, or create one.
@@ -98,7 +99,7 @@ def _find_or_create_canonical_scheme(
     recode, unlike the AMFI code itself."""
     scheme = None
     if isin:
-        scheme = session.execute(select(Scheme).where(Scheme.isin == isin)).scalar_one_or_none()
+        scheme = _scheme_by_isin(session, isin, scheme_cache)
     if scheme is None:
         scheme = Scheme(
             isin=isin, amfi_code=amfi_code, name=name, plan=plan, option=option,
@@ -106,6 +107,8 @@ def _find_or_create_canonical_scheme(
         )
         session.add(scheme)
         session.flush()  # assigns scheme_id
+        if scheme_cache is not None and isin:
+            scheme_cache[isin] = scheme
     elif amfi_code and scheme.amfi_code != amfi_code:
         # Same fund (same ISIN), but the CAS/mfapi code moved — update
         # the canonical row's own amfi_code to the current one and let
@@ -113,6 +116,30 @@ def _find_or_create_canonical_scheme(
         # scheme's primary identifier going forward.
         scheme.amfi_code = amfi_code
     return scheme
+
+
+def _scheme_by_isin(session: Session, isin: str, scheme_cache: Optional[dict]) -> Optional[Scheme]:
+    """ISIN -> canonical Scheme, from the caller's cache when it supplied
+    one. Importing a real statement calls this once per scheme, and each
+    miss is a full round trip to Neon (~300ms measured) asking a question
+    the caller can answer for the whole portfolio in a single query —
+    and on the normal upload path, which wipes every table first, the
+    answer is always "no such scheme" until this import creates it."""
+    if scheme_cache is not None:
+        if isin in scheme_cache:
+            return scheme_cache[isin]
+        return None
+    return session.execute(select(Scheme).where(Scheme.isin == isin)).scalar_one_or_none()
+
+
+def build_scheme_cache(session: Session) -> dict[str, Scheme]:
+    """Every existing scheme keyed by ISIN, in one query — see
+    _scheme_by_isin. Kept in this module so the cache's shape and the
+    lookup that reads it stay defined together."""
+    return {
+        s.isin: s
+        for s in session.execute(select(Scheme).where(Scheme.isin.isnot(None))).scalars()
+    }
 
 
 async def prefetch_mfapi_schemes(client: httpx.AsyncClient, amfi_codes: list[str]) -> dict[str, Optional[dict]]:
@@ -149,6 +176,7 @@ async def resolve_scheme(
     option: Optional[str] = None,
     asset_class: Optional[str] = None,
     prefetched_mfapi: Optional[dict[str, Optional[dict]]] = None,
+    scheme_cache: Optional[dict] = None,
 ) -> ResolutionResult:
     """Priority order exactly as spec 5.1 lists it. Every branch that
     succeeds persists what it learned (scheme row + alias row) so the
@@ -164,7 +192,7 @@ async def resolve_scheme(
 
     # 1. ISIN exact match.
     if cas_isin:
-        existing = session.execute(select(Scheme).where(Scheme.isin == cas_isin)).scalar_one_or_none()
+        existing = _scheme_by_isin(session, cas_isin, scheme_cache)
         if existing:
             return ResolutionResult(existing, "isin_exact", "confirmed")
 
@@ -190,6 +218,7 @@ async def resolve_scheme(
             if is_fresh and (not cas_isin or mfapi_isin == cas_isin):
                 scheme = _find_or_create_canonical_scheme(
                     session, cas_isin or mfapi_isin, cas_amfi_code, cas_scheme_name, plan, option, asset_class,
+                    scheme_cache=scheme_cache,
                 )
                 return ResolutionResult(scheme, "amfi_validated", "confirmed")
             # AMFI code returned data but it's stale (frozen NAV) or its
@@ -236,6 +265,7 @@ async def resolve_scheme(
                     continue
                 scheme = _find_or_create_canonical_scheme(
                     session, cas_isin, str(code), cas_scheme_name, plan, option, asset_class,
+                    scheme_cache=scheme_cache,
                 )
                 if cas_amfi_code and cas_amfi_code != str(code):
                     session.add(SchemeAlias(
@@ -263,4 +293,6 @@ async def resolve_scheme(
     )
     session.add(scheme)
     session.flush()
+    if scheme_cache is not None and cas_isin:
+        scheme_cache[cas_isin] = scheme
     return ResolutionResult(scheme, "unresolved", "needs_review")

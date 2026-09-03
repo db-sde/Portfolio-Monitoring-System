@@ -20,6 +20,9 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import time
+from collections import defaultdict
+from contextlib import contextmanager
 from dataclasses import dataclass, field
 from datetime import date, datetime
 from decimal import Decimal
@@ -33,13 +36,49 @@ import enrichment
 import nav_service
 from fifo import DISPOSAL_TYPES, LOT_CREATING_TYPES, NON_TAXABLE_REDUCTION_TYPES, LotInput, run_fifo
 from models import (
-    CasUpload, DisposalAllocation, Folio, Holding, PurchaseLot, Transaction,
+    CasUpload, DisposalAllocation, Folio, Holding, NavCache, PurchaseLot, Transaction,
 )
-from scheme_resolution import prefetch_mfapi_schemes, resolve_scheme
+from scheme_resolution import build_scheme_cache, prefetch_mfapi_schemes, resolve_scheme
 
 logger = logging.getLogger("portfolioiq")
 
 RECONCILIATION_TOLERANCE = Decimal("0.001")  # units; casparser's own Decimal rounding noise floor
+
+
+class PhaseTimer:
+    """Accumulates wall time per named phase and logs one summary line.
+
+    An import is a loop over ~100 schemes doing five different kinds of
+    work, and "the upload is slow" is not actionable without knowing
+    which of them the time is in. Guessing has been wrong repeatedly on
+    this pipeline — the last round assumed enrichment was the cost when
+    the job timestamps actually put 6m46s in parse+ingest — so this
+    measures instead. One aggregated line at the end rather than
+    per-scheme logging, which at this loop count would be noise.
+    """
+
+    def __init__(self) -> None:
+        self.totals: dict[str, float] = defaultdict(float)
+        self.counts: dict[str, int] = defaultdict(int)
+        self._start = time.perf_counter()
+
+    @contextmanager
+    def phase(self, name: str):
+        t0 = time.perf_counter()
+        try:
+            yield
+        finally:
+            self.totals[name] += time.perf_counter() - t0
+            self.counts[name] += 1
+
+    def summary(self) -> str:
+        total = time.perf_counter() - self._start
+        parts = [
+            f"{name}={self.totals[name]:.1f}s(x{self.counts[name]})"
+            for name in sorted(self.totals, key=lambda n: -self.totals[n])
+        ]
+        accounted = sum(self.totals.values())
+        return f"total={total:.1f}s " + " ".join(parts) + f" unaccounted={total - accounted:.1f}s"
 
 
 @dataclass
@@ -73,13 +112,20 @@ def _asset_class(scheme_type: Optional[str]) -> str:
     return t if t in ("EQUITY", "DEBT") else "OTHER"
 
 
-def _store_prefetched_nav_history(session: Session, scheme_id: int, raw: dict) -> None:
+def _store_prefetched_nav_history(
+    session: Session, scheme_id: int, raw: dict, stored_summary=None,
+) -> None:
     """Persist the NAV series out of an mfapi.in response we already
     fetched for scheme resolution (see the call site for why). Failure
     here is deliberately swallowed: this is a pure head start for
     enrichment, which re-fetches anything missing on its own, so a
     problem storing it must never be able to fail an otherwise-good
-    CAS import."""
+    CAS import.
+
+    stored_summary is passed in by the caller, which loads every
+    scheme's summary in one query. It used to be looked up here, per
+    scheme — one more round trip each, and on the wipe-then-ingest path
+    every one of them returned nothing."""
     try:
         points = []
         for row in enrichment._extract_mfapi_nav_history(raw):
@@ -87,36 +133,97 @@ def _store_prefetched_nav_history(session: Session, scheme_id: int, raw: dict) -
             if d is not None:
                 points.append((d, Decimal(str(row["nav"]))))
         if points:
-            summary = nav_service.get_stored_nav_summary(session, [scheme_id]).get(scheme_id)
-            nav_service.store_nav_points(session, scheme_id, points, stored_summary=summary)
+            nav_service.store_nav_points(session, scheme_id, points, stored_summary=stored_summary)
     except Exception:
         logger.exception("Could not store prefetched NAV history for scheme_id=%s", scheme_id)
 
 
-def _get_or_create_folio(session: Session, investor_id: Optional[int], folio_number: str, amc: str) -> Folio:
-    normalized = (folio_number or "").strip()
-    existing = session.execute(
-        select(Folio).where(
-            Folio.investor_id == investor_id, Folio.normalized_folio == normalized, Folio.amc == amc,
+class _IngestCaches:
+    """Every "does this row already exist?" lookup in the import loop,
+    answered once up front instead of once per folio/scheme.
+
+    Measured on a real 65-scheme statement: ingest spent 284 of its 305
+    seconds inside psycopg, across 973 round trips averaging 292ms. The
+    cost is the NUMBER of trips to Neon, not the data — the same finding
+    that dominated enrichment. Roughly 400 of those trips were these
+    existence checks, and on the normal upload path every one of them is
+    guaranteed to miss: _replace_and_ingest_sync wipes all these tables
+    immediately before calling ingest_cas, so the loop was asking, once
+    per scheme, a question whose answer is always "nothing here".
+
+    Preloading keeps the answer correct in BOTH cases — an empty
+    database (the wipe path) and a populated one (re-importing an
+    overlapping CAS, which must still dedupe by fingerprint) — because
+    the caches are seeded from the same queries the per-row lookups ran,
+    and are updated as new rows are created so later iterations see
+    earlier ones.
+    """
+
+    def __init__(self, session: Session) -> None:
+        self.folios: dict[tuple, Folio] = {
+            (f.investor_id, f.normalized_folio, f.amc): f
+            for f in session.execute(select(Folio)).scalars()
+        }
+        self.holdings: dict[tuple, Holding] = {
+            (h.folio_id, h.scheme_id, h.plan, h.option): h
+            for h in session.execute(select(Holding)).scalars()
+        }
+        self.schemes_by_isin = build_scheme_cache(session)
+        self.transactions: dict[int, list[Transaction]] = defaultdict(list)
+        for txn in session.execute(select(Transaction)).scalars():
+            self.transactions[txn.holding_id].append(txn)
+        # Holdings that already had lots before this import. Only these
+        # need the FIFO teardown; for a brand-new holding those two
+        # DELETEs can only ever match zero rows.
+        self.holdings_with_lots: set[int] = set(
+            session.execute(select(PurchaseLot.holding_id).distinct()).scalars()
         )
-    ).scalar_one_or_none()
+
+
+def _precreate_folios(session: Session, caches: _IngestCaches, parsed, investor_id: Optional[int]) -> None:
+    """Create every folio the statement mentions in ONE flush.
+
+    Each folio is an INSERT whose generated id the holdings below need,
+    and the obvious way to write that — add, flush, repeat — costs a
+    round trip per folio (31 of them, ~10s, on a real statement). The
+    ids are only needed once the scheme loop starts, and every folio is
+    known before it does, so they can all be inserted together:
+    SQLAlchemy sends one multi-row INSERT ... RETURNING and populates
+    every id from it."""
+    for folio in parsed.folios:
+        key = (investor_id, (folio.folio or "").strip(), folio.amc)
+        if key in caches.folios:
+            continue
+        row = Folio(investor_id=investor_id, normalized_folio=key[1], amc=key[2])
+        session.add(row)
+        caches.folios[key] = row
+    session.flush()
+
+
+def _get_or_create_folio(
+    session: Session, caches: _IngestCaches, investor_id: Optional[int], folio_number: str, amc: str,
+) -> Folio:
+    normalized = (folio_number or "").strip()
+    key = (investor_id, normalized, amc)
+    existing = caches.folios.get(key)
     if existing:
         return existing
+    # Fallback for a folio _precreate_folios didn't see. Kept so this
+    # stays correct if called outside that flow rather than silently
+    # depending on the pre-pass having run.
     folio = Folio(investor_id=investor_id, normalized_folio=normalized, amc=amc)
     session.add(folio)
     session.flush()
+    caches.folios[key] = folio
     return folio
 
 
 def _get_or_create_holding(
-    session: Session, folio_id: int, scheme_id: int, plan: str, option: str, advisor_arn: Optional[str],
+    session: Session, caches: _IngestCaches, folio_id: int, scheme_id: int,
+    plan: str, option: str, advisor_arn: Optional[str],
 ) -> Holding:
-    existing = session.execute(
-        select(Holding).where(
-            Holding.folio_id == folio_id, Holding.scheme_id == scheme_id,
-            Holding.plan == plan, Holding.option == option,
-        )
-    ).scalar_one_or_none()
+    key = (folio_id, scheme_id, plan, option)
+    existing = caches.holdings.get(key)
     if existing:
         if advisor_arn and not existing.advisor_arn:
             existing.advisor_arn = advisor_arn
@@ -125,7 +232,8 @@ def _get_or_create_holding(
         folio_id=folio_id, scheme_id=scheme_id, plan=plan, option=option, advisor_arn=advisor_arn,
     )
     session.add(holding)
-    session.flush()
+    session.flush()  # assigns holding_id, which transactions/lots need
+    caches.holdings[key] = holding
     return holding
 
 
@@ -161,7 +269,9 @@ def _transaction_fingerprint(t) -> tuple:
     return (t.date, t.type, t.amount, t.units, t.nav, t.occurrence_index)
 
 
-def _persist_transactions(session: Session, holding: Holding, scheme, upload_id: int) -> list[Transaction]:
+def _persist_transactions(
+    session: Session, caches: _IngestCaches, holding: Holding, scheme, upload_id: int,
+) -> list[Transaction]:
     """Insert any transaction rows not already present (by fingerprint),
     and return the FULL set for this holding (old + new) so FIFO always
     runs against the complete ledger, not just this upload's rows.
@@ -173,10 +283,9 @@ def _persist_transactions(session: Session, holding: Holding, scheme, upload_id:
     is what actually blew through Render's request timeout in
     production, not casparser or the ingestion logic itself). Duplicate
     detection now happens against an in-memory set built from one query."""
-    existing_rows = list(session.execute(
-        select(Transaction).where(Transaction.holding_id == holding.holding_id)
-    ).scalars())
+    existing_rows = caches.transactions.get(holding.holding_id, [])
     existing_fingerprints = {_transaction_fingerprint(t) for t in existing_rows}
+    added: list[Transaction] = []
 
     # occurrence_index disambiguates genuinely-identical same-day rows
     # (spec 6.3) — counted per (date, type, amount, units, nav) group,
@@ -188,7 +297,7 @@ def _persist_transactions(session: Session, holding: Holding, scheme, upload_id:
         seen_keys[key] = occurrence_index + 1
         fingerprint = (*key, occurrence_index)
         if fingerprint not in existing_fingerprints:
-            session.add(Transaction(
+            row = Transaction(
                 holding_id=holding.holding_id,
                 date=_as_date(txn.date),
                 type=txn.type,
@@ -200,25 +309,57 @@ def _persist_transactions(session: Session, holding: Holding, scheme, upload_id:
                 gift_folio=txn.gift_folio,
                 source_upload_id=upload_id,
                 occurrence_index=occurrence_index,
-            ))
+            )
+            session.add(row)
+            added.append(row)
             existing_fingerprints.add(fingerprint)  # guards against a duplicate row within this same upload
     session.flush()
-    return list(session.execute(
-        select(Transaction).where(Transaction.holding_id == holding.holding_id).order_by(Transaction.date, Transaction.occurrence_index)
-    ).scalars())
+    # Sorted in memory rather than re-SELECTed. The re-read existed to
+    # return old + new rows in ledger order, but both halves are already
+    # in hand — the preloaded existing rows and the ones just added —
+    # and after the flush above the new ones have their generated ids.
+    # That removed one full round trip per scheme purely to fetch rows
+    # this process had just written.
+    combined = list(existing_rows) + added
+    # transaction_id is load-bearing in this sort key, not a tidy-up.
+    # occurrence_index is only unique WITHIN a (date, type, amount,
+    # units, nav) group, so two different transactions on the same date
+    # routinely both carry occurrence_index 0 — ordering by (date,
+    # occurrence_index) alone leaves those ties to be broken by whatever
+    # order they happen to be in. FIFO consumes lots in the order it
+    # receives them, so a different tie-break silently produces
+    # different lot-to-disposal matching, and therefore different
+    # realized gains: caught by diffing a real portfolio's
+    # disposal_allocations before and after this change, where one
+    # sold_date's allocations came out with different cost bases.
+    # transaction_id reflects insertion order, which is casparser's own
+    # ledger order and what the previous SELECT ... ORDER BY returned in
+    # practice, so this both fixes the ordering and keeps it stable.
+    combined.sort(key=lambda t: (t.date, t.occurrence_index, t.transaction_id))
+    caches.transactions[holding.holding_id] = combined
+    return combined
 
 
-def _rebuild_fifo(session: Session, holding: Holding, transactions: list[Transaction]) -> tuple[Decimal, dict]:
+def _rebuild_fifo(
+    session: Session, caches: _IngestCaches, holding: Holding, transactions: list[Transaction],
+) -> tuple[Decimal, dict]:
     """Delete and recreate every lot/allocation for this holding from its
     full transaction set — see module docstring for why full rebuild
     rather than incremental patching."""
-    session.query(DisposalAllocation).filter(
-        DisposalAllocation.lot_id.in_(
-            select(PurchaseLot.lot_id).where(PurchaseLot.holding_id == holding.holding_id)
-        )
-    ).delete(synchronize_session=False)
-    session.query(PurchaseLot).filter(PurchaseLot.holding_id == holding.holding_id).delete(synchronize_session=False)
-    session.flush()
+    # Skipped entirely for a holding that has no lots yet — on the normal
+    # upload path (which wipes every table first) that is every holding,
+    # so these two DELETEs plus their flush were three round trips per
+    # scheme spent deleting nothing. caches.holdings_with_lots comes from
+    # one query up front; a holding is added to it below once it has lots,
+    # so a re-import within the same run still tears down correctly.
+    if holding.holding_id in caches.holdings_with_lots:
+        session.query(DisposalAllocation).filter(
+            DisposalAllocation.lot_id.in_(
+                select(PurchaseLot.lot_id).where(PurchaseLot.holding_id == holding.holding_id)
+            )
+        ).delete(synchronize_session=False)
+        session.query(PurchaseLot).filter(PurchaseLot.holding_id == holding.holding_id).delete(synchronize_session=False)
+        session.flush()
 
     # casparser signs units/amount by cash-flow direction (a REDEMPTION's
     # units and amount are both negative) — fifo.py's model wants plain
@@ -296,6 +437,11 @@ def _rebuild_fifo(session: Session, holding: Holding, transactions: list[Transac
         ))
     session.flush()
 
+    if lot_rows:
+        # This holding now has lots, so a later rebuild in the same run
+        # must do the teardown skipped above.
+        caches.holdings_with_lots.add(holding.holding_id)
+
     derived_closing_units = sum((l.remaining_units for l in lot_rows), Decimal("0"))
     return derived_closing_units, result.shortfalls
 
@@ -337,25 +483,42 @@ async def ingest_cas(
     # own per-call latency, 1-15s and highly variable); prefetching
     # collapses that to roughly the single slowest call instead of their sum.
     all_amfi_codes = [s.amfi for folio in parsed.folios for s in folio.schemes if s.amfi]
-    prefetched_mfapi = await prefetch_mfapi_schemes(client, all_amfi_codes)
+    timer = PhaseTimer()
+    with timer.phase("mfapi_prefetch"):
+        prefetched_mfapi = await prefetch_mfapi_schemes(client, all_amfi_codes)
+    with timer.phase("preload_caches"):
+        caches = _IngestCaches(session)
+        # Every stored-NAV summary in one aggregate query rather than one
+        # per scheme inside the loop. Scoped to schemes that actually
+        # have NAV rows; a scheme this import creates simply misses,
+        # which is correct — a brand-new scheme has no stored history.
+        nav_summaries = nav_service.get_stored_nav_summary(
+            session, list(session.execute(select(NavCache.scheme_id).distinct()).scalars())
+        )
+        _precreate_folios(session, caches, parsed, investor_id)
 
     for folio in parsed.folios:
-        folio_row = _get_or_create_folio(session, investor_id, folio.folio, folio.amc)
+        with timer.phase("folio_upsert"):
+            folio_row = _get_or_create_folio(session, caches, investor_id, folio.folio, folio.amc)
         for scheme in folio.schemes:
             plan, option = _derive_plan_option(scheme.scheme)
             asset_class = _asset_class(scheme.type)
-            resolution = await resolve_scheme(
-                session, client,
-                cas_isin=scheme.isin, cas_amfi_code=scheme.amfi, cas_scheme_name=scheme.scheme,
-                cas_rta_code=scheme.rta_code, plan=plan, option=option, asset_class=asset_class,
-                prefetched_mfapi=prefetched_mfapi,
-            )
-            holding = _get_or_create_holding(
-                session, folio_row.folio_id, resolution.scheme.scheme_id, plan, option, scheme.advisor,
-            )
+            with timer.phase("resolve_scheme"):
+                resolution = await resolve_scheme(
+                    session, client,
+                    cas_isin=scheme.isin, cas_amfi_code=scheme.amfi, cas_scheme_name=scheme.scheme,
+                    cas_rta_code=scheme.rta_code, plan=plan, option=option, asset_class=asset_class,
+                    prefetched_mfapi=prefetched_mfapi, scheme_cache=caches.schemes_by_isin,
+                )
+            with timer.phase("holding_upsert"):
+                holding = _get_or_create_holding(
+                    session, caches, folio_row.folio_id, resolution.scheme.scheme_id, plan, option, scheme.advisor,
+                )
 
-            transactions = _persist_transactions(session, holding, scheme, upload.upload_id)
-            derived_closing_units, shortfalls = _rebuild_fifo(session, holding, transactions)
+            with timer.phase("persist_transactions"):
+                transactions = _persist_transactions(session, caches, holding, scheme, upload.upload_id)
+            with timer.phase("rebuild_fifo"):
+                derived_closing_units, shortfalls = _rebuild_fifo(session, caches, holding, transactions)
 
             delta = (scheme.close or Decimal("0")) - derived_closing_units
             has_lot_creating_txn = any(t.type in LOT_CREATING_TYPES for t in transactions)
@@ -411,6 +574,12 @@ async def ingest_cas(
             # here costs nothing extra — we already paid for the bytes.
             raw = prefetched_mfapi.get(scheme.amfi) if scheme.amfi else None
             if raw:
-                _store_prefetched_nav_history(session, resolution.scheme.scheme_id, raw)
+                with timer.phase("store_nav_history"):
+                    _store_prefetched_nav_history(
+                        session, resolution.scheme.scheme_id, raw,
+                        stored_summary=nav_summaries.get(resolution.scheme.scheme_id),
+                    )
+
+    logger.info("ingest_cas timing: %s", timer.summary())
 
     return result
