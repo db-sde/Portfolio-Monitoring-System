@@ -1,14 +1,12 @@
-"""Authenticated single-owner portfolio API. Import jobs run in worker.py."""
+"""Shared portfolio API. Import jobs run in worker.py."""
 
 from __future__ import annotations
 import base64
 import hashlib
 import re
 import os
-import time
-from collections import defaultdict, deque
 from contextlib import asynccontextmanager
-from datetime import date, datetime, timedelta
+from datetime import date
 from typing import Optional, Any
 from dotenv import load_dotenv
 
@@ -26,7 +24,6 @@ from fastapi import (
 )
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
-from pydantic import BaseModel, Field
 from sqlalchemy import select, func, text
 from sqlalchemy.orm import Session
 import auth, db, jobs, ledger, config_service, portfolio_service, snapshot_service, exposure_service, enrichment_bridge, gains_service_db, benchmark_service
@@ -47,7 +44,6 @@ MAX_UPLOAD_BYTES = 20 * 1024 * 1024
 @asynccontextmanager
 async def lifespan(app):
     auth.secret()
-    auth.access_mode()
     db.init_db()
     yield
 
@@ -68,24 +64,7 @@ app.add_middleware(
 
 
 @app.middleware("http")
-async def authenticate(request: Request, call_next):
-    path = request.url.path
-    local_mode = auth.access_mode() == "local"
-    if local_mode and path != "/api/health" and not auth.local_request(request):
-        return JSONResponse(
-            status_code=403,
-            content={"detail": "This installation only accepts local access."},
-        )
-    if request.method != "OPTIONS" and path not in {
-        "/api/health",
-        "/api/session",
-        "/api/login",
-    }:
-        if not local_mode and not auth.valid_session(request.cookies.get(auth.COOKIE)):
-            return JSONResponse(
-                status_code=401,
-                content={"detail": "Please sign in to access your portfolio."},
-            )
+async def protect_requests(request: Request, call_next):
     if (
         request.method in {"POST", "DELETE"}
         and request.headers.get("x-requested-with") != "PortfolioIQ"
@@ -99,54 +78,10 @@ async def authenticate(request: Request, call_next):
     return response
 
 
-class Login(BaseModel):
-    password: str = Field(max_length=1024)
-
-
-_failures = defaultdict(deque)
-
-
-@app.post("/api/login")
-def login(body: Login, request: Request, response: Response):
-    key = request.client.host if request.client else "unknown"
-    attempts = _failures[key]
-    now = time.monotonic()
-    while attempts and attempts[0] < now - 300:
-        attempts.popleft()
-    if len(attempts) >= 10:
-        raise HTTPException(
-            429, "Too many sign-in attempts. Try again in five minutes."
-        )
-    if not auth.password_matches(body.password):
-        attempts.append(now)
-        raise HTTPException(401, "Incorrect owner password.")
-    attempts.clear()
-    response.set_cookie(
-        auth.COOKIE,
-        auth.make_session(),
-        max_age=auth.MAX_AGE,
-        httponly=True,
-        secure=os.environ.get("COOKIE_SECURE", "true").lower() == "true",
-        samesite="strict",
-        path="/",
-    )
-    return {"authenticated": True}
-
-
 @app.get("/api/session")
-def session_status(request: Request):
-    required = auth.access_mode() != "local"
-    return {
-        "authenticated": not required
-        or auth.valid_session(request.cookies.get(auth.COOKIE)),
-        "password_required": required,
-    }
-
-
-@app.post("/api/logout")
-def logout(response: Response):
-    response.delete_cookie(auth.COOKIE, path="/")
-    return {"status": "ok"}
+def session_status():
+    # Older frontend builds can still open during a rolling deployment.
+    return {"authenticated": True, "password_required": False}
 
 
 @app.get("/api/health")

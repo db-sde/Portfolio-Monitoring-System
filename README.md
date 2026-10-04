@@ -10,8 +10,7 @@ Use Python 3.13, Node 22+, and PostgreSQL. From this repository:
 python3.13 -m venv .venv
 .venv/bin/pip install --require-hashes -r backend/requirements.txt
 cp backend/.env.example backend/.env
-# Fill DATABASE_URL and APP_SECRET. ACCESS_MODE=local skips the app password.
-# Keep COOKIE_SECURE=false for local HTTP.
+# Fill DATABASE_URL and APP_SECRET. No app password is required.
 .venv/bin/python backend/serve.py
 ```
 
@@ -23,7 +22,7 @@ npm ci
 npm run dev
 ```
 
-Open the Vite URL. With `ACCESS_MODE=local`, the app opens without a login and the API accepts only loopback peers and local hostnames/origins. `serve.py` binds the API to `127.0.0.1` in this mode. Keep both servers on your machine; do not forward a public reverse proxy to local mode. The PDF password is still needed for encrypted statements. Vite proxies `/api` to port 8000. The frontend must reach the API through the same-origin proxy in production too; its Vercel rewrite is in `frontend/vercel.json`. Do not put credentials in frontend environment variables.
+Open the Vite URL; the workspace opens directly without a login. The example configuration binds the API to `127.0.0.1` using `HOST`. The PDF password is still needed for encrypted statements. Vite proxies `/api` to port 8000. The frontend must reach the API through the same-origin proxy in production too; its Vercel rewrite is in `frontend/vercel.json`. Do not put credentials in frontend environment variables.
 
 ## Import and refresh lifecycle
 
@@ -48,9 +47,9 @@ Cached analytics remain visible while refresh runs. Outbound requests are dedupl
 
 ## Deployment and upgrades
 
-Build this repo with `docker build -t portfolioiq .`. The image installs the bundled local parser wheel and starts both API and worker. Configure DATABASE_URL, APP_SECRET, ACCESS_MODE=password, OWNER_PASSWORD, COOKIE_SECURE=true, and your CORS origin. Password mode is also the default when ACCESS_MODE is unset. Set an automatic restart policy. Alternatively run `uvicorn main:app` and `python worker.py` as separately supervised processes from `backend/`, sharing the same environment.
+Build this repo with `docker build -t portfolioiq .`. The image installs the bundled local parser wheel and starts both API and worker. Configure DATABASE_URL, APP_SECRET, and your CORS origin. The container binds to `0.0.0.0` by default; set `HOST` to override it. Set an automatic restart policy. Alternatively run `uvicorn main:app` and `python worker.py` as separately supervised processes from `backend/`, sharing the same environment.
 
-Each installation holds one shared portfolio. Multiple people can run separate password-free local installations, each with its own database. A hosted installation uses the owner password; everyone given that password sees and replaces the same portfolio. Separate private portfolios on one hosted app are not implemented. Remove old API_KEY/VITE_API_KEY configuration. Back up PostgreSQL before upgrading. Schema changes run transactionally under a migration lock. Existing imports should be re-uploaded once to rebuild ledger order, opening coverage and confirmed identities under calculation version 3.0.1; until then unverified values may be unavailable. Production data is never migrated by the test suite.
+Each installation holds one shared portfolio. Local and hosted installations open without app authentication. Everyone who can reach an installation can view, replace, and delete its portfolio. Separate private portfolios on one hosted app are not implemented; use separate installations/databases for separate portfolios. Remove old OWNER_PASSWORD, ACCESS_MODE, COOKIE_SECURE, and API_KEY/VITE_API_KEY configuration; these no longer control access. Back up PostgreSQL before upgrading. Schema changes run transactionally under a migration lock. Existing imports should be re-uploaded once to rebuild ledger order, opening coverage and confirmed identities under calculation version 3.0.1; until then unverified values may be unavailable. Production data is never migrated by the test suite.
 
 The parser wheel is versioned `1.3.0+portfolioiq.1`. Its source changes and regression test are included in `vendor/casparser-portfolioiq.patch`; the base upstream commit is documented in `vendor/README.md`. To rebuild after parser changes, bump its local version in the sibling `casparser` project and run:
 

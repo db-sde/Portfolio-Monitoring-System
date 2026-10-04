@@ -30,7 +30,7 @@ const NO_FILTER_BAR = new Set(['portfolio-summary', 'settings'])
 const pageFromPath = () => { const key = location.pathname.replace(/^\/+/, ''); return key === '' ? 'upload' : PAGES[key] ? key : 'dashboard' }
 const active = (job) => job && ['queued', 'processing'].includes(job.status)
 
-export default function App({ authRequired = true }) {
+export default function App() {
   const [page, setPage] = useState(pageFromPath)
   const [config, setConfig] = useState(null)
   const [uploadInfo, setUploadInfo] = useState(null)
@@ -181,9 +181,6 @@ export default function App({ authRequired = true }) {
   const cancel = async () => {
     try { await api.cancelJob(job.job_id); updateJob({ ...currentJob.current, cancel_requested: true }) } catch (e) { setError(e.message) }
   }
-  const signOut = async () => {
-    try { await api.logout(); window.dispatchEvent(new Event('session-expired')) } catch (e) { setError(e.message) }
-  }
   const busy = submitting || active(job)
   const status = <div className="px-4 py-2 text-sm" role="status" aria-live="polite">
     {active(job) && <span>Processing: {job.stage || job.status}. {job.ready && 'Your portfolio is ready while market data refreshes.'} <button className="underline ml-2" onClick={cancel} disabled={job.cancel_requested}>{job.cancel_requested ? 'Cancelling…' : 'Cancel'}</button></span>}
@@ -205,7 +202,7 @@ export default function App({ authRequired = true }) {
     <div className="flex-1 flex flex-col min-w-0">
       <TopBar investorName={uploadInfo.investor_name} statementPeriod={uploadInfo.statement_period} lastEnriched={enrichStatus?.last_run} enrichStatus={enrichStatus} onUpload={handleUpload} uploading={busy} onMenuClick={() => setSidebarOpen(true)} onRetryEnrichment={retry} retryingEnrichment={busy} />
       {status}
-      <div className="px-4 flex gap-4 text-xs"><button onClick={retry} disabled={busy}>Refresh market data</button>{authRequired && <button onClick={signOut}>Sign out</button>}</div>
+      <div className="px-4 flex gap-4 text-xs"><button onClick={retry} disabled={busy}>Refresh market data</button></div>
       <main className="flex-1 p-4 md:p-6 max-w-[1400px] w-full">
         {!NO_FILTER_BAR.has(page) && <div className="mb-5"><LevelSelector config={config} level={filters.level} groupName={filters.groupName} investorName={filters.investorName} arn={filters.arn} onChange={next => setFilters(f => ({ ...f, ...next }))} /></div>}
         <Suspense fallback={<div role="status">Loading page…</div>}><PageComponent key={`${uploadInfo.dataset_id}:${page}`} filters={filters} setFilters={setFilters} config={config} refreshTick={refreshTick} onConfigSaved={loadConfig} /></Suspense>

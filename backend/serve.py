@@ -39,12 +39,7 @@ def main():
                     "uvicorn",
                     "main:app",
                     "--host",
-                    "127.0.0.1"
-                    if os.environ.get("ACCESS_MODE", "password").lower() == "local"
-                    else "0.0.0.0",
-                    "--no-proxy-headers"
-                    if os.environ.get("ACCESS_MODE", "password").lower() == "local"
-                    else "--proxy-headers",
+                    os.environ.get("HOST", "0.0.0.0"),
                     "--port",
                     os.environ.get("PORT", "8000"),
                 ],

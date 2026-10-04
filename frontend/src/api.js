@@ -5,7 +5,7 @@ export function invalidateQueries() { generation += 1; cache.clear() }
 
 export async function request(path, options = {}) {
   const method = options.method || 'GET'
-  const cacheable = method === 'GET' && !/session|status|jobs|statement|config/.test(path)
+  const cacheable = method === 'GET' && !/status|jobs|statement|config/.test(path)
   const key = `${generation}:${path}`
   const previous = cache.get(key)
   if (cacheable && previous && previous.expires > Date.now()) return previous.promise
@@ -14,13 +14,12 @@ export async function request(path, options = {}) {
   const fetchResult = async () => {
     try {
       const res = await fetch(`${BASE}${path}`, {
-        ...options, credentials: 'include', signal: controller.signal,
+        ...options, signal: controller.signal,
         headers: { ...options.headers, 'X-Requested-With': 'PortfolioIQ' },
       })
       if (!res.ok) {
         let message = `Request failed (${res.status})`
         try { const body = await res.json(); message = body.detail || message } catch { /* Non-JSON proxy error. */ }
-        if (res.status === 401 && path !== '/api/login') window.dispatchEvent(new Event('session-expired'))
         throw new Error(typeof message === 'string' ? message : JSON.stringify(message))
       }
       if (method !== 'GET') invalidateQueries()
@@ -43,9 +42,6 @@ function qs(params = {}) {
 }
 const get = (path) => (params) => request(path + qs(params))
 export const api = {
-  getSession: () => request('/api/session'),
-  login: (password) => request('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) }),
-  logout: () => request('/api/logout', { method: 'POST' }),
   getStatement: () => request('/api/statement'),
   getCurrentJob: () => request('/api/jobs/current'),
   cancelJob: (id) => request(`/api/jobs/${id}/cancel`, { method: 'POST' }),

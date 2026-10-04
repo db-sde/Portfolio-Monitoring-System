@@ -247,18 +247,10 @@ def test_cashflows_net_same_day_switches_and_drop_future_flows():
     assert ledger.cashflows(rows, date(2024, 1, 1)) == []
 
 
-def test_session_tampering_expiry_and_encrypted_payload(monkeypatch):
-    valid = auth.make_session()
-    assert auth.valid_session(valid)
-    assert not auth.valid_session(valid + "x")
+def test_encrypted_payload():
     encrypted = auth.seal({"password": "sensitive"})
-    assert (
-        "sensitive" not in encrypted
-        and auth.unseal(encrypted)["password"] == "sensitive"
-    )
-    now = auth.time.time()
-    monkeypatch.setattr(auth.time, "time", lambda: now + auth.MAX_AGE + 1)
-    assert not auth.valid_session(valid)
+    assert "sensitive" not in encrypted
+    assert auth.unseal(encrypted)["password"] == "sensitive"
 
 
 def test_provider_deduplicates_concurrent_calls():

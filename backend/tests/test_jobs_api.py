@@ -1,14 +1,13 @@
 import os
-import asyncio
 from datetime import date
 from decimal import Decimal as D
 import pytest
 
 if not os.environ.get("TEST_DATABASE_URL"):
     pytest.skip("Needs isolated PostgreSQL.", allow_module_level=True)
-from sqlalchemy import text, select, func, event
+from sqlalchemy import select, func, event
 from fastapi.testclient import TestClient
-import db, main, worker, jobs, auth, portfolio_service
+import db, main, worker, jobs, portfolio_service
 from models import Base, IngestJob, CasUpload, Scheme, NavCache, Transaction, Holding
 from casparser.types import CASData
 
@@ -25,12 +24,6 @@ def clean_database():
 @pytest.fixture
 def client():
     with TestClient(main.app, headers={"X-Requested-With": "PortfolioIQ"}) as client:
-        assert (
-            client.post(
-                "/api/login", json={"password": os.environ["OWNER_PASSWORD"]}
-            ).status_code
-            == 200
-        )
         yield client
 
 
@@ -93,47 +86,48 @@ def prepared():
     return {"1": raw, "__resolved__": {"INF_TEST": {"code": "1", "raw": raw}}}
 
 
-def test_auth_required_csrf_and_logout(client):
-    assert client.get("/api/portfolio").status_code == 200
-    other = TestClient(main.app)
-    assert other.get("/api/portfolio").status_code == 401
-    assert other.post("/api/login", json={"password": "x"}).status_code == 403
-    assert client.post("/api/logout").status_code == 200
-    assert client.get("/api/statement").status_code == 401
-
-
-def test_password_free_local_access_still_rejects_remote_peers_and_origins(monkeypatch):
-    monkeypatch.setenv("ACCESS_MODE", "local")
+@pytest.mark.parametrize("legacy_mode", [None, "password", "local"])
+def test_password_free_access_including_hosted_and_legacy_config(
+    monkeypatch, legacy_mode
+):
+    monkeypatch.delenv("OWNER_PASSWORD", raising=False)
+    if legacy_mode is None:
+        monkeypatch.delenv("ACCESS_MODE", raising=False)
+    else:
+        monkeypatch.setenv("ACCESS_MODE", legacy_mode)
     with TestClient(
-        main.app, base_url="http://127.0.0.1", client=("127.0.0.1", 4321)
-    ) as local:
-        assert local.get("/api/session").json() == {
+        main.app,
+        base_url="https://portfolio.example",
+        client=("203.0.113.1", 4321),
+        headers={"X-Requested-With": "PortfolioIQ"},
+    ) as visitor:
+        assert visitor.get("/api/session").json() == {
             "authenticated": True,
             "password_required": False,
         }
-        assert local.get("/api/portfolio").status_code == 200
+        assert visitor.get("/api/portfolio").status_code == 200
+        assert visitor.get("/api/statement").status_code == 200
         assert (
-            local.get(
-                "/api/portfolio", headers={"host": "untrusted.example"}
+            visitor.post(
+                "/api/upload-cas",
+                files={
+                    "file": (
+                        "test.json",
+                        parsed().model_dump_json(by_alias=True),
+                        "application/json",
+                    )
+                },
             ).status_code
-            == 403
+            == 202
         )
-        assert (
-            local.get(
-                "/api/portfolio", headers={"origin": "https://untrusted.example"}
-            ).status_code
-            == 403
-        )
-        assert local.post("/api/enrich/retry").status_code == 403
-    with TestClient(
-        main.app, base_url="http://localhost", client=("203.0.113.1", 4321)
-    ) as remote:
-        assert (
-            remote.get(
-                "/api/portfolio", headers={"x-forwarded-for": "127.0.0.1"}
-            ).status_code
-            == 403
-        )
+        assert not visitor.cookies
+
+
+def test_mutations_still_require_application_header():
+    with TestClient(main.app) as visitor:
+        assert visitor.get("/api/portfolio").status_code == 200
+        assert visitor.post("/api/enrich/retry").status_code == 403
+        assert visitor.delete("/api/all-data").status_code == 403
 
 
 def test_queue_blocks_upload_refresh_and_reset_until_terminal(client):

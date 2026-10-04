@@ -6,7 +6,7 @@ import { api, invalidateQueries } from './api'
 vi.mock('./api', () => ({
   invalidateQueries: vi.fn(),
   api: Object.fromEntries(['getConfig', 'getStatement', 'getEnrichStatus', 'getCurrentJob',
-    'getUploadStatus', 'uploadCas', 'getPortfolio', 'cancelJob', 'logout'].map(k => [k, vi.fn()])),
+    'getUploadStatus', 'uploadCas', 'getPortfolio', 'cancelJob'].map(k => [k, vi.fn()])),
 }))
 vi.mock('recharts', () => {
   const Chart = ({ children }) => <div>{children}</div>
