@@ -1,118 +1,71 @@
-// Relative by default: in production this is same-origin (Vercel's
-// vercel.json rewrites /api/* to the Render backend), and in local dev
-// the Vite dev server proxies /api itself (see vite.config.js) — so the
-// backend's actual URL never needs to be baked into the built bundle.
-// VITE_API_BASE_URL is still available as an override (e.g. pointing a
-// local frontend at an ngrok tunnel instead of the dev proxy).
 const BASE = import.meta.env.VITE_API_BASE_URL || ''
-// The backend rejects every request without this (see main.py's
-// _require_api_key) — a real production incident (all data wiped by an
-// unauthenticated caller, most likely found via the public GitHub repo)
-// is why this exists at all. Not a substitute for real per-user auth —
-// this value ships in the built bundle, so it's visible to anyone who
-// inspects this app's own network requests — but it stops a stranger or
-// bot from calling the API directly without ever loading the app.
-const API_KEY = import.meta.env.VITE_API_KEY || ''
+const cache = new Map()
+let generation = 0
+export function invalidateQueries() { generation += 1; cache.clear() }
 
-async function request(path, options = {}) {
-  const res = await fetch(`${BASE}${path}`, {
-    ...options,
-    headers: { ...options.headers, 'X-API-Key': API_KEY },
-  })
-  if (!res.ok) {
-    let message = `Request failed (${res.status})`
+export async function request(path, options = {}) {
+  const method = options.method || 'GET'
+  const cacheable = method === 'GET' && !/session|status|jobs|statement|config/.test(path)
+  const key = `${generation}:${path}`
+  const previous = cache.get(key)
+  if (cacheable && previous && previous.expires > Date.now()) return previous.promise
+  const controller = new AbortController()
+  const timeout = setTimeout(() => controller.abort(), options.body instanceof FormData ? 120000 : 45000)
+  const fetchResult = async () => {
     try {
-      const body = await res.json()
-      message = body.detail || message
-    } catch {
-      // response body wasn't JSON; keep the generic message
-    }
-    throw new Error(typeof message === 'string' ? message : JSON.stringify(message))
+      const res = await fetch(`${BASE}${path}`, {
+        ...options, credentials: 'include', signal: controller.signal,
+        headers: { ...options.headers, 'X-Requested-With': 'PortfolioIQ' },
+      })
+      if (!res.ok) {
+        let message = `Request failed (${res.status})`
+        try { const body = await res.json(); message = body.detail || message } catch { /* Non-JSON proxy error. */ }
+        if (res.status === 401 && path !== '/api/login') window.dispatchEvent(new Event('session-expired'))
+        throw new Error(typeof message === 'string' ? message : JSON.stringify(message))
+      }
+      if (method !== 'GET') invalidateQueries()
+      return options.blob ? res.blob() : res.json()
+    } catch (err) {
+      cache.delete(key)
+      if (err.name === 'AbortError') throw new Error('The server took too long to respond. Please retry; an import may still be running.')
+      throw err
+    } finally { clearTimeout(timeout) }
   }
-  return res.json()
+  const promise = fetchResult()
+  if (cache.size >= 100) cache.delete(cache.keys().next().value)
+  if (cacheable) cache.set(key, { promise, expires: Date.now() + 15000 })
+  return promise
 }
-
 function qs(params = {}) {
-  const usp = new URLSearchParams()
-  for (const [k, v] of Object.entries(params)) {
-    if (v !== undefined && v !== null && v !== '') usp.set(k, v)
-  }
-  const s = usp.toString()
-  return s ? `?${s}` : ''
+  const values = new URLSearchParams()
+  for (const [key, value] of Object.entries(params)) if (value !== undefined && value !== null) values.set(key, value)
+  return values.size ? `?${values}` : ''
 }
-
+const get = (path) => (params) => request(path + qs(params))
 export const api = {
+  getSession: () => request('/api/session'),
+  login: (password) => request('/api/login', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ password }) }),
+  logout: () => request('/api/logout', { method: 'POST' }),
+  getStatement: () => request('/api/statement'),
+  getCurrentJob: () => request('/api/jobs/current'),
+  cancelJob: (id) => request(`/api/jobs/${id}/cancel`, { method: 'POST' }),
   uploadCas(file, password = '') {
-    const form = new FormData()
-    form.append('file', file)
-    form.append('password', password)
-    return request('/api/upload-cas', { method: 'POST', body: form })
+    const body = new FormData(); body.append('file', file); body.append('password', password)
+    return request('/api/upload-cas', { method: 'POST', body })
   },
-  // The ingest itself now runs in the background (a real ~50-scheme
-  // statement takes minutes of sequential mfapi.in calls — long enough
-  // that Render's own proxy used to 502 before the ingest even
-  // finished). uploadCas returns almost immediately with a job_id;
-  // poll this until status leaves "processing".
-  getUploadStatus(jobId) {
-    return request(`/api/upload-status/${jobId}`)
-  },
-  getPortfolio(params) {
-    return request(`/api/portfolio${qs(params)}`)
-  },
-  getSnapshot(params) {
-    return request(`/api/portfolio/snapshot${qs(params)}`)
-  },
-  getPortfolioSummary() {
-    return request('/api/portfolio/summary')
-  },
-  getFundSummary(params) {
-    return request(`/api/portfolio/fund-summary${qs(params)}`)
-  },
-  getExposure(params) {
-    return request(`/api/portfolio/exposure${qs(params)}`)
-  },
-  getTransactions(params) {
-    return request(`/api/transactions${qs(params)}`)
-  },
-  getCapitalGains(params) {
-    return request(`/api/capital-gains${qs(params)}`)
-  },
-  // The one endpoint that isn't JSON (spec 12.2: the parser's own
-  // verified Schedule 112A export) — same BASE-prefixing as request()
-  // so the VITE_API_BASE_URL override still works for it, just a Blob
-  // instead of a parsed body.
-  async download112aCsv(params) {
-    const res = await fetch(`${BASE}/api/capital-gains/112a.csv${qs(params)}`, {
-      headers: { 'X-API-Key': API_KEY },
-    })
-    if (!res.ok) throw new Error(`Export failed (${res.status})`)
-    return res.blob()
-  },
-  getDataQuality() {
-    return request('/api/data-quality')
-  },
-  getConfig() {
-    return request('/api/config')
-  },
-  saveConfig(config) {
-    return request('/api/config', {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(config),
-    })
-  },
-  getEnrichStatus() {
-    return request('/api/enrich/status')
-  },
-  retryEnrichment() {
-    return request('/api/enrich/retry', { method: 'POST' })
-  },
-  // Full reset (spec 19) — wipes everything a plain new upload leaves
-  // alone too: config, groups/investors/ARNs, preferences. Had no UI
-  // path at all until now (backend-only, curl/API-client only), found
-  // auditing the app end to end — a real "wipe everything" need had
-  // come up with no way to do it except a raw API call.
-  deleteAllData() {
-    return request('/api/all-data', { method: 'DELETE' })
-  },
+  getUploadStatus: (id) => request(`/api/upload-status/${id}`),
+  getPortfolio: get('/api/portfolio'),
+  getSnapshot: get('/api/portfolio/snapshot'),
+  getPortfolioSummary: get('/api/portfolio/summary'),
+  getFundSummary: get('/api/portfolio/fund-summary'),
+  getExposure: get('/api/portfolio/exposure'),
+  getTransactions: get('/api/transactions'),
+  getCapitalGains: get('/api/capital-gains'),
+  download112aCsv: (params) => request('/api/capital-gains/112a.csv' + qs(params), { blob: true }),
+  getDataQuality: get('/api/data-quality'),
+  getConfig: () => request('/api/config'),
+  saveConfig: (config) => request('/api/config', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify(config) }),
+  getEnrichStatus: () => request('/api/enrich/status'),
+  retryEnrichment: () => request('/api/enrich/retry', { method: 'POST' }),
+  deleteAllData: () => request('/api/all-data', { method: 'DELETE' }),
 }

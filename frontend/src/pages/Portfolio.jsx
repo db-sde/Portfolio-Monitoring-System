@@ -3,12 +3,12 @@ import { api } from '../api'
 import { formatIndian, formatPct, formatUnits } from '../components/IndianNumber'
 import SkeletonTable from '../components/SkeletonTable'
 
-const CAT_ORDER = ['EQUITY', 'DEBT', 'OTHER']
-const CAT_LABEL = { EQUITY: 'Equity', DEBT: 'Debt', OTHER: 'Other' }
+const CAT_ORDER = ['EQUITY', 'HYBRID', 'DEBT', 'OTHER']
+const CAT_LABEL = { EQUITY: 'Equity', HYBRID: 'Hybrid', DEBT: 'Debt', OTHER: 'Other' }
 
 function normalizeCat(assetClass) {
   const t = (assetClass || '').toUpperCase()
-  return t === 'EQUITY' || t === 'DEBT' ? t : 'OTHER'
+  return CAT_ORDER.includes(t) ? t : 'OTHER'
 }
 
 function Row({ r }) {
@@ -17,6 +17,7 @@ function Row({ r }) {
       <td className="px-4 py-2.5 font-mono text-xs text-ink-3">{r.folio}</td>
       <td className="px-4 py-2.5">
         <div className="font-medium text-ink">{r.scheme_name}</div>
+        {(r.flags || []).map(f => <div key={f.code} className="text-xs text-warn">{f.detail || f.code}</div>)}
         <div className="text-xs text-ink-3 font-mono">{r.isin || ''}</div>
       </td>
       <td className="px-4 py-2.5 text-right tabular text-ink-2">{formatUnits(r.balance_units)}</td>
@@ -56,6 +57,7 @@ export default function Portfolio({ filters, refreshTick }) {
   const [error, setError] = useState(null)
 
   useEffect(() => {
+    let live = true
     setLoading(true)
     setError(null)
     api.getPortfolio({
@@ -63,9 +65,10 @@ export default function Portfolio({ filters, refreshTick }) {
       level: filters.level, group_name: filters.groupName,
       investor_name: filters.investorName, arn: filters.arn,
     })
-      .then(setData)
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false))
+      .then(value => { if (live) setData(value) })
+      .catch((err) => { if (live) setError(err.message) })
+      .finally(() => { if (live) setLoading(false) })
+    return () => { live = false }
   }, [filters, refreshTick])
 
   if (error) return <div className="text-sm text-bad">{error}</div>
@@ -81,7 +84,7 @@ export default function Portfolio({ filters, refreshTick }) {
   if (!rows.length) {
     return (
       <div className="rounded-xl border border-line-soft bg-card p-10 text-center text-sm text-ink-3">
-        No holdings match these filters.
+        No current holdings match these filters. Lifetime XIRR: {formatPct(subtotals.total?.xirr)}. Enable fully redeemed funds to see closed holdings.
       </div>
     )
   }
@@ -100,12 +103,12 @@ export default function Portfolio({ filters, refreshTick }) {
               <th className="text-right px-4 py-2.5">Balance units</th>
               <th className="text-right px-4 py-2.5">Weighted purchase NAV</th>
               <th className="text-right px-4 py-2.5">Current NAV</th>
-              <th className="text-right px-4 py-2.5">Purchase value</th>
+              <th className="text-right px-4 py-2.5">Remaining cost</th>
               <th className="text-right px-4 py-2.5">Current value</th>
-              <th className="text-right px-4 py-2.5">Gain</th>
+              <th className="text-right px-4 py-2.5">Unrealised gain</th>
               <th className="text-right px-4 py-2.5">Weighted days held</th>
               <th className="text-right px-4 py-2.5">Abs. return</th>
-              <th className="text-right px-4 py-2.5">XIRR</th>
+              <th className="text-right px-4 py-2.5">Lifetime XIRR</th>
             </tr>
           </thead>
           <tbody>
@@ -125,8 +128,7 @@ export default function Portfolio({ filters, refreshTick }) {
         </table>
       </div>
       <div className="px-4 py-3 text-xs text-ink-3 border-t border-line-soft">
-        Purchase value, current value, and current NAV all use MFAPI-resolved NAV — the CAS statement's own printed
-        valuation is never used for these figures. XIRR uses each holding's full dated cash-flow history, not CAGR.
+        Purchase value comes from FIFO acquisition costs. Current value uses available MFAPI NAV; its date and any missing coverage are reported above. XIRR uses each holding's full dated cash-flow history, not CAGR.
       </div>
     </div>
   )

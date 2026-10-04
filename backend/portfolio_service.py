@@ -1,55 +1,22 @@
-"""
-PortfolioIQ — portfolio_service.py
-
-Holding-level metrics (spec section 9, 11.1) computed from the FIFO lot
-engine's persisted state — never from CAS-printed valuation.value/nav
-(spec 10.1, 22: "Do not use CAS valuation NAV/value for dashboard,
-portfolio, snapshot closing value or exposure").
-
-This is the one place balance units, weighted purchase NAV, current
-value, gain, days held, absolute return and XIRR are computed for a
-holding — Dashboard/Portfolio/Exposure/Summary all call into this
-rather than each re-deriving their own version, so there's exactly one
-definition of "current value" in the whole app.
-"""
-
-from __future__ import annotations
+"""Portfolio calculations share one dated ledger and explicit data coverage."""
 
 from dataclasses import dataclass
 from datetime import date
 from decimal import Decimal
 from typing import Optional
-
 from sqlalchemy import select
 from sqlalchemy.orm import Session
-
+import ledger
 import nav_service
 import xirr_engine
-from models import Folio, Holding, PurchaseLot, Scheme, Transaction
+from models import Folio, Holding, Scheme, Transaction
 
 ZERO = Decimal("0")
-
-# Spec 8.1 / 9.5 sign convention — money OUT of the investor's pocket is
-# negative, money IN is positive, for scheme-level XIRR cash flows.
-MONEY_OUT_TYPES = {"PURCHASE", "PURCHASE_SIP", "SWITCH_IN", "SWITCH_IN_MERGER"}
-MONEY_IN_TYPES = {"REDEMPTION", "SWITCH_OUT", "SWITCH_OUT_MERGER", "DIVIDEND_PAYOUT"}
-# No external cash-flow impact for scheme XIRR: DIVIDEND_REINVEST (units
-# added, no net external flow), STAMP_DUTY_TAX/STT_TAX/TDS_TAX (already
-# folded into acquisition/disposal cost, not a separate flow event here),
-# SEGREGATION/GIFT_IN/GIFT_OUT/MISC/UNKNOWN (spec 8.3: excluded without
-# linked donor/cost data). REVERSAL is NOT in this "no impact" group —
-# despite what an earlier version of this comment claimed ("handled by
-# the transaction it reverses no longer being counted"), nothing ever
-# actually excluded that transaction; a bounced SIP's original
-# PURCHASE_SIP outflow is always counted normally. REVERSAL needs its
-# own offsetting flow instead, handled explicitly below (not via this
-# set, since its amount is already negative and would double-negate
-# through the abs() both sets apply).
 
 
 @dataclass
 class DataQualityFlag:
-    code: str  # NAV_UNAVAILABLE | SCHEME_UNRESOLVED | CAS_RECONCILIATION_FAILED | INCOMPLETE_OPENING_HISTORY | FIFO_SHORTFALL | XIRR_NO_SOLUTION
+    code: str
     detail: str
 
 
@@ -66,8 +33,8 @@ class HoldingMetrics:
     weighted_purchase_nav: Optional[Decimal]
     current_nav: Optional[Decimal]
     current_nav_date: Optional[date]
-    remaining_purchase_value: Decimal
-    current_value: Decimal
+    remaining_purchase_value: Optional[Decimal]
+    current_value: Optional[Decimal]
     gain: Optional[Decimal]
     weighted_days_held: Optional[int]
     absolute_return_pct: Optional[Decimal]
@@ -76,227 +43,300 @@ class HoldingMetrics:
     flags: list[DataQualityFlag]
 
 
-def _txn_cash_flow(txn: Transaction) -> Optional[Decimal]:
-    if txn.type in MONEY_OUT_TYPES:
-        return -abs(txn.amount) if txn.amount is not None else None
-    if txn.type in MONEY_IN_TYPES:
-        return abs(txn.amount) if txn.amount is not None else None
-    if txn.type == "REVERSAL":
-        return -txn.amount if txn.amount is not None else None
-    return None
-
-
 @dataclass
 class PortfolioContext:
-    """Everything compute_holding_metrics needs for a whole set of
-    holdings, loaded in a fixed handful of queries instead of six per
-    holding.
-
-    Why this exists: computing one page of holdings issued ~6 round
-    trips each (holding, folio, scheme, lots, NAV, transactions), and
-    profiling a real 65-holding portfolio put 106 of its 107 seconds
-    inside psycopg's connection wait across 383 of them — pure network
-    latency to Neon at ~277ms a trip, with essentially no computation
-    behind it. The per-holding functions were each individually cheap
-    and obviously correct, which is exactly why this stayed invisible:
-    nothing is slow until you count the round trips.
-    """
-    holdings: dict[int, Holding]
-    folios: dict[int, Folio]
-    schemes: dict[int, Scheme]
-    lots: dict[int, list[PurchaseLot]]
-    navs: dict[int, nav_service.NavPoint]
-    transactions: dict[int, list[Transaction]]
+    holdings: dict
+    folios: dict
+    schemes: dict
+    lots: dict
+    navs: dict
+    transactions: dict
 
 
-def build_context(session: Session, holding_ids: list[int], valuation_date: date) -> PortfolioContext:
-    """Six batched queries for any number of holdings. Transactions are
-    included because the XIRR path needs them; they're grouped by
-    holding here so that path stays a dict lookup."""
+def build_context(
+    session: Session, holding_ids: list[int], valuation_date: date, *, with_nav=True
+) -> PortfolioContext:
     if not holding_ids:
         return PortfolioContext({}, {}, {}, {}, {}, {})
-
     holdings = {
         h.holding_id: h
-        for h in session.execute(select(Holding).where(Holding.holding_id.in_(holding_ids))).scalars()
+        for h in session.scalars(
+            select(Holding).where(Holding.holding_id.in_(holding_ids))
+        )
     }
-    folio_ids = {h.folio_id for h in holdings.values()}
-    scheme_ids = {h.scheme_id for h in holdings.values()}
     folios = {
-        f.folio_id: f for f in session.execute(select(Folio).where(Folio.folio_id.in_(folio_ids))).scalars()
+        f.folio_id: f
+        for f in session.scalars(
+            select(Folio).where(
+                Folio.folio_id.in_({h.folio_id for h in holdings.values()})
+            )
+        )
     }
+    ids = {h.scheme_id for h in holdings.values()}
     schemes = {
-        s.scheme_id: s for s in session.execute(select(Scheme).where(Scheme.scheme_id.in_(scheme_ids))).scalars()
+        s.scheme_id: s
+        for s in session.scalars(select(Scheme).where(Scheme.scheme_id.in_(ids)))
     }
+    transactions = {}
+    for t in session.scalars(
+        select(Transaction)
+        .where(
+            Transaction.holding_id.in_(holding_ids), Transaction.date <= valuation_date
+        )
+        .order_by(
+            Transaction.date, Transaction.ledger_position, Transaction.transaction_id
+        )
+    ):
+        transactions.setdefault(t.holding_id, []).append(t)
+    navs = (
+        nav_service.get_navs_on_or_before(session, list(ids), valuation_date)
+        if with_nav
+        else {}
+    )
+    return PortfolioContext(holdings, folios, schemes, {}, navs, transactions)
 
-    lots: dict[int, list[PurchaseLot]] = {}
-    for lot in session.execute(
-        select(PurchaseLot).where(PurchaseLot.holding_id.in_(holding_ids), PurchaseLot.remaining_units > 0)
-    ).scalars():
-        lots.setdefault(lot.holding_id, []).append(lot)
 
-    transactions: dict[int, list[Transaction]] = {}
-    for txn in session.execute(
-        select(Transaction).where(Transaction.holding_id.in_(holding_ids)).order_by(Transaction.date)
-    ).scalars():
-        transactions.setdefault(txn.holding_id, []).append(txn)
+def units_at(holding, transactions, as_of):
+    if as_of is None:
+        return ZERO
+    opening_date = getattr(holding, "opening_date", None)
+    if opening_date and as_of < opening_date:
+        return None  # statement does not establish ownership before its coverage
+    opening = getattr(holding, "opening_units", None) or ZERO
+    return opening + sum(
+        (t.units or ZERO for t in transactions if t.date <= as_of), ZERO
+    )
 
-    navs = nav_service.get_navs_on_or_before(session, list(scheme_ids), valuation_date)
-    return PortfolioContext(holdings, folios, schemes, lots, navs, transactions)
+
+def _txn_cash_flow(txn):
+    flows = ledger.cashflows([txn])
+    return flows[0][1] if flows else None
 
 
 def compute_holding_metrics(
-    session: Session, holding_id: int, valuation_date: date, ctx: Optional[PortfolioContext] = None,
-) -> HoldingMetrics:
-    """ctx: optional prefetched data from build_context. Purely a
-    performance path — with it, this function makes no queries at all;
-    without it, it loads exactly what it always did, so single-holding
-    callers keep working unchanged."""
-    if ctx is not None:
-        holding = ctx.holdings.get(holding_id) or session.get(Holding, holding_id)
-        folio = ctx.folios.get(holding.folio_id) or session.get(Folio, holding.folio_id)
-        scheme = ctx.schemes.get(holding.scheme_id) or session.get(Scheme, holding.scheme_id)
-        lots = ctx.lots.get(holding_id, [])
-    else:
-        holding = session.get(Holding, holding_id)
-        folio = session.get(Folio, holding.folio_id)
-        scheme = session.get(Scheme, holding.scheme_id)
-        lots = list(session.execute(
-            select(PurchaseLot).where(PurchaseLot.holding_id == holding_id, PurchaseLot.remaining_units > 0)
-        ).scalars())
-    flags: list[DataQualityFlag] = []
-
-    balance_units = sum((l.remaining_units for l in lots), ZERO)
-    remaining_purchase_value = sum((l.remaining_cost for l in lots), ZERO)
-    weighted_purchase_nav = (
-        sum((l.remaining_units * l.purchase_nav for l in lots), ZERO) / balance_units
-        if balance_units > 0 else None
-    )
-    weighted_days_held = (
-        int(sum((l.remaining_units * (valuation_date - l.acquired_date).days for l in lots), ZERO) / balance_units)
-        if balance_units > 0 else None
-    )
-
-    nav_point = (
-        ctx.navs.get(holding.scheme_id) if ctx is not None
-        else nav_service.get_nav_on_or_before(session, holding.scheme_id, valuation_date)
-    )
-    current_nav = nav_point.nav if nav_point else None
-    current_nav_date = nav_point.resolved_date if nav_point else None
-    if current_nav is None and balance_units > 0:
-        flags.append(DataQualityFlag("NAV_UNAVAILABLE", "No NAV on or before the requested date for this scheme."))
-
-    current_value = (balance_units * current_nav) if (current_nav is not None) else ZERO
-    gain = (current_value - remaining_purchase_value) if remaining_purchase_value else None
-    absolute_return_pct = (
-        (gain / remaining_purchase_value * 100).quantize(Decimal("0.01"))
-        if remaining_purchase_value and gain is not None else None
-    )
-
-    if holding.data_quality_code:
-        flags.append(DataQualityFlag(holding.data_quality_code, holding.data_quality_detail or ""))
-
-    xirr_pct = None
-    blocking_codes = {"CAS_RECONCILIATION_FAILED", "INCOMPLETE_OPENING_HISTORY", "SCHEME_UNRESOLVED", "FIFO_SHORTFALL"}
-    if not any(f.code in blocking_codes for f in flags):
-        transactions = (
-            ctx.transactions.get(holding_id, []) if ctx is not None
-            else list(session.execute(
-                select(Transaction).where(Transaction.holding_id == holding_id).order_by(Transaction.date)
-            ).scalars())
+    session, holding_id, valuation_date, ctx=None, *, calculate_xirr=True
+):
+    ctx = ctx or build_context(session, [holding_id], valuation_date)
+    h = ctx.holdings[holding_id]
+    f, s = ctx.folios[h.folio_id], ctx.schemes[h.scheme_id]
+    transactions = [
+        t for t in ctx.transactions.get(holding_id, []) if t.date <= valuation_date
+    ]
+    fifo = ledger.fifo_for(transactions)
+    lots = [l for l in fifo.lots if l.remaining_units > ZERO]
+    flags = []
+    code = getattr(h, "data_quality_code", None)
+    # FIFO diagnostics are recalculated for the requested date. Persisted
+    # import diagnostics may describe a later date or an older engine.
+    if code and code not in {"REVERSAL_UNRESOLVED", "FIFO_SHORTFALL"}:
+        flags.append(DataQualityFlag(code, h.data_quality_detail or ""))
+    units = units_at(h, transactions, valuation_date)
+    if units is None:
+        flags.append(
+            DataQualityFlag(
+                "INCOMPLETE_OPENING_HISTORY",
+                "The requested date precedes statement coverage.",
+            )
         )
-        cashflows: list[tuple[date, Decimal]] = []
-        for t in transactions:
-            cf = _txn_cash_flow(t)
-            if cf is not None:
-                cashflows.append((t.date, cf))
-        if balance_units > 0 and current_nav is not None:
-            cashflows.append((valuation_date, current_value))
-        outcome = xirr_engine.xirr(cashflows)
-        xirr_pct = outcome.value
-        if outcome.value is None and outcome.reason:
+        units = ZERO
+    cost_valid = not any(f.code in ledger.BLOCKING_CODES for f in flags)
+    if fifo.reversal_errors:
+        cost_valid = False
+        flags.append(
+            DataQualityFlag(
+                "REVERSAL_UNRESOLVED",
+                "A reversed purchase cannot be identified unambiguously.",
+            )
+        )
+    if fifo.shortfalls:
+        cost_valid = False
+        flags.append(
+            DataQualityFlag(
+                "FIFO_SHORTFALL", "Purchase history does not cover all disposals."
+            )
+        )
+    if any(l.origin_type == "GIFT_IN" for l in lots) or any(
+        t.type == "SEGREGATION" for t in transactions
+    ):
+        cost_valid = False
+        flags.append(
+            DataQualityFlag(
+                "COST_BASIS_UNAVAILABLE",
+                "Transferred units require a verified carried cost basis.",
+            )
+        )
+    if (getattr(h, "opening_units", None) or ZERO) != ZERO:
+        cost_valid = False
+        if not any(f.code == "INCOMPLETE_OPENING_HISTORY" for f in flags):
+            flags.append(
+                DataQualityFlag(
+                    "INCOMPLETE_OPENING_HISTORY",
+                    "Opening units have no acquisition history.",
+                )
+            )
+    cost = sum((l.remaining_cost for l in lots), ZERO) if cost_valid else None
+    lot_units = sum((l.remaining_units for l in lots), ZERO)
+    weighted_nav = (
+        sum((l.remaining_units * l.purchase_nav for l in lots), ZERO) / lot_units
+        if cost_valid and lot_units
+        else None
+    )
+    days = (
+        int(
+            sum(
+                (
+                    l.remaining_units * (valuation_date - l.acquired_date).days
+                    for l in lots
+                ),
+                ZERO,
+            )
+            / lot_units
+        )
+        if cost_valid and lot_units
+        else None
+    )
+    point = ctx.navs.get(h.scheme_id)
+    nav = point.nav if point else None
+    identity_ok = bool(s.identity_confirmed) and not any(
+        f.code == "SCHEME_UNRESOLVED" for f in flags
+    )
+    coverage_ok = not (
+        getattr(h, "opening_date", None) and valuation_date < h.opening_date
+    )
+    current = (
+        units * nav
+        if nav is not None and identity_ok and coverage_ok
+        else (ZERO if units == ZERO and coverage_ok else None)
+    )
+    if units and point and (valuation_date - point.resolved_date).days > 7:
+        flags.append(
+            DataQualityFlag(
+                "NAV_STALE", "The latest available NAV is over seven days old."
+            )
+        )
+    if current is None:
+        flags.append(
+            DataQualityFlag(
+                "NAV_UNAVAILABLE",
+                "No verified valuation is available for these units on this date.",
+            )
+        )
+    gain = current - cost if current is not None and cost is not None else None
+    pct = (
+        (gain / cost * 100).quantize(Decimal(".01"))
+        if cost and gain is not None
+        else None
+    )
+    irr = None
+    if calculate_xirr and not any(f.code in ledger.BLOCKING_CODES for f in flags):
+        flows = ledger.cashflows(transactions, valuation_date)
+        if current:
+            flows.append((valuation_date, current))
+        outcome = xirr_engine.xirr(flows)
+        irr = outcome.value
+        if outcome.reason:
             flags.append(DataQualityFlag("XIRR_NO_SOLUTION", outcome.reason))
-
     return HoldingMetrics(
-        holding_id=holding_id, folio=folio.normalized_folio, amc=folio.amc,
-        scheme_name=scheme.name, isin=scheme.isin, asset_class=scheme.asset_class,
-        advisor_arn=holding.advisor_arn, balance_units=balance_units,
-        weighted_purchase_nav=weighted_purchase_nav, current_nav=current_nav,
-        current_nav_date=current_nav_date, remaining_purchase_value=remaining_purchase_value,
-        current_value=current_value, gain=gain, weighted_days_held=weighted_days_held,
-        absolute_return_pct=absolute_return_pct, xirr_pct=xirr_pct,
-        reconciliation_status=holding.reconciliation_status, flags=flags,
+        holding_id,
+        f.normalized_folio,
+        f.amc,
+        s.name,
+        s.isin,
+        s.asset_class,
+        h.advisor_arn,
+        units,
+        weighted_nav,
+        nav,
+        point.resolved_date if point else None,
+        cost,
+        current,
+        gain,
+        days,
+        pct,
+        irr,
+        h.reconciliation_status,
+        flags,
     )
 
 
-def compute_all_holdings(
-    session: Session, valuation_date: date, include_zero_value: bool = False,
-) -> list[HoldingMetrics]:
-    holding_ids = list(session.execute(select(Holding.holding_id)).scalars())
-    ctx = build_context(session, holding_ids, valuation_date)
-    results = [compute_holding_metrics(session, hid, valuation_date, ctx) for hid in holding_ids]
-    if not include_zero_value:
-        results = [r for r in results if r.balance_units > 0]
-    return results
+def compute_all_holdings(session, valuation_date, include_zero_value=False):
+    ids = list(session.scalars(select(Holding.holding_id)))
+    ctx = build_context(session, ids, valuation_date)
+    rows = [compute_holding_metrics(session, hid, valuation_date, ctx) for hid in ids]
+    return rows if include_zero_value else [r for r in rows if r.balance_units > ZERO]
 
 
 @dataclass
 class AggregateTotals:
-    invested_value: Decimal
-    current_value: Decimal
-    gain: Decimal
+    invested_value: Optional[Decimal]
+    current_value: Optional[Decimal]
+    gain: Optional[Decimal]
     absolute_return_pct: Optional[Decimal]
     weighted_days_held: Optional[int]
     xirr_pct: Optional[Decimal]
+    known_current_value: Decimal = ZERO
+    valued_holdings: int = 0
+    total_holdings: int = 0
+    closed_holdings: int = 0
 
 
-def aggregate(
-    session: Session, holdings: list[HoldingMetrics], valuation_date: date,
-    ctx: Optional[PortfolioContext] = None,
-) -> AggregateTotals:
-    """Spec 9.6: sums for invested/current/gain, gain/invested for
-    absolute return, current-value-weighted average for days held, and
-    XIRR recalculated from ALL consolidated cash flows — never an
-    average of the individual holdings' own XIRRs (spec 9.5, 22:
-    'Do not calculate weighted-average XIRR or CAGR').
-
-    ctx: optional prefetched data from build_context, same performance-
-    only contract as compute_holding_metrics. It matters more here than
-    it looks: /api/portfolio calls this four times (one per asset-class
-    bucket plus the grand total), so the transaction query below ran
-    once per holding per bucket — four full passes over the portfolio's
-    transactions per page load."""
-    invested = sum((h.remaining_purchase_value for h in holdings), ZERO)
-    current = sum((h.current_value for h in holdings), ZERO)
-    gain = current - invested
-    absolute_return_pct = (gain / invested * 100).quantize(Decimal("0.01")) if invested else None
-
-    weighted_days = None
-    if current > 0:
-        day_products = sum(
-            (h.current_value * h.weighted_days_held for h in holdings if h.weighted_days_held is not None), ZERO
+def aggregate(session, holdings, valuation_date, ctx=None):
+    holdings = list({h.holding_id: h for h in holdings}.values())
+    active = [h for h in holdings if h.balance_units != ZERO or h.current_value is None]
+    ids = [h.holding_id for h in holdings]
+    ctx = ctx or build_context(session, ids, valuation_date)
+    known = sum(
+        (h.current_value for h in holdings if h.current_value is not None), ZERO
+    )
+    valued = sum(h.current_value is not None for h in active)
+    current = known if valued == len(active) else None
+    invested = (
+        sum((h.remaining_purchase_value for h in active), ZERO)
+        if all(h.remaining_purchase_value is not None for h in active)
+        else None
+    )
+    gain = current - invested if current is not None and invested is not None else None
+    pct = (
+        (gain / invested * 100).quantize(Decimal(".01"))
+        if invested and gain is not None
+        else None
+    )
+    days = (
+        int(
+            sum(
+                (
+                    h.current_value * h.weighted_days_held
+                    for h in holdings
+                    if h.weighted_days_held is not None
+                ),
+                ZERO,
+            )
+            / current
         )
-        weighted_days = int(day_products / current) if day_products else None
-
-    cashflows: list[tuple[date, Decimal]] = []
-    for hid in {h.holding_id for h in holdings}:
-        transactions = (
-            ctx.transactions.get(hid, []) if ctx is not None
-            else list(session.execute(
-                select(Transaction).where(Transaction.holding_id == hid).order_by(Transaction.date)
-            ).scalars())
+        if current
+        and all(
+            h.weighted_days_held is not None or not h.current_value for h in holdings
         )
-        for t in transactions:
-            cf = _txn_cash_flow(t)
-            if cf is not None:
-                cashflows.append((t.date, cf))
-    holding_by_id = {h.holding_id: h for h in holdings}
-    for hid, h in holding_by_id.items():
-        if h.balance_units > 0 and h.current_nav is not None:
-            cashflows.append((valuation_date, h.current_value))
-    outcome = xirr_engine.xirr(cashflows)
-
+        else None
+    )
+    eligible = not any(
+        f.code in ledger.BLOCKING_CODES for h in holdings for f in h.flags
+    )
+    flows = ledger.cashflows(
+        [t for hid in ids for t in ctx.transactions.get(hid, [])], valuation_date
+    )
+    if current:
+        flows.append((valuation_date, current))
+    irr = xirr_engine.xirr(flows).value if eligible and current is not None else None
     return AggregateTotals(
-        invested_value=invested, current_value=current, gain=gain,
-        absolute_return_pct=absolute_return_pct, weighted_days_held=weighted_days, xirr_pct=outcome.value,
+        invested,
+        current,
+        gain,
+        pct,
+        days,
+        irr,
+        known,
+        valued,
+        len(active),
+        len(holdings) - len(active),
     )

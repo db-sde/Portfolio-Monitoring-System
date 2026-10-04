@@ -24,6 +24,8 @@ from typing import TYPE_CHECKING, Optional
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+import portfolio_service
+import ledger
 import nav_service
 import xirr_engine
 from models import Folio, Holding, Scheme, Transaction
@@ -32,7 +34,7 @@ if TYPE_CHECKING:  # import only for the type annotation — avoids a runtime cy
     import portfolio_service
 
 ZERO = Decimal("0")
-BUCKET_KEYS = ("EQUITY", "HYBRID", "DEBT", "total")
+BUCKET_KEYS = ("EQUITY", "HYBRID", "DEBT", "OTHER", "total")
 
 MONEY_OUT_TYPES = {"PURCHASE", "PURCHASE_SIP", "SWITCH_IN", "SWITCH_IN_MERGER"}
 MONEY_IN_TYPES = {"REDEMPTION", "SWITCH_OUT", "SWITCH_OUT_MERGER", "DIVIDEND_PAYOUT"}
@@ -60,24 +62,32 @@ class BucketSnapshot:
     closing_balance: Decimal = ZERO
     net_gain: Decimal = ZERO
     xirr_pct: Optional[Decimal] = None
+    incomplete: bool = False
+    opening_incomplete: bool = False
+    closing_incomplete: bool = False
     _cashflows: list = field(default_factory=list, repr=False)
 
 
 def _units_at(transactions: list[Transaction], as_of: Optional[date]) -> Decimal:
     if as_of is None:
         return ZERO
-    return sum((t.units for t in transactions if t.units is not None and t.date <= as_of), ZERO)
+    return sum(
+        (t.units for t in transactions if t.units is not None and t.date <= as_of), ZERO
+    )
 
 
 def _bucket_for(asset_class: Optional[str]) -> str:
-    return asset_class if asset_class in ("EQUITY", "HYBRID", "DEBT") else "total"
+    return asset_class if asset_class in ("EQUITY", "HYBRID", "DEBT") else "OTHER"
     # Note: casparser's own scheme.type only ever resolves to EQUITY/DEBT/
     # None (never HYBRID) — the HYBRID bucket exists structurally per
     # spec 13.2 but will be empty for casparser-sourced data today.
 
 
 def compute_snapshot(
-    session: Session, holding_ids: list[int], start_date: Optional[date], end_date: date,
+    session: Session,
+    holding_ids: list[int],
+    start_date: Optional[date],
+    end_date: date,
     ctx: Optional["portfolio_service.PortfolioContext"] = None,
 ) -> dict[str, dict]:
     """ctx: optional prefetched holdings/schemes/transactions from
@@ -93,7 +103,11 @@ def compute_snapshot(
     context: they resolve at start_date and end_date, which are specific
     to this call, whereas ctx.navs holds a single valuation date. They
     are batched here per date instead."""
-    buckets: dict[str, BucketSnapshot] = {k: BucketSnapshot() for k in (*BUCKET_KEYS[:-1], "total")}
+    if start_date and start_date > end_date:
+        raise ValueError("Start date must be on or before end date.")
+    buckets: dict[str, BucketSnapshot] = {
+        k: BucketSnapshot() for k in (*BUCKET_KEYS[:-1], "total")
+    }
 
     if ctx is not None:
         holdings = {hid: ctx.holdings.get(hid) for hid in holding_ids}
@@ -101,12 +115,16 @@ def compute_snapshot(
     else:
         holdings = {
             h.holding_id: h
-            for h in session.execute(select(Holding).where(Holding.holding_id.in_(holding_ids))).scalars()
+            for h in session.execute(
+                select(Holding).where(Holding.holding_id.in_(holding_ids))
+            ).scalars()
         }
         scheme_ids = [h.scheme_id for h in holdings.values()]
 
     opening_navs = (
-        nav_service.get_navs_on_or_before(session, scheme_ids, start_date) if start_date else {}
+        nav_service.get_navs_on_or_before(session, scheme_ids, start_date)
+        if start_date
+        else {}
     )
     closing_navs = nav_service.get_navs_on_or_before(session, scheme_ids, end_date)
 
@@ -115,28 +133,54 @@ def compute_snapshot(
         if holding is None:
             continue
         if ctx is not None:
-            scheme = ctx.schemes.get(holding.scheme_id) or session.get(Scheme, holding.scheme_id)
+            scheme = ctx.schemes.get(holding.scheme_id) or session.get(
+                Scheme, holding.scheme_id
+            )
             transactions = ctx.transactions.get(holding_id, [])
         else:
             scheme = session.get(Scheme, holding.scheme_id)
-            transactions = list(session.execute(
-                select(Transaction).where(Transaction.holding_id == holding_id).order_by(Transaction.date)
-            ).scalars())
+            transactions = list(
+                session.execute(
+                    select(Transaction)
+                    .where(Transaction.holding_id == holding_id)
+                    .order_by(Transaction.date)
+                ).scalars()
+            )
 
-        opening_units = _units_at(transactions, start_date) if start_date else ZERO
+        opening_units = (
+            portfolio_service.units_at(holding, transactions, start_date)
+            if start_date
+            else ZERO
+        )
         opening_point = opening_navs.get(holding.scheme_id) if start_date else None
-        opening_value = (opening_units * opening_point.nav) if (start_date and opening_point) else ZERO
+        opening_value = (
+            ((opening_units or ZERO) * opening_point.nav)
+            if (start_date and opening_point)
+            else ZERO
+        )
 
-        closing_units = _units_at(transactions, end_date)
+        closing_units = portfolio_service.units_at(holding, transactions, end_date)
         closing_point = closing_navs.get(holding.scheme_id)
-        closing_value = (closing_units * closing_point.nav) if closing_point else ZERO
+        closing_value = (
+            ((closing_units or ZERO) * closing_point.nav) if closing_point else ZERO
+        )
 
-        period = {"purchase": ZERO, "switch_in": ZERO, "switch_out": ZERO, "div_payout": ZERO, "redemption": ZERO}
+        period = {
+            "purchase": ZERO,
+            "switch_in": ZERO,
+            "switch_out": ZERO,
+            "div_payout": ZERO,
+            "redemption": ZERO,
+        }
         type_key = {
-            "PURCHASE": "purchase", "PURCHASE_SIP": "purchase",
-            "SWITCH_IN": "switch_in", "SWITCH_IN_MERGER": "switch_in",
-            "SWITCH_OUT": "switch_out", "SWITCH_OUT_MERGER": "switch_out",
-            "DIVIDEND_PAYOUT": "div_payout", "REDEMPTION": "redemption",
+            "PURCHASE": "purchase",
+            "PURCHASE_SIP": "purchase",
+            "SWITCH_IN": "switch_in",
+            "SWITCH_IN_MERGER": "switch_in",
+            "SWITCH_OUT": "switch_out",
+            "SWITCH_OUT_MERGER": "switch_out",
+            "DIVIDEND_PAYOUT": "div_payout",
+            "REDEMPTION": "redemption",
         }
         period_cashflows: list[tuple[date, Decimal]] = []
         if start_date and opening_value:
@@ -158,18 +202,41 @@ def compute_snapshot(
                 # casparser's own name for a reversed SIP installment
                 # specifically, so it always nets against "purchase".
                 period["purchase"] -= abs(t.amount)
-            if t.type in MONEY_OUT_TYPES and t.amount is not None:
-                period_cashflows.append((t.date, -abs(t.amount)))
-            elif t.type in MONEY_IN_TYPES and t.amount is not None:
-                period_cashflows.append((t.date, abs(t.amount)))
-            elif t.type == "REVERSAL" and t.amount is not None:
-                period_cashflows.append((t.date, -t.amount))
+            elif t.type == "STAMP_DUTY_TAX" and t.amount is not None:
+                period["purchase"] += t.amount
+        period_cashflows.extend(
+            ledger.cashflows(
+                [t for t in transactions if not start_date or t.date > start_date],
+                end_date,
+            )
+        )
         if closing_value:
             period_cashflows.append((end_date, closing_value))
 
+        opening_incomplete = opening_units is None or bool(
+            opening_units and (not opening_point or not scheme.identity_confirmed)
+        )
+        closing_incomplete = closing_units is None or bool(
+            closing_units and (not closing_point or not scheme.identity_confirmed)
+        )
+        incomplete = (
+            opening_incomplete
+            or closing_incomplete
+            or getattr(holding, "data_quality_code", None)
+            == "CAS_RECONCILIATION_FAILED"
+            or any(
+                t.type in {"GIFT_IN", "GIFT_OUT", "SEGREGATION"}
+                for t in transactions
+                if t.date <= end_date
+            )
+            or (start_date is None and bool(holding.opening_units))
+        )
         bucket_key = _bucket_for(scheme.asset_class)
         for key in (bucket_key, "total"):
             b = buckets[key]
+            b.incomplete |= incomplete
+            b.opening_incomplete |= opening_incomplete
+            b.closing_incomplete |= closing_incomplete
             b.opening_balance += opening_value
             b.closing_balance += closing_value
             b.purchase += period["purchase"]
@@ -185,13 +252,34 @@ def compute_snapshot(
         # div_payout is real money paid out with no offsetting unit
         # reduction, so it has to be an outflow here or it silently
         # vanishes from net_gain (spec 13.2).
-        b.net_gain = b.closing_balance + b.redemption + b.switch_out + b.div_payout - b.opening_balance - b.purchase - b.switch_in
-        outcome = xirr_engine.xirr(b._cashflows) if len(b._cashflows) >= 2 else xirr_engine.XirrOutcome(None, "XIRR_NO_SOLUTION: fewer than 2 cash flows")
-        b.xirr_pct = outcome.value
+        b.net_gain = (
+            b.closing_balance
+            + b.redemption
+            + b.switch_out
+            + b.div_payout
+            - b.opening_balance
+            - b.purchase
+            - b.switch_in
+        )
+        outcome = (
+            xirr_engine.xirr(b._cashflows)
+            if len(b._cashflows) >= 2
+            else xirr_engine.XirrOutcome(
+                None, "XIRR_NO_SOLUTION: fewer than 2 cash flows"
+            )
+        )
+        b.xirr_pct = None if b.incomplete else outcome.value
         result[key] = {
-            "opening_balance": b.opening_balance, "purchase": b.purchase, "switch_in": b.switch_in,
-            "switch_out": b.switch_out, "div_payout": b.div_payout, "redemption": b.redemption,
-            "net_addition": b.net_addition, "closing_balance": b.closing_balance,
-            "net_gain": b.net_gain, "xirr": b.xirr_pct,
+            "data_quality": "PARTIAL" if b.incomplete else "OK",
+            "opening_balance": None if b.opening_incomplete else b.opening_balance,
+            "purchase": b.purchase,
+            "switch_in": b.switch_in,
+            "switch_out": b.switch_out,
+            "div_payout": b.div_payout,
+            "redemption": b.redemption,
+            "net_addition": b.net_addition,
+            "closing_balance": None if b.closing_incomplete else b.closing_balance,
+            "net_gain": None if b.incomplete else b.net_gain,
+            "xirr": b.xirr_pct,
         }
     return result

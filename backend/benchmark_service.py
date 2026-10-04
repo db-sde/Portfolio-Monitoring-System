@@ -25,6 +25,7 @@ Three benchmark columns (spec 14.1, 14.3):
 from __future__ import annotations
 
 import asyncio
+from bisect import bisect_right
 from dataclasses import dataclass
 from datetime import date, datetime, timezone
 from decimal import Decimal
@@ -58,13 +59,17 @@ class BenchmarkXirrResult:
 
 def get_or_create_nifty50_proxy(session: Session) -> BenchmarkDefinition:
     existing = session.execute(
-        select(BenchmarkDefinition).where(BenchmarkDefinition.name == NIFTY50_PROXY_NAME)
+        select(BenchmarkDefinition).where(
+            BenchmarkDefinition.name == NIFTY50_PROXY_NAME
+        )
     ).scalar_one_or_none()
     if existing:
         return existing
     benchmark = BenchmarkDefinition(
-        name=NIFTY50_PROXY_NAME, kind="index_fund_proxy",
-        source_code=NIFTY50_PROXY_AMFI_CODE, proxy_disclosure=NIFTY50_PROXY_DISCLOSURE,
+        name=NIFTY50_PROXY_NAME,
+        kind="index_fund_proxy",
+        source_code=NIFTY50_PROXY_AMFI_CODE,
+        proxy_disclosure=NIFTY50_PROXY_DISCLOSURE,
     )
     session.add(benchmark)
     session.flush()
@@ -72,7 +77,9 @@ def get_or_create_nifty50_proxy(session: Session) -> BenchmarkDefinition:
 
 
 def _get_or_create_proxy_scheme(session: Session, amfi_code: str, name: str) -> Scheme:
-    existing = session.execute(select(Scheme).where(Scheme.amfi_code == amfi_code)).scalar_one_or_none()
+    existing = session.execute(
+        select(Scheme).where(Scheme.amfi_code == amfi_code).limit(1)
+    ).scalar_one_or_none()
     if existing:
         return existing
     scheme = Scheme(amfi_code=amfi_code, name=name, asset_class="OTHER", active=True)
@@ -85,7 +92,9 @@ FETCH_RETRY_ATTEMPTS = 3
 FETCH_RETRY_DELAY_SECONDS = 1.0
 
 
-async def refresh_nifty50_proxy_nav(session: Session, client: httpx.AsyncClient) -> None:
+async def refresh_nifty50_proxy_nav(
+    session: Session, client: httpx.AsyncClient
+) -> None:
     """Fetch/refresh the proxy fund's full NAV history into nav_cache —
     call this from the same background enrichment cycle that refreshes
     per-scheme NAVs (spec 18), not per-request.
@@ -98,18 +107,16 @@ async def refresh_nifty50_proxy_nav(session: Session, client: httpx.AsyncClient)
     same run, not just this one benchmark fetch (caught live: a single
     ConnectTimeout here silently discarded an already-successful scheme
     NAV population that happened earlier in the same transaction)."""
-    scheme = _get_or_create_proxy_scheme(session, NIFTY50_PROXY_AMFI_CODE, "UTI Nifty 50 Index Fund - Direct Growth")
-    raw = None
-    for attempt in range(FETCH_RETRY_ATTEMPTS):
-        try:
-            resp = await client.get(f"{MFAPI_BASE}/{NIFTY50_PROXY_AMFI_CODE}", timeout=httpx.Timeout(15.0, connect=5.0))
-            if resp.status_code == 200:
-                raw = resp.json()
-                break
-        except (httpx.HTTPError, ValueError):
-            pass
-        if attempt < FETCH_RETRY_ATTEMPTS - 1:
-            await asyncio.sleep(FETCH_RETRY_DELAY_SECONDS)
+    scheme = _get_or_create_proxy_scheme(
+        session, NIFTY50_PROXY_AMFI_CODE, "UTI Nifty 50 Index Fund - Direct Growth"
+    )
+    latest = nav_service.get_latest_nav(session, scheme.scheme_id)
+    if latest and (date.today() - latest.resolved_date).days <= 1:
+        return
+    session.commit()
+    from provider import fetch_json
+
+    raw = await fetch_json(client, f"{MFAPI_BASE}/{NIFTY50_PROXY_AMFI_CODE}")
     if raw is None:
         return
 
@@ -120,16 +127,28 @@ async def refresh_nifty50_proxy_nav(session: Session, client: httpx.AsyncClient)
             points.append((d, Decimal(str(row["nav"]))))
         except (ValueError, KeyError, TypeError):
             continue
-    nav_service.store_nav_points(session, scheme.scheme_id, points)
+    nav_service.store_nav_points(
+        session,
+        scheme.scheme_id,
+        points,
+        stored_summary=nav_service.get_stored_nav_summary(
+            session, [scheme.scheme_id]
+        ).get(scheme.scheme_id),
+    )
 
 
 def _nifty50_proxy_scheme_id(session: Session) -> Optional[int]:
-    scheme = session.execute(select(Scheme).where(Scheme.amfi_code == NIFTY50_PROXY_AMFI_CODE)).scalar_one_or_none()
+    scheme = session.execute(
+        select(Scheme).where(Scheme.amfi_code == NIFTY50_PROXY_AMFI_CODE).limit(1)
+    ).scalar_one_or_none()
     return scheme.scheme_id if scheme else None
 
 
 def simulate_benchmark_xirr(
-    session: Session, cashflows: list[tuple[date, Decimal]], valuation_date: date, benchmark_name: str = "Nifty 50",
+    session: Session,
+    cashflows: list[tuple[date, Decimal]],
+    valuation_date: date,
+    benchmark_name: str = "Nifty 50",
 ) -> BenchmarkXirrResult:
     """Spec 14.2's replay algorithm. `cashflows` are the SAME external
     cash flows already used for the real portfolio/scheme/advisor XIRR —
@@ -139,23 +158,49 @@ def simulate_benchmark_xirr(
     benchmark calculations")."""
     if benchmark_name != "Nifty 50":
         return BenchmarkXirrResult(
-            value=None, label=benchmark_name, proxy_disclosure=None, status="unavailable",
+            value=None,
+            label=benchmark_name,
+            proxy_disclosure=None,
+            status="unavailable",
             reason="BENCHMARK_UNAVAILABLE: no reliable free source configured for this benchmark yet.",
         )
 
-    scheme_id = _nifty50_proxy_scheme_id(session)
+    if "benchmark_scheme_id" not in session.info:
+        session.info["benchmark_scheme_id"] = _nifty50_proxy_scheme_id(session)
+    scheme_id = session.info["benchmark_scheme_id"]
     if scheme_id is None:
         return BenchmarkXirrResult(
-            value=None, label=NIFTY50_PROXY_NAME, proxy_disclosure=NIFTY50_PROXY_DISCLOSURE, status="unavailable",
+            value=None,
+            label=NIFTY50_PROXY_NAME,
+            proxy_disclosure=NIFTY50_PROXY_DISCLOSURE,
+            status="unavailable",
             reason="BENCHMARK_UNAVAILABLE: proxy fund NAV history not yet fetched.",
         )
 
+    history_key = ("benchmark_history", scheme_id)
+    history = session.info.get(history_key)
+    if history is None:
+        history = nav_service.get_nav_history(session, scheme_id)
+        session.info[history_key] = history
+    dates = [date.fromisoformat(r["date"]) for r in history]
+
+    def point_on(d):
+        index = bisect_right(dates, d) - 1
+        if index < 0:
+            return None
+        from types import SimpleNamespace
+
+        return SimpleNamespace(nav=Decimal(str(history[index]["nav"])))
+
     benchmark_units = Decimal("0")
     for cf_date, cf in sorted(cashflows, key=lambda x: x[0]):
-        point = nav_service.get_nav_on_or_before(session, scheme_id, cf_date)
+        point = point_on(cf_date)
         if point is None or not point.nav:
             return BenchmarkXirrResult(
-                value=None, label=NIFTY50_PROXY_NAME, proxy_disclosure=NIFTY50_PROXY_DISCLOSURE, status="unavailable",
+                value=None,
+                label=NIFTY50_PROXY_NAME,
+                proxy_disclosure=NIFTY50_PROXY_DISCLOSURE,
+                status="unavailable",
                 reason=f"BENCHMARK_UNAVAILABLE: no benchmark NAV on or before {cf_date}.",
             )
         if cf < 0:
@@ -163,10 +208,13 @@ def simulate_benchmark_xirr(
         elif cf > 0:
             benchmark_units -= cf / point.nav
 
-    terminal_point = nav_service.get_nav_on_or_before(session, scheme_id, valuation_date)
+    terminal_point = point_on(valuation_date)
     if terminal_point is None or benchmark_units <= 0:
         return BenchmarkXirrResult(
-            value=None, label=NIFTY50_PROXY_NAME, proxy_disclosure=NIFTY50_PROXY_DISCLOSURE, status="unavailable",
+            value=None,
+            label=NIFTY50_PROXY_NAME,
+            proxy_disclosure=NIFTY50_PROXY_DISCLOSURE,
+            status="unavailable",
             reason="BENCHMARK_UNAVAILABLE: no terminal benchmark NAV or non-positive simulated position.",
         )
 
@@ -175,9 +223,15 @@ def simulate_benchmark_xirr(
     outcome = xirr_engine.xirr(sim_flows)
     if outcome.value is None:
         return BenchmarkXirrResult(
-            value=None, label=NIFTY50_PROXY_NAME, proxy_disclosure=NIFTY50_PROXY_DISCLOSURE,
-            status="unavailable", reason=f"XIRR_NO_SOLUTION: {outcome.reason}",
+            value=None,
+            label=NIFTY50_PROXY_NAME,
+            proxy_disclosure=NIFTY50_PROXY_DISCLOSURE,
+            status="unavailable",
+            reason=f"XIRR_NO_SOLUTION: {outcome.reason}",
         )
     return BenchmarkXirrResult(
-        value=outcome.value, label=NIFTY50_PROXY_NAME, proxy_disclosure=NIFTY50_PROXY_DISCLOSURE, status="ok",
+        value=outcome.value,
+        label=NIFTY50_PROXY_NAME,
+        proxy_disclosure=NIFTY50_PROXY_DISCLOSURE,
+        status="ok",
     )

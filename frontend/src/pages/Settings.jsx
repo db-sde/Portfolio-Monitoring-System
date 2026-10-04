@@ -108,6 +108,8 @@ function InvestorCard({ investor, onRename, onRemove, onAddArn, onRelabelArn, on
 }
 
 export default function Settings({ onConfigSaved }) {
+  const [error, setError] = useState(null)
+  const [dirty, setDirty] = useState(false)
   const [config, setConfig] = useState(null)
   const [groups, setGroups] = useState([])
   const [loading, setLoading] = useState(true)
@@ -117,13 +119,22 @@ export default function Settings({ onConfigSaved }) {
   const [resetError, setResetError] = useState(null)
 
   useEffect(() => {
+    let live = true
     api.getConfig().then((c) => {
+      if (!live) return
       setConfig(c)
       setGroups(c.groups || [])
-    }).finally(() => setLoading(false))
+    }).catch(e => { if (live) setError(e.message) }).finally(() => { if (live) setLoading(false) })
+    return () => { live = false }
   }, [])
 
-  const touch = () => setSaved(false)
+  useEffect(() => {
+    window.dispatchEvent(new CustomEvent('settings-dirty', { detail: dirty }))
+    const leave = (e) => { if (dirty) { e.preventDefault(); e.returnValue = '' } }
+    window.addEventListener('beforeunload', leave)
+    return () => { window.removeEventListener('beforeunload', leave); window.dispatchEvent(new CustomEvent('settings-dirty', { detail: false })) }
+  }, [dirty])
+  const touch = () => { setSaved(false); setDirty(true) }
 
   const updateGroup = (gi, fn) => {
     setGroups((gs) => gs.map((g, i) => (i === gi ? fn(g) : g)))
@@ -147,13 +158,16 @@ export default function Settings({ onConfigSaved }) {
 
   const save = async () => {
     setSaving(true)
+    setError(null)
     const next = { ...config, groups }
     try {
       await api.saveConfig(next)
-      setConfig(next)
+      const fresh = await api.getConfig()
+      setConfig(fresh)
+      setDirty(false)
       setSaved(true)
-      onConfigSaved?.()
-    } finally {
+      await onConfigSaved?.()
+    } catch (e) { setError(e.message) } finally {
       setSaving(false)
     }
   }
@@ -183,10 +197,11 @@ export default function Settings({ onConfigSaved }) {
   }
 
   if (loading) return <div className="text-sm text-ink-3">Loading…</div>
-  if (!config) return null
+  if (!config) return <div role="alert" className="text-bad">{error || 'Settings unavailable. Reload to retry.'}</div>
 
   return (
     <div className="max-w-3xl space-y-6 animate-fade-up">
+      {error && <p role="alert" className="text-bad">{error}</p>}
       <div className="rounded-xl border border-line-soft bg-card p-5">
         <h2 className="font-display font-semibold text-ink mb-4">Preferences</h2>
         <div className="space-y-4">
@@ -200,12 +215,11 @@ export default function Settings({ onConfigSaved }) {
           </label>
           <div className="flex items-center justify-between gap-4">
             <span className="text-sm text-ink-2">Primary benchmark</span>
-            <input
-              type="text"
+            <select
               value={config.preferences?.primary_benchmark || ''}
               onChange={(e) => updatePreference('primary_benchmark', e.target.value)}
               className="rounded-lg border border-line px-3 py-1.5 text-sm w-48 outline-none focus:border-accent"
-            />
+            ><option>Nifty 50</option><option>Nifty 500</option></select>
           </div>
         </div>
       </div>
@@ -245,11 +259,11 @@ export default function Settings({ onConfigSaved }) {
                     onAddArn={(code, label) => updateInvestor(gi, ii, (inv) => ({
                       ...inv,
                       arns: [...(inv.arns || []), code],
-                      arn_labels: { ...(inv.arn_labels || {}), [code]: label },
+                      arn_labels: { ...inv.arn_labels, [code]: label },
                     }))}
                     onRelabelArn={(code, label) => updateInvestor(gi, ii, (inv) => ({
                       ...inv,
-                      arn_labels: { ...(inv.arn_labels || {}), [code]: label },
+                      arn_labels: { ...inv.arn_labels, [code]: label },
                     }))}
                     onRemoveArn={(code) => updateInvestor(gi, ii, (inv) => {
                       const { [code]: _drop, ...restLabels } = inv.arn_labels || {}

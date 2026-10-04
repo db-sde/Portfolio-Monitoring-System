@@ -24,7 +24,14 @@ from typing import Optional
 ZERO = Decimal("0")
 
 # Spec 8.1 sign convention / lot action table.
-LOT_CREATING_TYPES = {"PURCHASE", "PURCHASE_SIP", "SWITCH_IN", "SWITCH_IN_MERGER", "DIVIDEND_REINVEST", "GIFT_IN"}
+LOT_CREATING_TYPES = {
+    "PURCHASE",
+    "PURCHASE_SIP",
+    "SWITCH_IN",
+    "SWITCH_IN_MERGER",
+    "DIVIDEND_REINVEST",
+    "GIFT_IN",
+}
 DISPOSAL_TYPES = {"REDEMPTION", "SWITCH_OUT", "SWITCH_OUT_MERGER"}
 # GIFT_IN creates a lot (so a later disposal from the same holding has
 # real units to consume) but it's tagged via origin_type so gains code
@@ -40,19 +47,8 @@ DISPOSAL_TYPES = {"REDEMPTION", "SWITCH_OUT", "SWITCH_OUT_MERGER"}
 # carry) — FIFO-consumed like a disposal for balance accuracy, but never
 # produces a DisposalAllocation/realized_gain.
 #
-# REVERSAL belongs here too, not in the no-op list below — a real
-# statement's REVERSAL row (a bounced/reversed SIP installment: the AMC
-# claws back the exact units and amount of an earlier PURCHASE_SIP) is
-# never paired to its originating purchase by any explicit key, so
-# rather than try to match them, it's consumed the same way GIFT_OUT
-# already is: chronologically against whatever lots are open, oldest
-# first. Confirmed against a real statement where the original design
-# ("no unit effect, handled by the transaction it reverses simply not
-# being counted") left REVERSAL out of every FIFO-affecting set
-# entirely — the reversed SIP's units stayed in the derived balance
-# forever since nothing ever subtracted them back out, inflating a real
-# holding's balance by exactly the sum of its REVERSAL units versus the
-# CAS statement's own printed close.
+# Reversals cancel a matching purchase; they never consume unrelated
+# FIFO lots. A statement may print a reversal before its same-day purchase.
 NON_TAXABLE_REDUCTION_TYPES = {"GIFT_OUT", "SEGREGATION", "REVERSAL"}
 # No unit effect, no lot action at all: DIVIDEND_PAYOUT, STT_TAX,
 # STAMP_DUTY_TAX, TDS_TAX, MISC, UNKNOWN.
@@ -63,6 +59,7 @@ class LotInput:
     """One transaction that creates or consumes units, already filtered
     to LOT_CREATING_TYPES/DISPOSAL_TYPES by the caller (fifo_engine only
     handles the matching, not classifying every TransactionType)."""
+
     transaction_id: int
     date: date
     type: str
@@ -70,6 +67,7 @@ class LotInput:
     amount: Decimal  # purchase cash outflow, or disposal proceeds
     nav: Optional[Decimal]
     stamp_duty: Decimal = ZERO
+    reverses_transaction_id: Optional[int] = None
 
 
 @dataclass
@@ -106,74 +104,125 @@ class FifoResult:
     # transaction so the caller can raise FIFO_SHORTFALL against exactly
     # that disposal, not the whole holding.
     shortfalls: dict[int, Decimal] = field(default_factory=dict)
+    reversal_errors: dict[int, str] = field(default_factory=dict)
+    reversal_links: dict[int, int] = field(default_factory=dict)
 
 
 def run_fifo(events: list[LotInput]) -> FifoResult:
-    """events MUST already be sorted (date, then a stable original
-    ledger order for same-day ties) by the caller — this function does
-    not re-sort, since "same-day ties" ordering is a CAS-ledger-position
-    decision (spec 6.3's occurrence_index), not something to infer here."""
-    result = FifoResult()
-    open_lots: list[Lot] = []  # oldest-first; index also serves as lot_index
+    """Match disposals in ledger order; reversals cancel a specific purchase.
 
+    The cursor skips exhausted lots permanently. Lot indices remain stable
+    for disposal allocations even when a reversal closes a newer lot.
+    """
+    result = FifoResult()
+    # Resolve unique same-day cancellation pairs before replay. Printed row
+    # order does not establish intraday execution order, and a cancelled
+    # purchase must not become available to an intervening redemption.
+    purchases_by_date = {}
+    for event in events:
+        if event.type in {"PURCHASE", "PURCHASE_SIP"} and event.units > ZERO:
+            purchases_by_date.setdefault(event.date, []).append(event)
+    proposed = {}
+    claims = {}
+    for event in events:
+        if event.type != "REVERSAL":
+            continue
+        candidates = [
+            p
+            for p in purchases_by_date.get(event.date, [])
+            if p.units == event.units
+            and abs(p.amount - event.amount) <= Decimal("0.01")
+            and (
+                not event.reverses_transaction_id
+                or p.transaction_id == event.reverses_transaction_id
+            )
+        ]
+        if len(candidates) == 1:
+            purchase_id = candidates[0].transaction_id
+            proposed[event.transaction_id] = purchase_id
+            claims[purchase_id] = claims.get(purchase_id, 0) + 1
+    result.reversal_links = {
+        reversal: purchase
+        for reversal, purchase in proposed.items()
+        if claims[purchase] == 1
+    }
+    cancelled = set(result.reversal_links.values())
+    cursor = 0
     for event in events:
         if event.type in LOT_CREATING_TYPES:
-            lot = Lot(
-                transaction_id=event.transaction_id,
-                acquired_date=event.date,
-                original_units=event.units,
-                remaining_units=event.units,
-                purchase_nav=event.nav if event.nav is not None else (
-                    event.amount / event.units if event.units else ZERO
-                ),
-                purchase_amount=event.amount,
-                remaining_cost=event.amount + event.stamp_duty,
-                stamp_duty=event.stamp_duty,
-                origin_type=event.type,
+            if event.units <= ZERO:
+                continue
+            result.lots.append(
+                Lot(
+                    transaction_id=event.transaction_id,
+                    acquired_date=event.date,
+                    original_units=event.units,
+                    remaining_units=ZERO
+                    if event.transaction_id in cancelled
+                    else event.units,
+                    purchase_nav=event.nav
+                    if event.nav is not None
+                    else event.amount / event.units,
+                    purchase_amount=event.amount,
+                    remaining_cost=ZERO
+                    if event.transaction_id in cancelled
+                    else event.amount + event.stamp_duty,
+                    stamp_duty=event.stamp_duty,
+                    origin_type=event.type,
+                )
             )
-            open_lots.append(lot)
-            result.lots.append(lot)
-
-        elif event.type in DISPOSAL_TYPES or event.type in NON_TAXABLE_REDUCTION_TYPES:
-            is_taxable = event.type in DISPOSAL_TYPES
-            remaining_to_sell = event.units
-            total_units_for_proceeds = event.units  # for proportional sale-value allocation
-            for idx, lot in enumerate(open_lots):
-                if remaining_to_sell <= ZERO:
-                    break
-                if lot.remaining_units <= ZERO:
-                    continue
-                matched = min(lot.remaining_units, remaining_to_sell)
-                cost_fraction = matched / lot.original_units if lot.original_units else ZERO
-                # Proportional slice of THIS lot's own original cost, not
-                # the lot's current remaining_cost — remaining_cost was
-                # already reduced by any earlier partial disposal, so
-                # re-deriving from original_units/purchase_amount keeps
-                # each allocation's cost tied to what was actually paid
-                # for those specific units, not a stale running remainder.
-                allocated_cost = (lot.purchase_amount + lot.stamp_duty) * cost_fraction
-                if is_taxable:
-                    sale_value = (
-                        event.amount * (matched / total_units_for_proceeds)
-                        if total_units_for_proceeds else ZERO
-                    )
-                    result.allocations.append(DisposalAllocation(
+            continue
+        if event.type == "REVERSAL":
+            if event.transaction_id in result.reversal_links:
+                continue
+            candidates = [
+                l
+                for l in result.lots
+                if l.origin_type in {"PURCHASE", "PURCHASE_SIP"}
+                and l.remaining_units == l.original_units
+                and l.original_units == event.units
+                and (
+                    l.transaction_id == event.reverses_transaction_id
+                    if event.reverses_transaction_id
+                    else abs(l.purchase_amount - event.amount) <= Decimal("0.01")
+                )
+            ]
+            if len(candidates) != 1:
+                result.reversal_errors[event.transaction_id] = (
+                    "Reversal has no unique, unconsumed originating purchase."
+                )
+                continue
+            lot = candidates[0]
+            lot.remaining_units = ZERO
+            lot.remaining_cost = ZERO
+            result.reversal_links[event.transaction_id] = lot.transaction_id
+            continue
+        if event.type not in DISPOSAL_TYPES | NON_TAXABLE_REDUCTION_TYPES:
+            continue
+        remaining = event.units
+        while cursor < len(result.lots) and remaining > ZERO:
+            lot = result.lots[cursor]
+            if lot.remaining_units <= ZERO:
+                cursor += 1
+                continue
+            matched = min(lot.remaining_units, remaining)
+            cost = (lot.purchase_amount + lot.stamp_duty) * matched / lot.original_units
+            if event.type in DISPOSAL_TYPES:
+                proceeds = event.amount * matched / event.units
+                result.allocations.append(
+                    DisposalAllocation(
                         disposal_transaction_id=event.transaction_id,
-                        lot_index=idx,
+                        lot_index=cursor,
                         allocated_units=matched,
-                        allocated_cost=allocated_cost,
-                        sale_value=sale_value,
-                        realized_gain=sale_value - allocated_cost,
+                        allocated_cost=cost,
+                        sale_value=proceeds,
+                        realized_gain=proceeds - cost,
                         sold_date=event.date,
-                    ))
-                # Non-taxable reduction (gift-out/segregation): units and
-                # cost still come off the lot so balance stays accurate,
-                # just with no allocation/gain record created.
-                lot.remaining_units -= matched
-                lot.remaining_cost -= allocated_cost
-                remaining_to_sell -= matched
-
-            if remaining_to_sell > ZERO:
-                result.shortfalls[event.transaction_id] = remaining_to_sell
-
+                    )
+                )
+            lot.remaining_units -= matched
+            lot.remaining_cost -= cost
+            remaining -= matched
+        if remaining > ZERO:
+            result.shortfalls[event.transaction_id] = remaining
     return result

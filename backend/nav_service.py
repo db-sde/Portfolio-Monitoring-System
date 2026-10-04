@@ -180,6 +180,8 @@ def store_nav_points(
     roughly 205s across a real 54-scheme portfolio, spent rewriting rows
     to the values they already held. Past NAVs are immutable, so on a
     re-run there is usually nothing to write at all."""
+    # Deduplicate provider dates and reject unusable values before the bulk upsert.
+    points = list({d: nav for d, nav in points if nav.is_finite() and nav > 0}.items())
     if not points:
         return
     if stored_summary is not None:

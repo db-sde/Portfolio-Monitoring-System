@@ -56,7 +56,7 @@ export default function TopBar({ investorName, statementPeriod, lastEnriched, en
         </div>
 
         <div className="flex items-center gap-2.5 shrink-0">
-          {enrichStatus && enrichStatus.pending > 0 && (
+          {enrichStatus?.active_job && (
             <span className="hidden sm:inline-flex items-center gap-1.5 text-xs font-medium text-warn bg-warn-tint rounded-full px-2.5 py-1">
               <svg width="12" height="12" viewBox="0 0 24 24" className="animate-spin"><circle cx="12" cy="12" r="9" fill="none" stroke="currentColor" strokeWidth="3" strokeDasharray="42" strokeDashoffset="14" strokeLinecap="round" /></svg>
               Enriching {enrichStatus.total_schemes - enrichStatus.pending}/{enrichStatus.total_schemes}
@@ -86,7 +86,7 @@ export default function TopBar({ investorName, statementPeriod, lastEnriched, en
             disabled={uploading || !!pendingFile}
             className="text-sm font-semibold text-ink-2 hover:text-ink border border-line rounded-lg px-3.5 py-2 disabled:opacity-50 transition-colors"
           >
-            {uploading ? 'Importing…' : 'New statement'}
+            {uploading ? 'Processing…' : 'New statement'}
           </button>
         </div>
       </div>

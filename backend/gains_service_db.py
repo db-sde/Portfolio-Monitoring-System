@@ -39,6 +39,7 @@ from casparser.analysis.utils import get_fin_year
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+import ledger
 from models import DisposalAllocation, Folio, Holding, PurchaseLot, Scheme, Transaction
 
 
@@ -86,23 +87,24 @@ class ExcludedGiftDisposal:
     8.3) — no gain is computed for these units since the donor's cost
     basis/holding period (Sec 49(1)/2(42A)) isn't in this CAS. Surfaced
     explicitly rather than silently missing from the gains totals."""
+
     scheme_name: str
     folio: str
     sold_date: date
     units: Decimal
+    reason: str = "Unknown cost basis"
 
 
 def _gain_entries(
-    session: Session, holding_ids: Optional[list[int]] = None,
+    session: Session,
+    holding_ids: Optional[list[int]] = None,
 ) -> tuple[list[_RawGain], list[ExcludedGiftDisposal]]:
-    query = select(DisposalAllocation, PurchaseLot, Holding, Scheme, Folio).join(
-        PurchaseLot, DisposalAllocation.lot_id == PurchaseLot.lot_id
-    ).join(
-        Holding, PurchaseLot.holding_id == Holding.holding_id
-    ).join(
-        Scheme, Holding.scheme_id == Scheme.scheme_id
-    ).join(
-        Folio, Holding.folio_id == Folio.folio_id
+    query = (
+        select(DisposalAllocation, PurchaseLot, Holding, Scheme, Folio)
+        .join(PurchaseLot, DisposalAllocation.lot_id == PurchaseLot.lot_id)
+        .join(Holding, PurchaseLot.holding_id == Holding.holding_id)
+        .join(Scheme, Holding.scheme_id == Scheme.scheme_id)
+        .join(Folio, Holding.folio_id == Folio.folio_id)
     )
     if holding_ids is not None:
         query = query.where(Holding.holding_id.in_(holding_ids))
@@ -110,16 +112,34 @@ def _gain_entries(
     out: list[_RawGain] = []
     excluded: list[ExcludedGiftDisposal] = []
     for alloc, lot, holding, scheme, folio in session.execute(query).all():
-        if lot.origin_type == "GIFT_IN":
-            excluded.append(ExcludedGiftDisposal(
-                scheme_name=scheme.name, folio=folio.normalized_folio,
-                sold_date=alloc.sold_date, units=alloc.allocated_units,
-            ))
+        if (
+            lot.origin_type == "GIFT_IN"
+            or holding.data_quality_code in ledger.BLOCKING_CODES
+            or scheme.asset_class not in {"EQUITY", "DEBT"}
+        ):
+            excluded.append(
+                ExcludedGiftDisposal(
+                    scheme_name=scheme.name,
+                    folio=folio.normalized_folio,
+                    sold_date=alloc.sold_date,
+                    units=alloc.allocated_units,
+                    reason="Gifted units"
+                    if lot.origin_type == "GIFT_IN"
+                    else holding.data_quality_code or "Unverified tax classification",
+                )
+            )
             continue
         fund_type = _asset_class_for_tax(scheme.asset_class)
-        fund = Fund(scheme=scheme.name, folio=folio.normalized_folio, isin=scheme.isin or "", type=fund_type)
+        fund = Fund(
+            scheme=scheme.name,
+            folio=folio.normalized_folio,
+            isin=scheme.isin or "",
+            type=fund_type,
+        )
         lot_stamp_share = (
-            lot.stamp_duty * (alloc.allocated_units / lot.original_units) if lot.original_units else Decimal("0")
+            lot.stamp_duty * (alloc.allocated_units / lot.original_units)
+            if lot.original_units
+            else Decimal("0")
         )
         entry = GainEntry(
             fy=get_fin_year(alloc.sold_date),
@@ -130,9 +150,13 @@ def _gain_entries(
             purchase_value=alloc.allocated_cost - lot_stamp_share,
             stamp_duty=lot_stamp_share,
             sale_date=alloc.sold_date,
-            sale_nav=(alloc.sale_value / alloc.allocated_units) if alloc.allocated_units else Decimal("0"),
+            sale_nav=(alloc.sale_value / alloc.allocated_units)
+            if alloc.allocated_units
+            else Decimal("0"),
             sale_value=alloc.sale_value,
-            stt=Decimal("0"),  # STT is tracked as its own transaction row (STT_TAX), not on the allocation
+            stt=Decimal(
+                "0"
+            ),  # STT is tracked as its own transaction row (STT_TAX), not on the allocation
             units=alloc.allocated_units,
         )
         out.append(_RawGain(entry=entry, holding=holding, scheme=scheme, folio=folio))
@@ -140,23 +164,39 @@ def _gain_entries(
 
 
 def realized_gains(
-    session: Session, holding_ids: Optional[list[int]] = None,
+    session: Session,
+    holding_ids: Optional[list[int]] = None,
 ) -> tuple[list[RealizedGainRow], list[ExcludedGiftDisposal]]:
     raw_gains, excluded = _gain_entries(session, holding_ids)
     rows: list[RealizedGainRow] = []
     for raw in raw_gains:
         entry, holding, scheme, folio = raw.entry, raw.holding, raw.scheme, raw.folio
-        rows.append(RealizedGainRow(
-            fy=entry.fy, scheme_name=scheme.name, folio=folio.normalized_folio, isin=scheme.isin,
-            fund_type=entry.type, advisor_arn=holding.advisor_arn,
-            acquired_date=entry.purchase_date, sold_date=entry.sale_date, units=entry.units,
-            acquisition_value=entry.acquisition_value, sale_value=entry.sale_value, gain=entry.gain,
-            gain_type=entry.gain_type.name, ltcg=entry.ltcg, stcg=entry.stcg, ltcg_taxable=entry.ltcg_taxable,
-        ))
+        rows.append(
+            RealizedGainRow(
+                fy=entry.fy,
+                scheme_name=scheme.name,
+                folio=folio.normalized_folio,
+                isin=scheme.isin,
+                fund_type=entry.type,
+                advisor_arn=holding.advisor_arn,
+                acquired_date=entry.purchase_date,
+                sold_date=entry.sale_date,
+                units=entry.units,
+                acquisition_value=entry.acquisition_value,
+                sale_value=entry.sale_value,
+                gain=entry.gain,
+                gain_type=entry.gain_type.name,
+                ltcg=entry.ltcg,
+                stcg=entry.stcg,
+                ltcg_taxable=entry.ltcg_taxable,
+            )
+        )
     return rows, excluded
 
 
-def generate_112a_csv(session: Session, fy: str, holding_ids: Optional[list[int]] = None) -> str:
+def generate_112a_csv(
+    session: Session, fy: str, holding_ids: Optional[list[int]] = None
+) -> str:
     """The OFFICIAL Schedule 112A format (14/15 columns incl. grandfathered
     FMV treatment and the 23-Jul-2024 LTCG-regime transfer flag) — spec
     12.2: "must use... the parser's verified export logic," not a
@@ -167,6 +207,10 @@ def generate_112a_csv(session: Session, fy: str, holding_ids: Optional[list[int]
     — exactly what this module's per-holding approach avoids) is enough
     to reuse it correctly."""
     raw_gains, _excluded = _gain_entries(session, holding_ids)
+    if any(get_fin_year(row.sold_date) == fy for row in _excluded):
+        raise ValueError(
+            "This year includes disposals with unverified cost basis or classification. Review them before exporting."
+        )
     report = CapitalGainsReport.__new__(CapitalGainsReport)
     report._gains = [raw.entry for raw in raw_gains]
     return report.generate_112a_csv_data(fy)
@@ -212,21 +256,28 @@ def gifts(session: Session, holding_ids: Optional[list[int]] = None) -> list[Gif
     gift-out isn't a sale — Sec 47(iii) — and a gift-in needs the
     donor's own cost basis/holding period, Sec 49(1)/2(42A), which a
     single CAS never has) — never part of the gains totals above."""
-    query = select(Transaction, Holding, Scheme).join(
-        Holding, Transaction.holding_id == Holding.holding_id
-    ).join(
-        Scheme, Holding.scheme_id == Scheme.scheme_id
-    ).where(Transaction.type.in_(("GIFT_IN", "GIFT_OUT")))
+    query = (
+        select(Transaction, Holding, Scheme)
+        .join(Holding, Transaction.holding_id == Holding.holding_id)
+        .join(Scheme, Holding.scheme_id == Scheme.scheme_id)
+        .where(Transaction.type.in_(("GIFT_IN", "GIFT_OUT")))
+    )
     if holding_ids is not None:
         query = query.where(Holding.holding_id.in_(holding_ids))
 
     out: list[GiftRow] = []
     for txn, holding, scheme in session.execute(query).all():
-        out.append(GiftRow(
-            fy=get_fin_year(txn.date), scheme_name=scheme.name, isin=scheme.isin,
-            direction="IN" if txn.type == "GIFT_IN" else "OUT", date=txn.date,
-            units=abs(txn.units) if txn.units is not None else Decimal("0"),
-            nav=txn.nav, value=abs(txn.amount) if txn.amount is not None else None,
-            counterparty_folio=txn.gift_folio,
-        ))
+        out.append(
+            GiftRow(
+                fy=get_fin_year(txn.date),
+                scheme_name=scheme.name,
+                isin=scheme.isin,
+                direction="IN" if txn.type == "GIFT_IN" else "OUT",
+                date=txn.date,
+                units=abs(txn.units) if txn.units is not None else Decimal("0"),
+                nav=txn.nav,
+                value=abs(txn.amount) if txn.amount is not None else None,
+                counterparty_folio=txn.gift_folio,
+            )
+        )
     return sorted(out, key=lambda g: (g.fy, g.scheme_name, g.date))

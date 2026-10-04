@@ -1,0 +1,634 @@
+diff --git a/casparser/__init__.py b/casparser/__init__.py
+index 56654bc..f40fc62 100644
+--- a/casparser/__init__.py
++++ b/casparser/__init__.py
+@@ -15,7 +15,7 @@ __all__ = [
+     "CapitalGainsReport",
+ ]
+ 
+-__version__ = "1.3.0"
++__version__ = "1.3.0+portfolioiq.1"
+ 
+ 
+ def __getattr__(name: str):
+diff --git a/casparser/parsers/__init__.py b/casparser/parsers/__init__.py
+index 0e98e41..fa1d8bd 100644
+--- a/casparser/parsers/__init__.py
++++ b/casparser/parsers/__init__.py
+@@ -143,61 +143,64 @@ def read_cas_pdf(
+     # `data` is plain pydantic models holding no pdfium references, so it
+     # is safe to return after the document is closed.
+     doc = _open_document(filename, password)
++    from ._isin import isin_session
++
+     try:
+-        file_type = detect_file_type(filename, password, _doc=doc)
+-        if file_type == FileType.UNKNOWN:
+-            raise CASParseError(
+-                "Could not identify the CAS issuer. Supported issuers are "
+-                "CAMS, KFintech, NSDL, and CDSL."
+-            )
+-
+-        if file_type in (FileType.CAMS, FileType.KFINTECH):
+-            cas_type = detect_cas_type(filename, password, _doc=doc)
+-            if cas_type == CASFileType.DETAILED:
+-                from . import cams_detailed
+-
+-                data: Union[CASData, NSDLCASData] = cams_detailed.parse(
++        with isin_session():
++            file_type = detect_file_type(filename, password, _doc=doc)
++            if file_type == FileType.UNKNOWN:
++                raise CASParseError(
++                    "Could not identify the CAS issuer. Supported issuers are "
++                    "CAMS, KFintech, NSDL, and CDSL."
++                )
++
++            if file_type in (FileType.CAMS, FileType.KFINTECH):
++                cas_type = detect_cas_type(filename, password, _doc=doc)
++                if cas_type == CASFileType.DETAILED:
++                    from . import cams_detailed
++
++                    data: Union[CASData, NSDLCASData] = cams_detailed.parse(
++                        filename,
++                        password,
++                        file_type=file_type,
++                        _doc=doc,
++                    )
++                elif cas_type == CASFileType.SUMMARY:
++                    from . import cams_summary
++
++                    data = cams_summary.parse(
++                        filename,
++                        password,
++                        file_type=file_type,
++                        _doc=doc,
++                    )
++                else:
++                    raise CASParseError(
++                        "Could not identify whether this is a DETAILED or "
++                        "SUMMARY CAMS / KFin statement."
++                    )
++                if sort_transactions and isinstance(data, CASData):
++                    data = _sort_transactions(data)
++            elif file_type == FileType.NSDL:
++                from . import nsdl
++
++                data = nsdl.parse_nsdl(
+                     filename,
+                     password,
+-                    file_type=file_type,
++                    file_type=FileType.NSDL,
+                     _doc=doc,
+                 )
+-            elif cas_type == CASFileType.SUMMARY:
+-                from . import cams_summary
++            elif file_type == FileType.CDSL:
++                from . import cdsl
+ 
+-                data = cams_summary.parse(
++                data = cdsl.parse_cdsl(
+                     filename,
+                     password,
+-                    file_type=file_type,
++                    file_type=FileType.CDSL,
+                     _doc=doc,
+                 )
+-            else:
+-                raise CASParseError(
+-                    "Could not identify whether this is a DETAILED or "
+-                    "SUMMARY CAMS / KFin statement."
+-                )
+-            if sort_transactions and isinstance(data, CASData):
+-                data = _sort_transactions(data)
+-        elif file_type == FileType.NSDL:
+-            from . import nsdl
+-
+-            data = nsdl.parse_nsdl(
+-                filename,
+-                password,
+-                file_type=FileType.NSDL,
+-                _doc=doc,
+-            )
+-        elif file_type == FileType.CDSL:
+-            from . import cdsl
+-
+-            data = cdsl.parse_cdsl(
+-                filename,
+-                password,
+-                file_type=FileType.CDSL,
+-                _doc=doc,
+-            )
+-        else:  # pragma: no cover — handled above
+-            raise CASParseError(f"Unsupported file type: {file_type}")
++            else:  # pragma: no cover — handled above
++                raise CASParseError(f"Unsupported file type: {file_type}")
+     finally:
+         doc.close()
+ 
+diff --git a/casparser/parsers/_investor.py b/casparser/parsers/_investor.py
+index e8ec246..a44a1bd 100644
+--- a/casparser/parsers/_investor.py
++++ b/casparser/parsers/_investor.py
+@@ -86,6 +86,7 @@ def extract_cams_kfin_investor(
+             pdf_path,
+             password,
+             _doc=_doc,
++            page_numbers=[0],
+         )
+     )
+     block = _left_column_atoms(pages[0]) if pages else []
+diff --git a/casparser/parsers/_isin.py b/casparser/parsers/_isin.py
+index ea21322..e4709c8 100644
+--- a/casparser/parsers/_isin.py
++++ b/casparser/parsers/_isin.py
+@@ -1,8 +1,28 @@
++from contextlib import contextmanager, nullcontext
++from contextvars import ContextVar
++
+ from typing import Dict, Iterable, Optional, Tuple
+ 
+ from casparser_isin import ISINDb, MFISINDb
+ 
+ 
++_active_db = ContextVar("casparser_isin_db", default=None)
++
++
++@contextmanager
++def isin_session():
++    """Reuse one lookup session during a parse; concurrent parses stay isolated."""
++    if _active_db.get() is not None:
++        yield
++        return
++    with MFISINDb() as db:
++        token = _active_db.set(db)
++        try:
++            yield
++        finally:
++            _active_db.reset(token)
++
++
+ def isin_search(
+     scheme_name: str,
+     rta: str,
+@@ -23,7 +43,7 @@ def isin_search(
+     :param rta_code: Scheme's per-RTA code.
+     :param isin: Optional ISIN hint pulled from the scheme header.
+     """
+-    with MFISINDb() as db:
++    with nullcontext(_active_db.get()) if _active_db.get() is not None else MFISINDb() as db:
+         try:
+             scheme_data = db.isin_lookup(scheme_name, rta, rta_code, isin=isin)
+             return scheme_data.isin, scheme_data.amfi_code, scheme_data.type
+diff --git a/casparser/parsers/cams_detailed.py b/casparser/parsers/cams_detailed.py
+index c356c69..8d9d8bc 100644
+--- a/casparser/parsers/cams_detailed.py
++++ b/casparser/parsers/cams_detailed.py
+@@ -45,7 +45,7 @@ from ._classify import (
+ )
+ from ._investor import extract_cams_kfin_investor
+ from ._isin import isin_search
+-from .extract import Char, Line, extract_pages
++from .extract import Char, Line, iter_pages
+ 
+ # -----------------------------------------------------------------------------
+ # Column anchors
+@@ -667,7 +667,7 @@ def parse(
+     *,
+     _doc=None,
+ ) -> CASData:
+-    pages = extract_pages(pdf_path, password, _doc=_doc)
++    pages = iter_pages(pdf_path, password, _doc=_doc)
+ 
+     statement_period: Optional[StatementPeriod] = None
+     # Keyed by (amc, folio_no): folio numbers are RTA-scoped, not globally
+diff --git a/casparser/parsers/cams_summary.py b/casparser/parsers/cams_summary.py
+index 50af792..91547fa 100644
+--- a/casparser/parsers/cams_summary.py
++++ b/casparser/parsers/cams_summary.py
+@@ -35,7 +35,7 @@ from casparser.types import (
+ from ._investor import extract_cams_kfin_investor
+ from ._isin import isin_search
+ from .cams_detailed import AMC_RE, Column, _decimal
+-from .extract import Char, Line, extract_pages
++from .extract import Char, Line, iter_pages
+ 
+ # -----------------------------------------------------------------------------
+ # Column anchors
+@@ -279,7 +279,7 @@ def parse(
+     *,
+     _doc=None,
+ ) -> CASData:
+-    pages = extract_pages(pdf_path, password, _doc=_doc)
++    pages = iter_pages(pdf_path, password, _doc=_doc)
+ 
+     statement_date: Optional[str] = None
+     folios: dict[str, Folio] = {}
+diff --git a/casparser/parsers/extract.py b/casparser/parsers/extract.py
+index 4f4fd2a..f1af39e 100644
+--- a/casparser/parsers/extract.py
++++ b/casparser/parsers/extract.py
+@@ -180,25 +180,26 @@ def _strip_font_subset_prefix(name: str) -> str:
+ # ---------------------------------------------------------------------- API
+ 
+ 
+-def extract_pages(
+-    pdf_path: str,
+-    password: str,
+-    *,
+-    _doc: "Optional[pdfium.PdfDocument]" = None,
+-) -> List[Page]:
+-    """Return one `Page` per PDF page, each containing baseline-clustered
+-    `Line`s of `Char`s. See module docstring for the design rationale.
+-
+-    ``_doc``: pre-opened document supplied by the dispatcher. When not
+-    provided, the function opens the PDF from `pdf_path` itself.
+-    """
++def iter_pages(pdf_path: str, password: str, *, _doc=None):
++    """Extract one page at a time and release its native PDF handles promptly."""
+     doc = _doc if _doc is not None else pdfium.PdfDocument(pdf_path, password=password)
+-    pages: List[Page] = []
+-    for page_num, page in enumerate(doc, start=1):
+-        atoms = _walk_page_atoms(page)
+-        atoms = _dedupe_overlay_atoms(atoms)
+-        pages.append(Page(number=page_num, lines=_cluster_into_lines(atoms, page_num)))
+-    return pages
++    try:
++        for page_num in range(len(doc)):
++            page = doc[page_num]
++            try:
++                atoms = _dedupe_overlay_atoms(_walk_page_atoms(page))
++                result = Page(number=page_num + 1, lines=_cluster_into_lines(atoms, page_num + 1))
++            finally:
++                page.close()
++            yield result
++    finally:
++        if _doc is None:
++            doc.close()
++
++
++def extract_pages(pdf_path: str, password: str, *, _doc=None) -> List[Page]:
++    """Compatibility wrapper for callers that need random access to all pages."""
++    return list(iter_pages(pdf_path, password, _doc=_doc))
+ 
+ 
+ # ---------------------------------------------------------------------- atom walk
+@@ -215,94 +216,99 @@ def _walk_page_atoms(page) -> List[_Atom]:
+     """
+     page_handle = page.raw
+     tp = page.get_textpage()
+-    tp_handle = tp.raw
+-
+-    # 1. Index page objects by handle so we can look up each char's
+-    #    atom in O(1) below. The handle is the raw PDFium pointer
+-    #    returned by FPDFPage_GetObject; comparing with `ctypes`
+-    #    pointers requires holding the cast value (use the integer
+-    #    address via ctypes.addressof, or compare ctypes void_p .value).
+-    n_objects = pdfium_raw.FPDFPage_CountObjects(page_handle)
+-    font_buf = (ctypes.c_char * _FONT_BUF_SIZE)()
+-    left = ctypes.c_float()
+-    bottom = ctypes.c_float()
+-    right = ctypes.c_float()
+-    top = ctypes.c_float()
+-
+-    obj_index: dict = {}  # handle-key -> _Atom (chars will be filled below)
+-    obj_order: List[int] = []
+-    for oi in range(n_objects):
+-        obj = pdfium_raw.FPDFPage_GetObject(page_handle, oi)
+-        if pdfium_raw.FPDFPageObj_GetType(obj) != pdfium_raw.FPDF_PAGEOBJ_TEXT:
+-            continue
+-        # Drop vertically-oriented text. CAMS/KFin stamp a rotated
+-        # watermark ("CAMSCASWS… Version:V3.4 Live-1017") down the page
+-        # edge; its glyphs land in the right-hand columns and bleed
+-        # fragments ("V", "iv", "CAMS L", "KFINTECH 4.") into the RTA /
+-        # scheme-name fields. The object matrix's glyph-advance vector is
+-        # (a, b); |b| > |a| means the run reads vertically, so it is
+-        # watermark noise, not content — route its chars to the drop
+-        # sentinel.
+-        _mtx = pdfium_raw.FS_MATRIX()
+-        if pdfium_raw.FPDFPageObj_GetMatrix(obj, ctypes.byref(_mtx)) and abs(_mtx.b) > abs(_mtx.a):
+-            obj_index[_obj_key(obj)] = None
+-            continue
+-        font_obj = pdfium_raw.FPDFTextObj_GetFont(obj)
+-        fn = pdfium_raw.FPDFFont_GetBaseFontName(font_obj, font_buf, _FONT_BUF_SIZE)
+-        raw_font = (
+-            font_buf.raw[: max(0, fn - 1)].decode("utf-8", errors="replace") if fn > 0 else ""
+-        )
+-        if _is_non_latin_font(raw_font):
+-            # Mark with a sentinel so chars routed here are dropped.
+-            obj_index[_obj_key(obj)] = None
+-            continue
+-        pdfium_raw.FPDFPageObj_GetBounds(
+-            obj,
+-            ctypes.byref(left),
+-            ctypes.byref(bottom),
+-            ctypes.byref(right),
+-            ctypes.byref(top),
+-        )
+-        key = _obj_key(obj)
+-        obj_index[key] = _Atom(
+-            x_left=left.value,
+-            x_right=right.value,
+-            y_top=top.value,
+-            y_bot=bottom.value,
+-            font=_strip_font_subset_prefix(raw_font),
+-        )
+-        obj_order.append(key)
+-
+-    # 2. Walk per-glyph chars. For each char, ask PDFium which text
+-    #    object owns it and append the char to that atom's list.
+-    n_chars = tp.count_chars()
+-    ox = ctypes.c_double()
+-    oy = ctypes.c_double()
+-    for ci in range(n_chars):
+-        ch = tp.get_text_range(ci, 1)
+-        if ch in ("\r", "\n", "�"):
+-            continue
+-        x0, y0_bbox, x1, y1_bbox = tp.get_charbox(ci)
+-        if y1_bbox - y0_bbox <= 0 or x1 - x0 <= 0:
+-            continue
+-        text_obj = pdfium_raw.FPDFText_GetTextObject(tp_handle, ci)
+-        atom = obj_index.get(_obj_key(text_obj))
+-        if atom is None:  # None == not text, or non-Latin (dropped)
+-            continue
+-        pdfium_raw.FPDFText_GetCharOrigin(tp_handle, ci, ox, oy)
+-        atom.chars.append(
+-            Char(
+-                text=ch,
+-                x0=x0,
+-                y0=oy.value,
+-                x1=x1,
+-                y1=y1_bbox,
+-                font=atom.font,
++    try:
++        tp_handle = tp.raw
++
++        # 1. Index page objects by handle so we can look up each char's
++        #    atom in O(1) below. The handle is the raw PDFium pointer
++        #    returned by FPDFPage_GetObject; comparing with `ctypes`
++        #    pointers requires holding the cast value (use the integer
++        #    address via ctypes.addressof, or compare ctypes void_p .value).
++        n_objects = pdfium_raw.FPDFPage_CountObjects(page_handle)
++        font_buf = (ctypes.c_char * _FONT_BUF_SIZE)()
++        left = ctypes.c_float()
++        bottom = ctypes.c_float()
++        right = ctypes.c_float()
++        top = ctypes.c_float()
++
++        obj_index: dict = {}  # handle-key -> _Atom (chars will be filled below)
++        obj_order: List[int] = []
++        for oi in range(n_objects):
++            obj = pdfium_raw.FPDFPage_GetObject(page_handle, oi)
++            if pdfium_raw.FPDFPageObj_GetType(obj) != pdfium_raw.FPDF_PAGEOBJ_TEXT:
++                continue
++            # Drop vertically-oriented text. CAMS/KFin stamp a rotated
++            # watermark ("CAMSCASWS… Version:V3.4 Live-1017") down the page
++            # edge; its glyphs land in the right-hand columns and bleed
++            # fragments ("V", "iv", "CAMS L", "KFINTECH 4.") into the RTA /
++            # scheme-name fields. The object matrix's glyph-advance vector is
++            # (a, b); |b| > |a| means the run reads vertically, so it is
++            # watermark noise, not content — route its chars to the drop
++            # sentinel.
++            _mtx = pdfium_raw.FS_MATRIX()
++            if pdfium_raw.FPDFPageObj_GetMatrix(obj, ctypes.byref(_mtx)) and abs(_mtx.b) > abs(
++                _mtx.a
++            ):
++                obj_index[_obj_key(obj)] = None
++                continue
++            font_obj = pdfium_raw.FPDFTextObj_GetFont(obj)
++            fn = pdfium_raw.FPDFFont_GetBaseFontName(font_obj, font_buf, _FONT_BUF_SIZE)
++            raw_font = (
++                font_buf.raw[: max(0, fn - 1)].decode("utf-8", errors="replace") if fn > 0 else ""
++            )
++            if _is_non_latin_font(raw_font):
++                # Mark with a sentinel so chars routed here are dropped.
++                obj_index[_obj_key(obj)] = None
++                continue
++            pdfium_raw.FPDFPageObj_GetBounds(
++                obj,
++                ctypes.byref(left),
++                ctypes.byref(bottom),
++                ctypes.byref(right),
++                ctypes.byref(top),
++            )
++            key = _obj_key(obj)
++            obj_index[key] = _Atom(
++                x_left=left.value,
++                x_right=right.value,
++                y_top=top.value,
++                y_bot=bottom.value,
++                font=_strip_font_subset_prefix(raw_font),
++            )
++            obj_order.append(key)
++
++        # 2. Walk per-glyph chars. For each char, ask PDFium which text
++        #    object owns it and append the char to that atom's list.
++        n_chars = tp.count_chars()
++        ox = ctypes.c_double()
++        oy = ctypes.c_double()
++        for ci in range(n_chars):
++            ch = tp.get_text_range(ci, 1)
++            if ch in ("\r", "\n", "�"):
++                continue
++            x0, y0_bbox, x1, y1_bbox = tp.get_charbox(ci)
++            if y1_bbox - y0_bbox <= 0 or x1 - x0 <= 0:
++                continue
++            text_obj = pdfium_raw.FPDFText_GetTextObject(tp_handle, ci)
++            atom = obj_index.get(_obj_key(text_obj))
++            if atom is None:  # None == not text, or non-Latin (dropped)
++                continue
++            pdfium_raw.FPDFText_GetCharOrigin(tp_handle, ci, ox, oy)
++            atom.chars.append(
++                Char(
++                    text=ch,
++                    x0=x0,
++                    y0=oy.value,
++                    x1=x1,
++                    y1=y1_bbox,
++                    font=atom.font,
++                )
+             )
+-        )
+ 
+-    # 3. Return atoms in page-object order, dropping empties.
+-    return [a for k in obj_order if (a := obj_index.get(k)) is not None and a.chars]
++        # 3. Return atoms in page-object order, dropping empties.
++        return [a for k in obj_order if (a := obj_index.get(k)) is not None and a.chars]
++    finally:
++        tp.close()
+ 
+ 
+ def _obj_key(obj_ptr) -> int:
+diff --git a/casparser/parsers/pageobj.py b/casparser/parsers/pageobj.py
+index 307e04e..821863f 100644
+--- a/casparser/parsers/pageobj.py
++++ b/casparser/parsers/pageobj.py
+@@ -39,7 +39,7 @@ from __future__ import annotations
+ 
+ import ctypes
+ from dataclasses import dataclass
+-from typing import List, Optional, Tuple
++from typing import Iterable, List, Optional, Tuple
+ 
+ import pypdfium2 as pdfium
+ import pypdfium2.raw as pdfium_raw
+@@ -150,6 +150,7 @@ def extract_atoms(
+     pdf_path: str,
+     password: str,
+     *,
++    page_numbers: Optional[Iterable[int]] = None,
+     _doc: "Optional[pdfium.PdfDocument]" = None,
+ ) -> List[List[Atom]]:
+     """Return one list of Atoms per page (in object-index order).
+@@ -168,38 +169,51 @@ def extract_atoms(
+     top = ctypes.c_float()
+     buf = (ctypes.c_ushort * (_TEXT_BUF_SIZE // 2))()
+     fname_buf = (ctypes.c_char * _FONT_BUF_SIZE)()
+-    for page in doc:
+-        page_handle = page.raw
+-        tp = page.get_textpage()
+-        tp_handle = tp.raw
+-        atoms: List[Atom] = []
+-        seen: set = set()  # dedup by (x_left, y_top, text)
+-        counter = _StreamCounter()
+-        for obj, seq in _iter_text_objects(page_handle, is_form=False, counter=counter):
+-            # Skip vertically-oriented text — the rotated CAS watermark
+-            # ("CAMSCASWS… / NSDLCASWS…") whose glyphs otherwise bleed
+-            # down the right-hand columns. The object matrix's glyph
+-            # advance vector is (a, b); |b| > |a| means a vertical run.
+-            mtx = pdfium_raw.FS_MATRIX()
+-            if pdfium_raw.FPDFPageObj_GetMatrix(obj, ctypes.byref(mtx)) and abs(mtx.b) > abs(mtx.a):
+-                continue
+-            text, fname = _read_text_obj(obj, tp_handle, buf, fname_buf)
+-            if not text:
+-                continue
+-            pdfium_raw.FPDFPageObj_GetBounds(
+-                obj,
+-                ctypes.byref(left),
+-                ctypes.byref(bottom),
+-                ctypes.byref(right),
+-                ctypes.byref(top),
+-            )
+-            xl, xr, yt, yb = left.value, right.value, top.value, bottom.value
+-            key = (round(xl, 1), round(yt, 1), text)
+-            if key in seen:
+-                continue
+-            seen.add(key)
+-            atoms.append(Atom(xl, xr, yt, yb, text, fname, stream_seq=seq))
+-        pages.append(_dedupe_overlapping(atoms))
++    try:
++        for page_number in range(len(doc)) if page_numbers is None else page_numbers:
++            page = doc[page_number]
++            tp = None
++            try:
++                tp = page.get_textpage()
++                page_handle = page.raw
++                tp_handle = tp.raw
++                atoms: List[Atom] = []
++                seen: set = set()  # dedup by (x_left, y_top, text)
++                counter = _StreamCounter()
++                for obj, seq in _iter_text_objects(page_handle, is_form=False, counter=counter):
++                    # Skip vertically-oriented text — the rotated CAS watermark
++                    # ("CAMSCASWS… / NSDLCASWS…") whose glyphs otherwise bleed
++                    # down the right-hand columns. The object matrix's glyph
++                    # advance vector is (a, b); |b| > |a| means a vertical run.
++                    mtx = pdfium_raw.FS_MATRIX()
++                    if pdfium_raw.FPDFPageObj_GetMatrix(obj, ctypes.byref(mtx)) and abs(
++                        mtx.b
++                    ) > abs(mtx.a):
++                        continue
++                    text, fname = _read_text_obj(obj, tp_handle, buf, fname_buf)
++                    if not text:
++                        continue
++                    pdfium_raw.FPDFPageObj_GetBounds(
++                        obj,
++                        ctypes.byref(left),
++                        ctypes.byref(bottom),
++                        ctypes.byref(right),
++                        ctypes.byref(top),
++                    )
++                    xl, xr, yt, yb = left.value, right.value, top.value, bottom.value
++                    key = (round(xl, 1), round(yt, 1), text)
++                    if key in seen:
++                        continue
++                    seen.add(key)
++                    atoms.append(Atom(xl, xr, yt, yb, text, fname, stream_seq=seq))
++                pages.append(_dedupe_overlapping(atoms))
++            finally:
++                if tp is not None:
++                    tp.close()
++                page.close()
++    finally:
++        if _doc is None:
++            doc.close()
+     return pages
+ 
+ 
+diff --git a/tests/test_extraction_efficiency.py b/tests/test_extraction_efficiency.py
+new file mode 100644
+index 0000000..237ee7f
+--- /dev/null
++++ b/tests/test_extraction_efficiency.py
+@@ -0,0 +1,63 @@
++"""Page bounds and native handle lifetime without private CAS fixtures."""
++from types import SimpleNamespace
++import pytest
++from casparser.parsers import pageobj, extract, _investor, _isin
++
++
++def test_investor_extraction_requests_only_first_page(monkeypatch):
++    seen=[]
++    def atoms(*args, **kwargs):
++        seen.append(kwargs['page_numbers'])
++        return [[pageobj.Atom(10,100,700-i*20,690-i*20,text,'Arial') for i,text in enumerate([
++            'Email Id: test@example.test','Test Investor','Test Address','Mobile: 9999999999'])]]
++    monkeypatch.setattr(_investor,'extract_atoms',atoms)
++    result=_investor.extract_cams_kfin_investor('unused','')
++    assert result.name=='Test Investor'
++    assert seen==[[0]]
++
++
++def test_page_iterator_does_not_extract_ahead_and_releases_handles(monkeypatch):
++    closed=[]
++    class Document:
++        def __len__(self):return 3
++        def __getitem__(self, index):return SimpleNamespace(index=index,close=lambda:closed.append(index))
++    walked=[]
++    def walk(page):walked.append(page.index);return []
++    monkeypatch.setattr(extract,'_walk_page_atoms',walk)
++    pages=extract.iter_pages('unused','',_doc=Document())
++    assert walked==[]
++    assert next(pages).number==1
++    assert walked==[0] and closed==[0]
++    assert [p.number for p in pages]==[2,3]
++    assert closed==[0,1,2]
++
++
++def test_iterator_closes_owned_document_on_error(monkeypatch):
++    closed=[]
++    class Document:
++        def __len__(self):return 1
++        def __getitem__(self,index):return SimpleNamespace(close=lambda:closed.append('page'))
++        def close(self):closed.append('doc')
++    monkeypatch.setattr(extract.pdfium,'PdfDocument',lambda *a,**k:Document())
++    def fail(page):raise ValueError('bad page')
++    monkeypatch.setattr(extract,'_walk_page_atoms',fail)
++    with pytest.raises(ValueError):list(extract.iter_pages('unused',''))
++    assert closed==['page','doc']
++
++
++def test_isin_session_reused_and_reset_after_failure(monkeypatch):
++    opens=[]
++    class Database:
++        def __enter__(self):opens.append(self);return self
++        def __exit__(self,*a):pass
++        def isin_lookup(self,*a,**k):return SimpleNamespace(isin='INFTEST',amfi_code='1',type='EQUITY')
++    monkeypatch.setattr(_isin,'MFISINDb',Database)
++    with pytest.raises(RuntimeError):
++        with _isin.isin_session():
++            _isin.isin_search('Fund','CAMS','X')
++            _isin.isin_search('Fund 2','CAMS','Y')
++            raise RuntimeError('test')
++    assert len(opens)==1
++    assert _isin._active_db.get() is None
++    _isin.isin_search('Other','CAMS','Z')
++    assert len(opens)==2

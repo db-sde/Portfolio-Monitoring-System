@@ -1,0 +1,3 @@
+Local parser release built from the sibling casparser project. Version 1.3.0+portfolioiq.1 includes streaming page extraction, bounded investor extraction, native handle cleanup and shared ISIN lookup sessions. Rebuild instructions are in the project README. SHA-256 is pinned in backend/requirements.txt.
+
+Source patch: casparser-portfolioiq.patch, against upstream codereverser/casparser commit 6c74d9a1eba18ebc0effdd4a67dd5f8e90fb499f. Apply with git apply from that checkout. It includes the extraction regression tests and the local package version. The upstream repository is not modified by the application release.

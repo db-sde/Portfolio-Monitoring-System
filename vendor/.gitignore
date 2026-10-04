@@ -1,0 +1,5 @@
+*
+!.gitignore
+!casparser-1.3.0+portfolioiq.1-py3-none-any.whl
+!README.md
+!casparser-portfolioiq.patch

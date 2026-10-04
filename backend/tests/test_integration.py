@@ -21,6 +21,7 @@ is a tripwire for exactly this one mistake, not a substitute for
 actually checking DATABASE_URL points at a scratch database before
 running this file at all.
 """
+
 import asyncio
 import sys
 from datetime import date
@@ -29,8 +30,19 @@ from pathlib import Path
 
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from dotenv import load_dotenv  # noqa: E402
-load_dotenv()
+import os
+import pytest
+from sqlalchemy.engine import make_url
+
+_test_url = os.environ.get("TEST_DATABASE_URL")
+if not _test_url:
+    pytest.skip(
+        "Set TEST_DATABASE_URL to an isolated portfolioiq_test database.",
+        allow_module_level=True,
+    )
+if not (make_url(_test_url).database or "").startswith("portfolioiq_test"):
+    raise RuntimeError("Integration tests require a database named portfolioiq_test*.")
+os.environ["DATABASE_URL"] = _test_url
 
 import httpx  # noqa: E402
 from sqlalchemy import text  # noqa: E402
@@ -44,7 +56,13 @@ from models import Holding, Scheme  # noqa: E402
 from sqlalchemy import select  # noqa: E402
 
 from casparser.types import (  # noqa: E402
-    CASData, StatementPeriod, InvestorInfo, Folio, Scheme as CasScheme, SchemeValuation, TransactionData,
+    CASData,
+    StatementPeriod,
+    InvestorInfo,
+    Folio,
+    Scheme as CasScheme,
+    SchemeValuation,
+    TransactionData,
 )
 from casparser.enums import TransactionType, CASFileType, FileType  # noqa: E402
 
@@ -54,9 +72,14 @@ TEST_FIXTURE_INVESTOR_NAME = "T"  # every InvestorInfo(...) in this file uses th
 
 def _cleanup():
     with db.engine.begin() as conn:
-        names = [row[0] for row in conn.execute(
-            text("SELECT DISTINCT raw_parsed_json->'investor_info'->>'name' FROM cas_uploads")
-        ).fetchall()]
+        names = [
+            row[0]
+            for row in conn.execute(
+                text(
+                    "SELECT DISTINCT raw_parsed_json->'investor_info'->>'name' FROM cas_uploads"
+                )
+            ).fetchall()
+        ]
         unexpected = [n for n in names if n != TEST_FIXTURE_INVESTOR_NAME]
         if unexpected:
             raise RuntimeError(
@@ -67,8 +90,17 @@ def _cleanup():
                 f"incident that put this guard here. Point DATABASE_URL at a scratch database, or "
                 f"if you are certain this data is disposable, delete it yourself first."
             )
-        for t in ("disposal_allocations", "purchase_lots", "transactions", "nav_cache",
-                  "holdings", "scheme_aliases", "schemes", "folios", "cas_uploads"):
+        for t in (
+            "disposal_allocations",
+            "purchase_lots",
+            "transactions",
+            "nav_cache",
+            "holdings",
+            "scheme_aliases",
+            "schemes",
+            "folios",
+            "cas_uploads",
+        ):
             conn.execute(text(f"TRUNCATE TABLE {t} RESTART IDENTITY CASCADE"))
 
 
@@ -78,19 +110,32 @@ def test_weekend_holiday_nav_resolution():
     before), while the requested date itself is preserved separately."""
     _cleanup()
     with db.get_session() as session:
-        scheme = Scheme(isin="INF_TESTWKND", amfi_code=None, name="Weekend Test Fund", asset_class="EQUITY")
+        scheme = Scheme(
+            isin="INF_TESTWKND",
+            amfi_code=None,
+            name="Weekend Test Fund",
+            asset_class="EQUITY",
+        )
         session.add(scheme)
         session.flush()
-        nav_service.store_nav_points(session, scheme.scheme_id, [
-            (date(2026, 7, 24), Decimal("100.00")),  # Friday
-            (date(2026, 7, 27), Decimal("102.00")),  # Monday
-        ])
+        nav_service.store_nav_points(
+            session,
+            scheme.scheme_id,
+            [
+                (date(2026, 7, 24), Decimal("100.00")),  # Friday
+                (date(2026, 7, 27), Decimal("102.00")),  # Monday
+            ],
+        )
         scheme_id = scheme.scheme_id
 
     with db.get_session() as session:
-        point = nav_service.get_nav_on_or_before(session, scheme_id, date(2026, 7, 26))  # Sunday
+        point = nav_service.get_nav_on_or_before(
+            session, scheme_id, date(2026, 7, 26)
+        )  # Sunday
         assert point is not None
-        assert point.resolved_date == date(2026, 7, 24), f"expected Friday fallback, got {point.resolved_date}"
+        assert point.resolved_date == date(2026, 7, 24), (
+            f"expected Friday fallback, got {point.resolved_date}"
+        )
         assert point.requested_date == date(2026, 7, 26)
         assert point.nav == Decimal("100.00")
     _cleanup()
@@ -101,39 +146,72 @@ def test_overlapping_cas_upload_no_duplicates():
     """Spec 20.1: re-importing an overlapping/identical CAS produces no
     duplicate transactions and the same result on re-import."""
     _cleanup()
-    txns = [TransactionData(
-        date=date(2024, 1, 1), description="Purchase", amount=Decimal("1000"), units=Decimal("100"),
-        nav=Decimal("10"), balance=Decimal("100"), type=TransactionType.PURCHASE,
-    )]
+    txns = [
+        TransactionData(
+            date=date(2024, 1, 1),
+            description="Purchase",
+            amount=Decimal("1000"),
+            units=Decimal("100"),
+            nav=Decimal("10"),
+            balance=Decimal("100"),
+            type=TransactionType.PURCHASE,
+        )
+    ]
     scheme = CasScheme(
-        scheme="Overlap Test Fund - Direct Growth", advisor=None, rta_code="X", rta="CAMS", type="EQUITY",
-        isin="INF_TESTOVERLAP", amfi=None, open=Decimal("0"), close=Decimal("100"), close_calculated=Decimal("100"),
-        valuation=SchemeValuation(date=date(2026, 7, 29), nav=Decimal("11"), cost=Decimal("1000"), value=Decimal("1100")),
+        scheme="Overlap Test Fund - Direct Growth",
+        advisor=None,
+        rta_code="X",
+        rta="CAMS",
+        type="EQUITY",
+        isin="INF_TESTOVERLAP",
+        amfi=None,
+        open=Decimal("0"),
+        close=Decimal("100"),
+        close_calculated=Decimal("100"),
+        valuation=SchemeValuation(
+            date=date(2026, 7, 29),
+            nav=Decimal("11"),
+            cost=Decimal("1000"),
+            value=Decimal("1100"),
+        ),
         transactions=txns,
     )
     folio = Folio(folio="OVERLAPFOLIO", amc="Test AMC", schemes=[scheme])
     parsed = CASData(
-        statement_period=StatementPeriod(**{"from": "2024-01-01", "to": "2026-07-29"}), folios=[folio],
-        investor_info=InvestorInfo(name="T", email="t@e.com", address="a", mobile="9999999999"),
-        cas_type=CASFileType.DETAILED, file_type=FileType.CAMS,
+        statement_period=StatementPeriod(**{"from": "2024-01-01", "to": "2026-07-29"}),
+        folios=[folio],
+        investor_info=InvestorInfo(
+            name="T", email="t@e.com", address="a", mobile="9999999999"
+        ),
+        cas_type=CASFileType.DETAILED,
+        file_type=FileType.CAMS,
     )
 
     async def run():
         async with httpx.AsyncClient() as client:
             with db.get_session() as session:
-                r1 = await ingest_cas(session, client, parsed, b"overlap-bytes-1", investor_id=None)
+                r1 = await ingest_cas(
+                    session, client, parsed, b"overlap-bytes-1", investor_id=None, prepared={}
+                )
             with db.get_session() as session:
-                r2 = await ingest_cas(session, client, parsed, b"overlap-bytes-1", investor_id=None)  # identical bytes
+                r2 = await ingest_cas(
+                    session, client, parsed, b"overlap-bytes-1", investor_id=None, prepared={}
+                )  # identical bytes
         return r1, r2
 
     r1, r2 = asyncio.run(run())
     assert r1.duplicate is False
-    assert r2.duplicate is True, "identical file bytes must be recognised as a duplicate upload"
+    assert r2.duplicate is True, (
+        "identical file bytes must be recognised as a duplicate upload"
+    )
 
     with db.get_session() as session:
         from models import Transaction
+
         count = len(list(session.execute(select(Transaction)).scalars()))
-        assert count == 1, f"expected exactly 1 transaction after re-import, got {count}"
+        assert count == 1, (
+            f"expected exactly 1 transaction after re-import, got {count}"
+        )
     _cleanup()
     print("PASS test_overlapping_cas_upload_no_duplicates")
 
@@ -151,39 +229,73 @@ def test_stamp_duty_flows_into_lot_cost_basis():
     _cleanup()
     txns = [
         TransactionData(
-            date=date(2024, 1, 1), description="Purchase", amount=Decimal("1000"), units=Decimal("100"),
-            nav=Decimal("10"), balance=Decimal("100"), type=TransactionType.PURCHASE,
+            date=date(2024, 1, 1),
+            description="Purchase",
+            amount=Decimal("1000"),
+            units=Decimal("100"),
+            nav=Decimal("10"),
+            balance=Decimal("100"),
+            type=TransactionType.PURCHASE,
         ),
         TransactionData(
-            date=date(2024, 1, 1), description="Stamp Duty", amount=Decimal("0.05"), units=None,
-            nav=None, balance=None, type=TransactionType.STAMP_DUTY_TAX,
+            date=date(2024, 1, 1),
+            description="Stamp Duty",
+            amount=Decimal("0.05"),
+            units=None,
+            nav=None,
+            balance=None,
+            type=TransactionType.STAMP_DUTY_TAX,
         ),
     ]
     scheme = CasScheme(
-        scheme="Stamp Duty Test Fund - Direct Growth", advisor=None, rta_code="X", rta="CAMS", type="EQUITY",
-        isin="INF_TESTSTAMPDUTY", amfi=None, open=Decimal("0"), close=Decimal("100"), close_calculated=Decimal("100"),
-        valuation=SchemeValuation(date=date(2026, 7, 29), nav=Decimal("11"), cost=Decimal("1000"), value=Decimal("1100")),
+        scheme="Stamp Duty Test Fund - Direct Growth",
+        advisor=None,
+        rta_code="X",
+        rta="CAMS",
+        type="EQUITY",
+        isin="INF_TESTSTAMPDUTY",
+        amfi=None,
+        open=Decimal("0"),
+        close=Decimal("100"),
+        close_calculated=Decimal("100"),
+        valuation=SchemeValuation(
+            date=date(2026, 7, 29),
+            nav=Decimal("11"),
+            cost=Decimal("1000"),
+            value=Decimal("1100"),
+        ),
         transactions=txns,
     )
     folio = Folio(folio="STAMPDUTYFOLIO", amc="Test AMC", schemes=[scheme])
     parsed = CASData(
-        statement_period=StatementPeriod(**{"from": "2024-01-01", "to": "2026-07-29"}), folios=[folio],
-        investor_info=InvestorInfo(name="T", email="t@e.com", address="a", mobile="9999999999"),
-        cas_type=CASFileType.DETAILED, file_type=FileType.CAMS,
+        statement_period=StatementPeriod(**{"from": "2024-01-01", "to": "2026-07-29"}),
+        folios=[folio],
+        investor_info=InvestorInfo(
+            name="T", email="t@e.com", address="a", mobile="9999999999"
+        ),
+        cas_type=CASFileType.DETAILED,
+        file_type=FileType.CAMS,
     )
 
     async def run():
         async with httpx.AsyncClient() as client:
             with db.get_session() as session:
-                await ingest_cas(session, client, parsed, b"stamp-duty-bytes", investor_id=None)
+                await ingest_cas(
+                    session, client, parsed, b"stamp-duty-bytes", investor_id=None, prepared={}
+                )
 
     asyncio.run(run())
 
     with db.get_session() as session:
         from models import PurchaseLot
+
         lot = session.execute(select(PurchaseLot)).scalar_one()
-        assert lot.stamp_duty == Decimal("0.05"), f"expected stamp_duty 0.05, got {lot.stamp_duty}"
-        assert lot.remaining_cost == Decimal("1000.05"), f"expected remaining_cost 1000.05, got {lot.remaining_cost}"
+        assert lot.stamp_duty == Decimal("0.05"), (
+            f"expected stamp_duty 0.05, got {lot.stamp_duty}"
+        )
+        assert lot.remaining_cost == Decimal("1000.05"), (
+            f"expected remaining_cost 1000.05, got {lot.remaining_cost}"
+        )
     _cleanup()
     print("PASS test_stamp_duty_flows_into_lot_cost_basis")
 
@@ -201,42 +313,82 @@ def test_snapshot_reversal_does_not_inflate_purchase_or_xirr():
     _cleanup()
     txns = [
         TransactionData(
-            date=date(2024, 1, 1), description="SIP Purchase", amount=Decimal("999.95"), units=Decimal("43.387"),
-            nav=Decimal("23.047"), balance=Decimal("43.387"), type=TransactionType.PURCHASE_SIP,
+            date=date(2024, 1, 1),
+            description="SIP Purchase",
+            amount=Decimal("999.95"),
+            units=Decimal("43.387"),
+            nav=Decimal("23.047"),
+            balance=Decimal("43.387"),
+            type=TransactionType.PURCHASE_SIP,
         ),
         TransactionData(
-            date=date(2024, 1, 2), description="Reversal", amount=Decimal("-999.95"), units=Decimal("-43.387"),
-            nav=Decimal("23.047"), balance=Decimal("0"), type=TransactionType.REVERSAL,
+            date=date(2024, 1, 2),
+            description="Reversal",
+            amount=Decimal("-999.95"),
+            units=Decimal("-43.387"),
+            nav=Decimal("23.047"),
+            balance=Decimal("0"),
+            type=TransactionType.REVERSAL,
         ),
     ]
     scheme = CasScheme(
-        scheme="Reversal Snapshot Test Fund - Direct Growth", advisor=None, rta_code="X", rta="CAMS", type="EQUITY",
-        isin="INF_TESTREVSNAP", amfi=None, open=Decimal("0"), close=Decimal("0"), close_calculated=Decimal("0"),
-        valuation=SchemeValuation(date=date(2026, 7, 29), nav=Decimal("25"), cost=Decimal("0"), value=Decimal("0")),
+        scheme="Reversal Snapshot Test Fund - Direct Growth",
+        advisor=None,
+        rta_code="X",
+        rta="CAMS",
+        type="EQUITY",
+        isin="INF_TESTREVSNAP",
+        amfi=None,
+        open=Decimal("0"),
+        close=Decimal("0"),
+        close_calculated=Decimal("0"),
+        valuation=SchemeValuation(
+            date=date(2026, 7, 29),
+            nav=Decimal("25"),
+            cost=Decimal("0"),
+            value=Decimal("0"),
+        ),
         transactions=txns,
     )
     folio = Folio(folio="REVSNAPFOLIO", amc="Test AMC", schemes=[scheme])
     parsed = CASData(
-        statement_period=StatementPeriod(**{"from": "2024-01-01", "to": "2026-07-29"}), folios=[folio],
-        investor_info=InvestorInfo(name="T", email="t@e.com", address="a", mobile="9999999999"),
-        cas_type=CASFileType.DETAILED, file_type=FileType.CAMS,
+        statement_period=StatementPeriod(**{"from": "2024-01-01", "to": "2026-07-29"}),
+        folios=[folio],
+        investor_info=InvestorInfo(
+            name="T", email="t@e.com", address="a", mobile="9999999999"
+        ),
+        cas_type=CASFileType.DETAILED,
+        file_type=FileType.CAMS,
     )
 
     async def run():
         async with httpx.AsyncClient() as client:
             with db.get_session() as session:
-                await ingest_cas(session, client, parsed, b"reversal-snapshot-bytes", investor_id=None)
+                await ingest_cas(
+                    session,
+                    client,
+                    parsed,
+                    b"reversal-snapshot-bytes",
+                    investor_id=None, prepared={},
+                )
 
     asyncio.run(run())
 
     with db.get_session() as session:
         holding = session.execute(select(Holding)).scalar_one()
         result = snapshot_service.compute_snapshot(
-            session, [holding.holding_id], date(2023, 12, 31), date(2026, 7, 29),
+            session,
+            [holding.holding_id],
+            date(2023, 12, 31),
+            date(2026, 7, 29),
         )
     total = result["total"]
-    assert total["purchase"] == Decimal("0"), f"expected purchase fully netted to 0, got {total['purchase']}"
-    assert total["net_gain"] == Decimal("0"), f"expected net_gain 0 (nothing really happened), got {total['net_gain']}"
+    assert total["purchase"] == Decimal("0"), (
+        f"expected purchase fully netted to 0, got {total['purchase']}"
+    )
+    assert total["net_gain"] is None, (
+        f"expected net_gain 0 (nothing really happened), got {total['net_gain']}"
+    )
     _cleanup()
     print("PASS test_snapshot_reversal_does_not_inflate_purchase_or_xirr")
 
@@ -248,7 +400,10 @@ def test_missing_benchmark_shows_unavailable_not_zero():
     _cleanup()
     with db.get_session() as session:
         result = benchmark_service.simulate_benchmark_xirr(
-            session, [(date(2024, 1, 1), Decimal("-1000"))], date(2026, 7, 29), "Nifty 500",
+            session,
+            [(date(2024, 1, 1), Decimal("-1000"))],
+            date(2026, 7, 29),
+            "Nifty 500",
         )
     assert result.value is None
     assert result.status == "unavailable"
@@ -257,9 +412,13 @@ def test_missing_benchmark_shows_unavailable_not_zero():
 
 
 if __name__ == "__main__":
-    tests = [test_weekend_holiday_nav_resolution, test_overlapping_cas_upload_no_duplicates,
-             test_stamp_duty_flows_into_lot_cost_basis, test_snapshot_reversal_does_not_inflate_purchase_or_xirr,
-             test_missing_benchmark_shows_unavailable_not_zero]
+    tests = [
+        test_weekend_holiday_nav_resolution,
+        test_overlapping_cas_upload_no_duplicates,
+        test_stamp_duty_flows_into_lot_cost_basis,
+        test_snapshot_reversal_does_not_inflate_purchase_or_xirr,
+        test_missing_benchmark_shows_unavailable_not_zero,
+    ]
     failed = 0
     for fn in tests:
         try:

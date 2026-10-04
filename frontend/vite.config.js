@@ -12,7 +12,7 @@ export default defineConfig({
     // to Render in production — same code path, no per-environment URL.
     proxy: {
       '/api': {
-        target: 'http://localhost:8000',
+        target: process.env.API_PROXY_TARGET || 'http://localhost:8000',
         changeOrigin: true,
       },
     },

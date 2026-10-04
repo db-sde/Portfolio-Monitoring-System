@@ -34,12 +34,14 @@ export default function Exposure({ filters, refreshTick }) {
   const [error, setError] = useState(null)
 
   useEffect(() => {
+    let live = true
     setLoading(true)
     setError(null)
     api.getExposure({
       level: filters.level, group_name: filters.groupName,
       investor_name: filters.investorName, arn: filters.arn,
-    }).then(setData).catch((err) => setError(err.message)).finally(() => setLoading(false))
+    }).then(value => { if (live) setData(value) }).catch((err) => { if (live) setError(err.message) }).finally(() => { if (live) setLoading(false) })
+    return () => { live = false }
   }, [filters, refreshTick])
 
   if (error) return <div className="text-sm text-bad">{error}</div>
@@ -56,6 +58,7 @@ export default function Exposure({ filters, refreshTick }) {
 
   return (
     <div className="grid grid-cols-1 lg:grid-cols-2 gap-6 animate-fade-up">
+      {data.data_quality === 'PARTIAL' && <p className="text-warn text-sm lg:col-span-2">Exposure percentages cover verified valuations only; some holdings could not be valued.</p>}
       <ExposureTable title="Top AMCs" rows={data.top_amcs || []} nameKey="amc_name" />
       <ExposureTable title="Top funds" rows={data.top_funds || []} nameKey="scheme_name" />
       <div className="rounded-xl border border-line-soft bg-card p-4 lg:col-span-2">

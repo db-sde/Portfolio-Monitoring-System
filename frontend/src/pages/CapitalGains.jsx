@@ -1,41 +1,41 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { api } from '../api'
 import { formatIndian, formatUnits, formatDate } from '../components/IndianNumber'
 import SkeletonTable from '../components/SkeletonTable'
 
 export default function CapitalGains({ filters, refreshTick }) {
+  const [page, setPage] = useState(1)
+  const [giftPage, setGiftPage] = useState(1)
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
   const [fy, setFy] = useState(null)
   const [exporting, setExporting] = useState(false)
 
+  useEffect(() => { setPage(1); setGiftPage(1) }, [filters.level, filters.groupName, filters.investorName, filters.arn])
+
   useEffect(() => {
+    let live = true
     setLoading(true)
     setError(null)
     api.getCapitalGains({
+      fy, page, page_size: 100, gift_page: giftPage,
       level: filters.level, group_name: filters.groupName,
       investor_name: filters.investorName, arn: filters.arn,
     })
-      .then((d) => { setData(d); setFy((prev) => (prev && d.fys.includes(prev) ? prev : d.fys[0] || null)) })
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false))
-  }, [filters, refreshTick])
+      .then((d) => { if (!live) return; setData(d); setFy(d.selected_fy) })
+      .catch((err) => { if (live) setError(err.message) })
+      .finally(() => { if (live) setLoading(false) })
+    return () => { live = false }
+  }, [filters, refreshTick, fy, page, giftPage])
 
   const gains = data?.gains || []
   const gifts = data?.gifts || []
-  const fyRows = useMemo(() => gains.filter((g) => g.fy === fy), [gains, fy])
-
-  // Spec 12.1: every summary card scopes to the SELECTED FY, not every
-  // year ever realised — computed from fyRows, not the full gains list.
-  const { stcg, ltcg, net } = useMemo(() => {
-    let s = 0, l = 0
-    fyRows.forEach((g) => { s += g.stcg; l += g.ltcg })
-    return { stcg: s, ltcg: l, net: s + l }
-  }, [fyRows])
+  const fyRows = gains
+  const { stcg = 0, ltcg = 0, net = 0 } = data?.summary || {}
 
   if (error) return <div className="text-sm text-bad">{error}</div>
-  if (loading) return <SkeletonTable rows={8} cols={7} />
+  if (loading && !data) return <SkeletonTable rows={8} cols={7} />
 
   const exportFyCsv = async () => {
     setExporting(true)
@@ -52,7 +52,7 @@ export default function CapitalGains({ filters, refreshTick }) {
       a.click()
       a.remove()
       setTimeout(() => URL.revokeObjectURL(url), 1000)
-    } finally {
+    } catch (e) { setError(e.message) } finally {
       setExporting(false)
     }
   }
@@ -63,12 +63,17 @@ export default function CapitalGains({ filters, refreshTick }) {
         <div key={i} className="rounded-lg border border-warn/20 bg-warn-tint text-warn text-sm px-4 py-2.5">{w}</div>
       ))}
 
-      {!gains.length ? (
+      {!data?.fys?.length ? (
         <div className="rounded-xl border border-line-soft bg-card p-10 text-center text-sm text-ink-3">
           No realised sales found — gains only appear once units are actually redeemed or switched out.
         </div>
       ) : (
         <>
+          <div className="flex gap-4 text-sm">
+            <button disabled={page <= 1 || loading} onClick={() => setPage(p => p - 1)}>Previous sales</button>
+            <span>Page {page} of {Math.max(1, Math.ceil((data?.total || 0) / 100))}</span>
+            <button disabled={page * 100 >= (data?.total || 0) || loading} onClick={() => setPage(p => p + 1)}>Next sales</button>
+          </div>
           <div className="grid grid-cols-1 sm:grid-cols-3 gap-4">
             <div className="rounded-xl border border-line-soft bg-card p-4">
               <div className="text-xs font-medium text-ink-3 mb-1">Short-term (STCG)</div>
@@ -93,10 +98,10 @@ export default function CapitalGains({ filters, refreshTick }) {
               <div className="flex items-center gap-2">
                 <select
                   value={fy || ''}
-                  onChange={(e) => setFy(e.target.value)}
+                  onChange={(e) => { setFy(e.target.value); setPage(1) }}
                   className="rounded-lg border border-line px-3 py-1.5 text-sm outline-none focus:border-accent bg-card"
                 >
-                  {data.fys.map((f) => <option key={f} value={f}>FY {f}</option>)}
+                  {data.fys.map((f) => <option key={f} value={f}>{f}</option>)}
                 </select>
                 <button
                   onClick={exportFyCsv}
@@ -143,10 +148,13 @@ export default function CapitalGains({ filters, refreshTick }) {
             </div>
           </div>
 
-          {gifts.length > 0 && (
+        </>
+      )}
+          {data?.gift_total > 0 && (
             <div className="rounded-xl border border-line-soft bg-card overflow-hidden">
               <div className="px-4 py-3 border-b border-line-soft">
                 <div className="font-display font-semibold text-ink">Gift transfers</div>
+                <div className="flex gap-4 text-sm"><button disabled={giftPage <= 1 || loading} onClick={() => setGiftPage(p => p - 1)}>Previous gifts</button><span>Page {giftPage}</span><button disabled={giftPage * 100 >= data.gift_total || loading} onClick={() => setGiftPage(p => p + 1)}>Next gifts</button></div>
                 <div className="text-xs text-ink-3">Informational only — not part of the gains totals above</div>
               </div>
               <div className="overflow-x-auto">
@@ -177,8 +185,6 @@ export default function CapitalGains({ filters, refreshTick }) {
               </div>
             </div>
           )}
-        </>
-      )}
     </div>
   )
 }

@@ -73,6 +73,7 @@ from pathlib import Path
 from typing import Any, Optional
 
 import httpx
+import provider
 
 logger = logging.getLogger("portfolioiq")
 
@@ -166,11 +167,24 @@ STALE_NAV_DAYS = 10
 MAX_ALTERNATE_CANDIDATES = 10
 
 ENRICHED_FIELD_DEFAULTS = {
-    "corpus_cr": None, "largecap_pct": None, "midcap_pct": None, "smallcap_pct": None,
-    "benchmark": None, "category": None, "expense_ratio": None, "fund_manager": None,
+    "corpus_cr": None,
+    "largecap_pct": None,
+    "midcap_pct": None,
+    "smallcap_pct": None,
+    "benchmark": None,
+    "category": None,
+    "expense_ratio": None,
+    "fund_manager": None,
     "nav_as_of": None,
     "returns": {"1m": None, "3m": None, "6m": None, "1y": None, "2y": None, "3y": None},
-    "risk": {"std_dev": None, "sharpe": None, "sortino": None, "max_drawdown": None, "alpha": None, "beta": None},
+    "risk": {
+        "std_dev": None,
+        "sharpe": None,
+        "sortino": None,
+        "max_drawdown": None,
+        "alpha": None,
+        "beta": None,
+    },
 }
 
 
@@ -215,8 +229,12 @@ def _is_fresh(entry: dict) -> bool:
 
 # ------------------------------------------------------------ fetchers ----
 
+
 async def _fetch_json_result(
-    client: httpx.AsyncClient, url: str, timeout: httpx.Timeout = REQUEST_TIMEOUT, **kwargs
+    client: httpx.AsyncClient,
+    url: str,
+    timeout: httpx.Timeout = REQUEST_TIMEOUT,
+    **kwargs,
 ) -> tuple[Optional[Any], bool, float]:
     """Returns (data, retryable, retry_after_seconds).
 
@@ -246,7 +264,12 @@ async def _fetch_json_result(
                 retry_after = 0.0
         retryable = resp.status_code == 429 or resp.status_code >= 500
         return None, retryable, retry_after
-    except (httpx.TimeoutException, httpx.ConnectError, httpx.ReadError, httpx.RemoteProtocolError):
+    except (
+        httpx.TimeoutException,
+        httpx.ConnectError,
+        httpx.ReadError,
+        httpx.RemoteProtocolError,
+    ):
         # Transport-level failure — a timeout or a refused/dropped
         # connection is exactly what this host does when it's throttling
         # us, so it's retryable rather than a verdict about the URL.
@@ -258,9 +281,14 @@ async def _fetch_json_result(
 
 
 async def _fetch_json(
-    client: httpx.AsyncClient, url: str, timeout: httpx.Timeout = REQUEST_TIMEOUT, **kwargs
+    client: httpx.AsyncClient,
+    url: str,
+    timeout: httpx.Timeout = REQUEST_TIMEOUT,
+    **kwargs,
 ) -> Optional[Any]:
-    data, _retryable, _retry_after = await _fetch_json_result(client, url, timeout=timeout, **kwargs)
+    data, _retryable, _retry_after = await _fetch_json_result(
+        client, url, timeout=timeout, **kwargs
+    )
     return data
 
 
@@ -269,38 +297,8 @@ FETCH_RETRY_BASE_DELAY_SECONDS = 1.0
 FETCH_RETRY_MAX_DELAY_SECONDS = 8.0
 
 
-async def _fetch_json_retrying(client: httpx.AsyncClient, url: str, **kwargs) -> Optional[Any]:
-    """Like _fetch_json, but retries transient failures with exponential
-    backoff and jitter. For mfapi.in and captnemo specifically — both
-    confirmed reachable in general, but measured live to rate-limit hard
-    under a whole portfolio's worth of concurrent requests (see
-    _fetch_json_result: 502s, then refused connections, then a ~225s
-    lockout).
-
-    Both halves of "exponential + jitter" are load-bearing here, for
-    different reasons. Exponential: a fixed 1s delay is far too short
-    for a host that stays angry for minutes, so all three attempts
-    burned inside the same failure window and the call failed anyway.
-    Jitter: without it, N schemes that failed together in the same
-    concurrent batch all sleep the same 1s and then retry at the same
-    instant — the retry burst is as synchronised as the burst that
-    caused the throttling, which is what turns one transient blip into
-    a batch-wide failure. Randomising each waiter's delay spreads them.
-
-    Deliberately NOT used for the mfdata.in probe in _enrich_one: that
-    host is confirmed permanently down (see module docstring), so
-    retrying it would just add latency for a call that never succeeds."""
-    for attempt in range(FETCH_RETRY_ATTEMPTS):
-        data, retryable, retry_after = await _fetch_json_result(client, url, **kwargs)
-        if data is not None:
-            return data
-        if not retryable or attempt == FETCH_RETRY_ATTEMPTS - 1:
-            return None
-        delay = retry_after or min(
-            FETCH_RETRY_BASE_DELAY_SECONDS * (2 ** attempt), FETCH_RETRY_MAX_DELAY_SECONDS
-        )
-        await asyncio.sleep(delay * (0.5 + random.random()))
-    return None
+async def _fetch_json_retrying(client, url, **kwargs):
+    return await provider.fetch_json(client, url, **kwargs)
 
 
 def _num(value: Any) -> Optional[float]:
@@ -448,10 +446,16 @@ async def _find_fresh_alternate(
     query = _search_query_from_name(scheme_name)
     if not query:
         return None
-    candidates = await _fetch_json_retrying(client, f"{MFAPI_BASE}/search", params={"q": query})
+    candidates = await _fetch_json_retrying(
+        client, f"{MFAPI_BASE}/search", params={"q": query}
+    )
     if not candidates:
         return None
-    codes = [c.get("schemeCode") for c in candidates[:MAX_ALTERNATE_CANDIDATES] if c.get("schemeCode") is not None]
+    codes = [
+        c.get("schemeCode")
+        for c in candidates[:MAX_ALTERNATE_CANDIDATES]
+        if c.get("schemeCode") is not None
+    ]
     if not codes:
         return None
     raws = await asyncio.gather(
@@ -485,7 +489,9 @@ def _compute_trailing_returns(nav_history: list[dict]) -> dict[str, Optional[flo
     history — reachable and correct, unlike mfdata.in (see module
     docstring) or trying to reuse a third party's own return figures
     which may use different period boundaries or rounding."""
-    out: dict[str, Optional[float]] = {k: None for k in (*RETURN_DAY_PERIODS, *RETURN_YEAR_PERIODS)}
+    out: dict[str, Optional[float]] = {
+        k: None for k in (*RETURN_DAY_PERIODS, *RETURN_YEAR_PERIODS)
+    }
     if not nav_history:
         return out
     latest = nav_history[-1]
@@ -542,7 +548,7 @@ def _std_dev(values: list[float]) -> Optional[float]:
         return None
     mean = sum(values) / n
     variance = sum((v - mean) ** 2 for v in values) / (n - 1)
-    return variance ** 0.5
+    return variance**0.5
 
 
 def _downside_deviation(daily_returns: list[float]) -> Optional[float]:
@@ -555,7 +561,7 @@ def _downside_deviation(daily_returns: list[float]) -> Optional[float]:
     negative = [r for r in daily_returns if r < 0]
     if len(negative) < 2:
         return None
-    return (sum(r ** 2 for r in negative) / len(negative)) ** 0.5
+    return (sum(r**2 for r in negative) / len(daily_returns)) ** 0.5
 
 
 def _max_drawdown_pct(nav_history: list[dict]) -> Optional[float]:
@@ -576,7 +582,9 @@ def _max_drawdown_pct(nav_history: list[dict]) -> Optional[float]:
     return round(worst * 100, 2)
 
 
-def _paired_daily_returns(a_history: list[dict], b_history: list[dict]) -> tuple[list[float], list[float]]:
+def _paired_daily_returns(
+    a_history: list[dict], b_history: list[dict]
+) -> tuple[list[float], list[float]]:
     """Daily returns for two NAV series, aligned to dates present in BOTH
     (inner join) and kept strictly paired index-for-index — a fund and
     its benchmark index fund don't necessarily publish NAVs on exactly
@@ -603,7 +611,9 @@ def _beta(fund_daily: list[float], bench_daily: list[float]) -> Optional[float]:
         return None
     mean_f = sum(fund_daily) / n
     mean_b = sum(bench_daily) / n
-    covariance = sum((f - mean_f) * (b - mean_b) for f, b in zip(fund_daily, bench_daily)) / (n - 1)
+    covariance = sum(
+        (f - mean_f) * (b - mean_b) for f, b in zip(fund_daily, bench_daily)
+    ) / (n - 1)
     variance_b = sum((b - mean_b) ** 2 for b in bench_daily) / (n - 1)
     if not variance_b:
         return None
@@ -623,8 +633,12 @@ def _compute_risk_ratios(
     No dedicated ratios endpoint exists on any free source, so all of
     this is computed with standard formulas instead of staying null."""
     out: dict[str, Optional[float]] = {
-        "std_dev": None, "sharpe": None, "sortino": None, "max_drawdown": None,
-        "alpha": None, "beta": None,
+        "std_dev": None,
+        "sharpe": None,
+        "sortino": None,
+        "max_drawdown": None,
+        "alpha": None,
+        "beta": None,
     }
     if len(nav_history) < 2:
         return out
@@ -643,7 +657,7 @@ def _compute_risk_ratios(
     vol = _std_dev(daily)
     if not vol:
         return out
-    annual_vol_pct = vol * (TRADING_DAYS_PER_YEAR ** 0.5) * 100
+    annual_vol_pct = vol * (TRADING_DAYS_PER_YEAR**0.5) * 100
     out["std_dev"] = round(annual_vol_pct, 2)
 
     # Reuse the 3y CAGR already computed for the `returns` block rather
@@ -657,11 +671,15 @@ def _compute_risk_ratios(
 
     downside_dev = _downside_deviation(daily)
     if downside_dev:
-        annual_downside_pct = downside_dev * (TRADING_DAYS_PER_YEAR ** 0.5) * 100
+        annual_downside_pct = downside_dev * (TRADING_DAYS_PER_YEAR**0.5) * 100
         out["sortino"] = round(excess / (annual_downside_pct / 100), 2)
 
     if benchmark_nav_history:
-        bench_window = [r for r in benchmark_nav_history if _parse_nav_date(r["date"]) >= window_start]
+        bench_window = [
+            r
+            for r in benchmark_nav_history
+            if _parse_nav_date(r["date"]) >= window_start
+        ]
         fund_paired, bench_paired = _paired_daily_returns(window, bench_window)
         beta = _beta(fund_paired, bench_paired)
         if beta is not None:
@@ -675,7 +693,10 @@ def _compute_risk_ratios(
 
 
 async def _enrich_one(
-    client: httpx.AsyncClient, amfi_code: str, isin: Optional[str], scheme_name: str,
+    client: httpx.AsyncClient,
+    amfi_code: str,
+    isin: Optional[str],
+    scheme_name: str,
     benchmark_nav_history: Optional[list[dict]] = None,
     cached_nav_history: Optional[list[dict]] = None,
     known_category: Optional[str] = None,
@@ -696,7 +717,9 @@ async def _enrich_one(
     fields["returns"] = dict(ENRICHED_FIELD_DEFAULTS["returns"])
     fields["risk"] = dict(ENRICHED_FIELD_DEFAULTS["risk"])
     if MFDATA_ENABLED:
-        mfdata_raw = await _fetch_json(client, f"{MFDATA_BASE}/schemes/{amfi_code}", timeout=MFDATA_TIMEOUT)
+        mfdata_raw = await _fetch_json(
+            client, f"{MFDATA_BASE}/schemes/{amfi_code}", timeout=MFDATA_TIMEOUT
+        )
         if mfdata_raw:
             fields.update(_extract_mfdata_fields(mfdata_raw))
             sources_used.append("mfdata.in")
@@ -715,7 +738,14 @@ async def _enrich_one(
     # Tracks whether `nav_history` is something we just downloaded (and
     # so the caller still needs to store) versus history it already had.
     history_is_new = False
-    if cached_nav_history and not _is_stale(cached_nav_history[-1]["date"]):
+    if (
+        cached_nav_history
+        and (
+            datetime.now(timezone.utc).date()
+            - _parse_nav_date(cached_nav_history[-1]["date"])
+        ).days
+        <= 1
+    ):
         nav_history = cached_nav_history
         sources_used.append("nav_cache")
         # Serving NAV from cache skips the full fetch — but `meta` came
@@ -730,9 +760,15 @@ async def _enrich_one(
         # category from a previous run, so this costs one small request
         # per scheme once, not on every enrichment.
         if not fields.get("category"):
-            mfapi_raw = await _fetch_json_retrying(client, f"{MFAPI_BASE}/{amfi_code}/latest")
+            mfapi_raw = await _fetch_json_retrying(
+                client, f"{MFAPI_BASE}/{amfi_code}/latest"
+            )
     else:
         mfapi_raw = await _fetch_json_retrying(client, f"{MFAPI_BASE}/{amfi_code}")
+        from scheme_resolution import matches
+
+        if not matches(mfapi_raw, isin):
+            mfapi_raw = None
         nav_history = _extract_mfapi_nav_history(mfapi_raw) if mfapi_raw else []
         history_is_new = bool(nav_history)
         # Falling back to what we already had beats returning nothing: a
@@ -775,7 +811,9 @@ async def _enrich_one(
         # Stored as ISO regardless of mfapi.in's own DD-MM-YYYY format —
         # every consumer (frontend date parsing, JSON) can rely on one
         # unambiguous shape rather than re-detecting it downstream.
-        latest_parsed = _parse_nav_date(nav_history[-1]["date"]) if nav_history else None
+        latest_parsed = (
+            _parse_nav_date(nav_history[-1]["date"]) if nav_history else None
+        )
         fields["nav_as_of"] = latest_parsed.isoformat() if latest_parsed else None
         # mfdata.in is the only source with pre-computed returns and it is
         # unreachable in practice (see module docstring) — compute our own
@@ -806,12 +844,22 @@ async def _enrich_one(
     # against a known fund's real AUM, and a wrong number dressed up as
     # "corpus_cr" is worse than a blank field.
     if isin:
-        cn_raw = await _fetch_json_retrying(client, f"{CAPTNEMO_BASE}/{isin}", follow_redirects=True)
+        cn_raw = await _fetch_json_retrying(
+            client, f"{CAPTNEMO_BASE}/{isin}", follow_redirects=True
+        )
         cn_entry = cn_raw[0] if isinstance(cn_raw, list) and cn_raw else cn_raw
         if isinstance(cn_entry, dict):
-            fields["category"] = fields.get("category") or cn_entry.get("fund_category") or cn_entry.get("category")
-            fields["expense_ratio"] = fields.get("expense_ratio") or _num(cn_entry.get("expense_ratio"))
-            fields["fund_manager"] = fields.get("fund_manager") or cn_entry.get("fund_manager")
+            fields["category"] = (
+                fields.get("category")
+                or cn_entry.get("fund_category")
+                or cn_entry.get("category")
+            )
+            fields["expense_ratio"] = fields.get("expense_ratio") or _num(
+                cn_entry.get("expense_ratio")
+            )
+            fields["fund_manager"] = fields.get("fund_manager") or cn_entry.get(
+                "fund_manager"
+            )
             if fields["risk"].get("std_dev") is None:
                 fields["risk"]["std_dev"] = _num(cn_entry.get("volatility"))
             sources_used.append("captnemo")
@@ -822,6 +870,26 @@ async def _enrich_one(
         fields["risk"]["std_dev"] = computed_std_dev
 
     fields["enriched_at"] = datetime.now(timezone.utc).isoformat()
+    fields["nav_status"] = (
+        "stale"
+        if nav_history and _is_stale(nav_history[-1]["date"])
+        else "ok"
+        if nav_history
+        else "unavailable"
+    )
+    fields["metadata_status"] = "ok" if fields.get("category") else "unavailable"
+    fields["analytics_status"] = (
+        "ok"
+        if any(v is not None for v in fields["returns"].values())
+        else "unavailable"
+    )
+    fields["risk_methodology"] = {
+        "window_days": RISK_RATIO_WINDOW_DAYS,
+        "risk_free_rate": RISK_FREE_RATE,
+        "sortino_target": 0,
+        "drawdown_window": "since inception",
+        "benchmark": BENCHMARK_LABEL,
+    }
     fields["enrichment_source"] = "+".join(sources_used) if sources_used else "failed"
     # Only NEWLY FETCHED history is handed back. Not part of the public
     # `enriched` shape either way — it exists so the caller can persist
@@ -838,7 +906,9 @@ async def _enrich_one(
 BENCHMARK_CACHE_KEY = "__benchmark_nav_history__"
 
 
-async def _get_benchmark_nav_history(client: httpx.AsyncClient, cache: dict) -> list[dict]:
+async def _get_benchmark_nav_history(
+    client: httpx.AsyncClient, cache: dict
+) -> list[dict]:
     """The shared benchmark series (see BENCHMARK_AMFI_CODE) is one
     request that every scheme's alpha/beta in this batch depends on —
     confirmed live (not hypothetical): the exact same fetch, run seconds
@@ -890,7 +960,7 @@ async def enrich_schemes(schemes: list[dict]) -> dict[str, dict]:
     lets a scheme whose history is already current skip its mfapi.in
     fetch entirely (see _enrich_one) — correctness is identical either
     way, since it's the same append-only series from the same source."""
-    cache = _load_cache()
+    cache = {}  # Postgres is the authoritative cache; no failure cached on disk.
     results: dict[str, dict] = {}
     to_fetch = []
 
@@ -905,7 +975,7 @@ async def enrich_schemes(schemes: list[dict]) -> dict[str, dict]:
             to_fetch.append(scheme)
 
     if to_fetch:
-        async with httpx.AsyncClient() as client:
+        async with provider.Client() as client:
             # Fetched once per batch, not once per scheme: it's the same
             # series for every fund, and this way a portfolio with 20
             # holdings costs 1 extra request, not 20.
@@ -920,7 +990,11 @@ async def enrich_schemes(schemes: list[dict]) -> dict[str, dict]:
             async def _enrich_one_bounded(s: dict) -> dict:
                 async with semaphore:
                     return await _enrich_one(
-                        client, s["amfi"], s.get("isin"), s.get("scheme", ""), benchmark_nav_history,
+                        client,
+                        s["amfi"],
+                        s.get("isin"),
+                        s.get("scheme", ""),
+                        benchmark_nav_history,
                         known_category=s.get("category"),
                         cached_nav_history=s.get("nav_history"),
                     )
@@ -932,13 +1006,17 @@ async def enrich_schemes(schemes: list[dict]) -> dict[str, dict]:
             # because plain gather() discards every already-completed
             # result the moment any single coroutine raises) blows up the
             # whole batch instead of failing just that one scheme.
-            fetched = await asyncio.gather(*[
-                _enrich_one_bounded(s) for s in to_fetch
-            ], return_exceptions=True)
+            fetched = await asyncio.gather(
+                *[_enrich_one_bounded(s) for s in to_fetch], return_exceptions=True
+            )
         for scheme, data in zip(to_fetch, fetched):
             amfi = scheme["amfi"]
             if isinstance(data, BaseException):
-                logger.exception("enrich_schemes: _enrich_one failed for amfi=%s", amfi, exc_info=data)
+                logger.exception(
+                    "enrich_schemes: _enrich_one failed for amfi=%s",
+                    amfi,
+                    exc_info=data,
+                )
                 continue
             results[amfi] = data
             cache[amfi] = {
@@ -946,6 +1024,5 @@ async def enrich_schemes(schemes: list[dict]) -> dict[str, dict]:
                 "ttl_hours": CACHE_TTL_HOURS,
                 "data": data,
             }
-        _save_cache(cache)
 
     return results

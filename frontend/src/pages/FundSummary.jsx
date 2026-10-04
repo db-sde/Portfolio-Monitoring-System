@@ -25,6 +25,7 @@ export default function FundSummary({ filters, refreshTick }) {
   const [error, setError] = useState(null)
 
   useEffect(() => {
+    let live = true
     setLoading(true)
     setError(null)
     api.getFundSummary({
@@ -32,9 +33,10 @@ export default function FundSummary({ filters, refreshTick }) {
       level: filters.level, group_name: filters.groupName,
       investor_name: filters.investorName, arn: filters.arn,
     })
-      .then(setData)
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false))
+      .then(value => { if (live) setData(value) })
+      .catch((err) => { if (live) setError(err.message) })
+      .finally(() => { if (live) setLoading(false) })
+    return () => { live = false }
   }, [filters, refreshTick])
 
   if (error) return <div className="text-sm text-bad">{error}</div>
@@ -67,7 +69,7 @@ export default function FundSummary({ filters, refreshTick }) {
           <tbody>
             {funds.map((f) => (
               <tr key={f.amfi}>
-                <td className="px-3 py-2 font-medium text-ink whitespace-nowrap">{f.scheme_name}</td>
+                <td className="px-3 py-2 font-medium text-ink whitespace-nowrap">{f.scheme_name}<div className="text-xs text-warn">{f.stale ? 'Cached data needs refresh' : f.status !== 'ok' ? 'Some data unavailable' : ''}</div></td>
                 <td className="px-3 py-2 text-right tabular text-ink-2">{f.corpus_cr ?? '—'}</td>
                 <td className="px-3 py-2 text-right tabular text-ink-2 whitespace-nowrap">
                   {f.largecap_pct != null ? `${f.largecap_pct}/${f.midcap_pct}/${f.smallcap_pct}` : '—'}

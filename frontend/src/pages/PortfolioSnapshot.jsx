@@ -3,8 +3,8 @@ import { api } from '../api'
 import { formatIndian, formatPct } from '../components/IndianNumber'
 import SkeletonTable from '../components/SkeletonTable'
 
-const BUCKET_LABELS = { EQUITY: 'Equity', HYBRID: 'Hybrid', DEBT: 'Debt', total: 'Total' }
-const BUCKET_ORDER = ['EQUITY', 'HYBRID', 'DEBT', 'total']
+const BUCKET_LABELS = { EQUITY: 'Equity', HYBRID: 'Hybrid', DEBT: 'Debt', OTHER: 'Other', total: 'Total' }
+const BUCKET_ORDER = ['EQUITY', 'HYBRID', 'DEBT', 'OTHER', 'total']
 const ROWS = [
   ['opening_balance', 'Opening balance'],
   ['purchase', 'Purchase'],
@@ -32,7 +32,7 @@ function SnapshotTable({ title, period }) {
             <tr className="text-xs uppercase tracking-wide text-ink-3 bg-paper-soft">
               <th className="text-left px-4 py-2.5">Metric</th>
               {BUCKET_ORDER.map((b) => (
-                <th key={b} className="text-right px-4 py-2.5">{BUCKET_LABELS[b]}</th>
+                <th key={b} className="text-right px-4 py-2.5">{BUCKET_LABELS[b]}{period[b]?.data_quality === 'PARTIAL' && ' (incomplete)'}</th>
               ))}
             </tr>
           </thead>
@@ -71,6 +71,7 @@ export default function PortfolioSnapshot({ filters, refreshTick }) {
   const [error, setError] = useState(null)
 
   useEffect(() => {
+    let live = true
     setLoading(true)
     setError(null)
     api.getSnapshot({
@@ -79,9 +80,10 @@ export default function PortfolioSnapshot({ filters, refreshTick }) {
       level: filters.level, group_name: filters.groupName,
       investor_name: filters.investorName, arn: filters.arn,
     })
-      .then(setData)
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false))
+      .then(value => { if (live) setData(value) })
+      .catch((err) => { if (live) setError(err.message) })
+      .finally(() => { if (live) setLoading(false) })
+    return () => { live = false }
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [startDate, endDate, filters, refreshTick])
 

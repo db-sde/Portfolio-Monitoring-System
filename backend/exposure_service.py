@@ -56,7 +56,7 @@ class ExposureResult:
 
 
 def compute_exposure(holdings: list[HoldingMetrics]) -> ExposureResult:
-    held = [h for h in holdings if h.balance_units > 0]
+    held = [h for h in holdings if h.balance_units > 0 and h.current_value is not None]
     total_value = sum((h.current_value for h in held), ZERO) or Decimal("1")
 
     by_amc: dict[str, Decimal] = {}
@@ -67,16 +67,29 @@ def compute_exposure(holdings: list[HoldingMetrics]) -> ExposureResult:
     # in "Top funds," defeating the point of a concentration view. TOP_N
     # caps both lists; sorting by value descending was already correct.
     top_amcs = sorted(
-        (AmcExposure(amc_name=amc, current_value=v, pct_of_portfolio=(v / total_value * 100).quantize(Decimal("0.01")))
-         for amc, v in by_amc.items()),
+        (
+            AmcExposure(
+                amc_name=amc,
+                current_value=v,
+                pct_of_portfolio=(v / total_value * 100).quantize(Decimal("0.01")),
+            )
+            for amc, v in by_amc.items()
+        ),
         key=lambda a: -a.current_value,
     )[:TOP_N]
 
+    by_fund = {}
+    for h in held:
+        key = h.isin or h.scheme_name
+        name, value = by_fund.get(key, (h.scheme_name, ZERO))
+        by_fund[key] = (name, value + h.current_value)
     top_funds = sorted(
-        (FundExposure(
-            scheme_name=h.scheme_name, current_value=h.current_value,
-            pct_of_portfolio=(h.current_value / total_value * 100).quantize(Decimal("0.01")),
-        ) for h in held),
+        (
+            FundExposure(
+                name, value, (value / total_value * 100).quantize(Decimal(".01"))
+            )
+            for name, value in by_fund.values()
+        ),
         key=lambda f: -f.current_value,
     )[:TOP_N]
 
@@ -85,7 +98,13 @@ def compute_exposure(holdings: list[HoldingMetrics]) -> ExposureResult:
     # session against captnemo/Kuvera's own documented schema) — always
     # unavailable today, never inferred from a scheme's category label.
     cap_allocation = CapAllocation(
-        largecap_pct=None, midcap_pct=None, smallcap_pct=None, other_pct=None, status="unavailable",
+        largecap_pct=None,
+        midcap_pct=None,
+        smallcap_pct=None,
+        other_pct=None,
+        status="unavailable",
     )
 
-    return ExposureResult(top_amcs=top_amcs, top_funds=top_funds, cap_allocation=cap_allocation)
+    return ExposureResult(
+        top_amcs=top_amcs, top_funds=top_funds, cap_allocation=cap_allocation
+    )

@@ -9,6 +9,7 @@ _as_date crashed with ValueError on the very first real statement
 uploaded after the Postgres migration went live. Diagnosed from the
 production traceback, not guessed.
 """
+
 import sys
 from datetime import date
 from pathlib import Path
@@ -45,9 +46,15 @@ def test_as_date_raises_clearly_on_garbage():
 
 
 def test_derive_plan_option():
-    assert _derive_plan_option("HSBC Small Cap Fund - Direct Plan - Growth") == ("Direct", "Growth")
-    assert _derive_plan_option("SBI Contra Fund - Regular Plan - IDCW") == ("Regular", "IDCW")
-    assert _derive_plan_option("Some Fund - Dividend Option") == ("Regular", "IDCW")
+    assert _derive_plan_option("HSBC Small Cap Fund - Direct Plan - Growth") == (
+        "Direct",
+        "Growth",
+    )
+    assert _derive_plan_option("SBI Contra Fund - Regular Plan - IDCW") == (
+        "Regular",
+        "IDCW",
+    )
+    assert _derive_plan_option("Some Fund - Dividend Option") == ("Unknown", "IDCW")
 
 
 def test_asset_class_folds_unknown_into_other():

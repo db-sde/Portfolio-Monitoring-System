@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from 'react'
+import { useEffect, useState } from 'react'
 import { api } from '../api'
 import { formatIndian, formatUnits, formatDate } from '../components/IndianNumber'
 import SkeletonTable from '../components/SkeletonTable'
@@ -21,6 +21,7 @@ const TYPE_GROUPS = [
 const ALL_TYPES = TYPE_GROUPS.flatMap((g) => g.types)
 
 export default function Transactions({ filters, refreshTick }) {
+  const [page, setPage] = useState(1)
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
@@ -28,39 +29,39 @@ export default function Transactions({ filters, refreshTick }) {
   const [typeFilter, setTypeFilter] = useState(new Set(ALL_TYPES))
   const [filterOpen, setFilterOpen] = useState(false)
 
+  useEffect(() => { setPage(1) }, [filters.level, filters.groupName, filters.investorName, filters.arn])
+
   useEffect(() => {
+    let live = true
     setLoading(true)
     setError(null)
     api.getTransactions({
+      page, page_size: 100, scheme_id: schemeFilter === 'all' ? undefined : schemeFilter, types: [...typeFilter].join(','),
       level: filters.level, group_name: filters.groupName,
       investor_name: filters.investorName, arn: filters.arn,
     })
-      .then(setData)
-      .catch((err) => setError(err.message))
-      .finally(() => setLoading(false))
-  }, [filters, refreshTick])
+      .then(value => { if (live) setData(value) })
+      .catch((err) => { if (live) setError(err.message) })
+      .finally(() => { if (live) setLoading(false) })
+    return () => { live = false }
+  }, [filters, refreshTick, page, schemeFilter, typeFilter])
 
   const allTx = data?.transactions || []
 
-  const schemeOptions = useMemo(() => {
-    const seen = new Map()
-    allTx.forEach((t) => { if (t.isin && !seen.has(t.isin)) seen.set(t.isin, t.scheme_name) })
-    return [{ value: 'all', label: 'All schemes' }, ...[...seen.entries()].map(([isin, name]) => ({ value: isin, label: name }))]
-  }, [allTx])
-
-  const filtered = useMemo(() => {
-    return allTx.filter((t) => (schemeFilter === 'all' || t.isin === schemeFilter) && typeFilter.has(t.type))
-  }, [allTx, schemeFilter, typeFilter])
+  const schemeOptions = [{ value: 'all', label: 'All schemes' }, ...(data?.scheme_options || []).map(s => ({ value: s.scheme_id, label: s.name }))]
+  const filtered = allTx
 
   if (error) return <div className="text-sm text-bad">{error}</div>
-  if (loading) return <SkeletonTable rows={10} cols={7} />
+  if (loading && !data) return <SkeletonTable rows={10} cols={7} />
 
   const allOn = typeFilter.size === ALL_TYPES.length
 
   const toggleType = (t) => {
+    setPage(1)
     setTypeFilter((prev) => {
       const next = new Set(prev)
-      next.has(t) ? next.delete(t) : next.add(t)
+      if (next.has(t)) next.delete(t)
+      else next.add(t)
       return next
     })
   }
@@ -68,11 +69,11 @@ export default function Transactions({ filters, refreshTick }) {
   return (
     <div className="space-y-4 animate-fade-up">
       <div className="flex flex-wrap items-center justify-between gap-3">
-        <div className="text-sm text-ink-2">{filtered.length} transaction{filtered.length === 1 ? '' : 's'}</div>
+        <div className="text-sm text-ink-2">{data?.total || 0} transaction{filtered.length === 1 ? '' : 's'}</div>
         <div className="flex items-center gap-2">
           <select
             value={schemeFilter}
-            onChange={(e) => setSchemeFilter(e.target.value)}
+            onChange={(e) => { setSchemeFilter(e.target.value); setPage(1) }}
             className="rounded-lg border border-line px-3 py-1.5 text-sm outline-none focus:border-accent bg-card"
           >
             {schemeOptions.map((o) => <option key={o.value} value={o.value}>{o.label}</option>)}
@@ -108,7 +109,7 @@ export default function Transactions({ filters, refreshTick }) {
                   </div>
                   <div className="flex justify-between items-center mt-4 pt-3 border-t border-line-soft">
                     <button
-                      onClick={() => setTypeFilter(allOn ? new Set() : new Set(ALL_TYPES))}
+                      onClick={() => { setTypeFilter(allOn ? new Set() : new Set(ALL_TYPES)); setPage(1) }}
                       className="text-sm font-medium text-ink-2 hover:text-ink"
                     >
                       {allOn ? 'Unselect all' : 'Select all'}
@@ -122,6 +123,11 @@ export default function Transactions({ filters, refreshTick }) {
         </div>
       </div>
 
+      <div className="flex gap-4 items-center text-sm" aria-live="polite">
+        <button disabled={page <= 1 || loading} onClick={() => setPage(p => p - 1)}>Previous</button>
+        <span>Page {page} of {Math.max(1, Math.ceil((data?.total || 0) / 100))}{loading && ' · Loading…'}</span>
+        <button disabled={page * 100 >= (data?.total || 0) || loading} onClick={() => setPage(p => p + 1)}>Next</button>
+      </div>
       <div className="rounded-xl border border-line-soft bg-card overflow-hidden">
         <div className="overflow-x-auto">
           <table className="w-full text-sm">
@@ -137,8 +143,8 @@ export default function Transactions({ filters, refreshTick }) {
               </tr>
             </thead>
             <tbody>
-              {filtered.map((t, i) => (
-                <tr key={i} className="border-t border-line-soft hover:bg-paper-soft/40 transition-colors">
+              {filtered.map((t) => (
+                <tr key={t.transaction_id} className="border-t border-line-soft hover:bg-paper-soft/40 transition-colors">
                   <td className="px-4 py-2.5 text-ink-2 whitespace-nowrap">{formatDate(t.date)}</td>
                   <td className="px-4 py-2.5 text-ink font-medium">{t.scheme_name}</td>
                   <td className="px-4 py-2.5">

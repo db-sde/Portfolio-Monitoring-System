@@ -21,7 +21,7 @@ import os
 from contextlib import contextmanager
 from typing import Iterator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, text
 from sqlalchemy.orm import Session, sessionmaker
 
 from models import Base
@@ -54,36 +54,20 @@ SessionLocal = sessionmaker(bind=engine, expire_on_commit=False, future=True)
 
 
 def init_db() -> None:
-    """Idempotent schema creation — safe to call on every startup rather
-    than requiring a separate migration step. There's no Alembic history
-    to manage yet: this is a from-scratch schema for a single-investor
-    tool, not a database with years of incremental changes behind it. If
-    the schema needs a breaking change later, that's the point to add
-    Alembic rather than before it's needed."""
-    Base.metadata.create_all(bind=engine)
-    # create_all() only creates whole tables that don't exist yet — it
-    # does NOT add a new index to a table that already existed before
-    # the index was added to the model. ingest_jobs's own concurrent-
-    # upload guard (a partial unique index) was added after that table
-    # had already shipped to production, so a fresh deploy gets it via
-    # create_all() above, but an already-running one needs it created
-    # explicitly. checkfirst=True makes this safe to call every startup
-    # either way — a no-op once the index exists.
-    from models import IngestJob
-    for index in IngestJob.__table__.indexes:
-        index.create(bind=engine, checkfirst=True)
-    # Same story for a new COLUMN on an existing table — create_all()
-    # won't add one either. IF NOT EXISTS makes this idempotent the same
-    # way checkfirst=True does for the index above.
-    from sqlalchemy import text
-    with engine.begin() as conn:
-        conn.execute(text("ALTER TABLE ingest_jobs ADD COLUMN IF NOT EXISTS debug_stage VARCHAR"))
+    from migrations import migrate
+
+    with engine.begin() as connection:
+        connection.execute(text("SELECT pg_advisory_xact_lock(74102001)"))
+        Base.metadata.create_all(bind=connection)
+        migrate(connection)
 
 
 @contextmanager
-def get_session() -> Iterator[Session]:
+def get_session(*, consistent=False) -> Iterator[Session]:
     session = SessionLocal()
     try:
+        if consistent:
+            session.connection(execution_options={"isolation_level": "REPEATABLE READ"})
         yield session
         session.commit()
     except Exception:

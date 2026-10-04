@@ -1,18 +1,18 @@
-import { useEffect, useState, useCallback } from 'react'
-import { api } from './api'
+import { useEffect, useState, useCallback, useRef, lazy, Suspense } from 'react'
+import { api, invalidateQueries } from './api'
 import Sidebar from './components/Sidebar'
 import TopBar from './components/TopBar'
 import LevelSelector from './components/LevelSelector'
 import WelcomeUpload from './components/WelcomeUpload'
-import Dashboard from './pages/Dashboard'
-import Portfolio from './pages/Portfolio'
-import Transactions from './pages/Transactions'
-import CapitalGains from './pages/CapitalGains'
-import PortfolioSnapshot from './pages/PortfolioSnapshot'
-import FundSummary from './pages/FundSummary'
-import PortfolioSummary from './pages/PortfolioSummary'
-import Exposure from './pages/Exposure'
-import Settings from './pages/Settings'
+const Dashboard = lazy(() => import('./pages/Dashboard'))
+const Portfolio = lazy(() => import('./pages/Portfolio'))
+const Transactions = lazy(() => import('./pages/Transactions'))
+const CapitalGains = lazy(() => import('./pages/CapitalGains'))
+const PortfolioSnapshot = lazy(() => import('./pages/PortfolioSnapshot'))
+const FundSummary = lazy(() => import('./pages/FundSummary'))
+const PortfolioSummary = lazy(() => import('./pages/PortfolioSummary'))
+const Exposure = lazy(() => import('./pages/Exposure'))
+const Settings = lazy(() => import('./pages/Settings'))
 
 const PAGES = {
   dashboard: Dashboard,
@@ -26,349 +26,190 @@ const PAGES = {
   settings: Settings,
 }
 
-// Pages that don't use the level/advisor filter bar at all (summary is
-// already grouped by every advisor at once; settings isn't portfolio data).
-// "upload" never reaches this set — it's handled before the shell renders.
 const NO_FILTER_BAR = new Set(['portfolio-summary', 'settings'])
+const pageFromPath = () => { const key = location.pathname.replace(/^\/+/, ''); return key === '' ? 'upload' : PAGES[key] ? key : 'dashboard' }
+const active = (job) => job && ['queued', 'processing'].includes(job.status)
 
-// Sidebar navigation used to be plain useState with no URL involved at
-// all — every page lived at the same "/", so the browser's Back button
-// had nothing of this app's own to go back to (it would just leave the
-// app entirely), and reloading always landed back on Dashboard no
-// matter which page you'd been on. pageFromPath/pathFromPage are the
-// two directions of keeping `page` state in sync with the real URL via
-// the History API, so Back/Forward/reload all do what they look like
-// they should.
-// "/" is its own page — the upload/drop screen — not an alias for
-// Dashboard; "upload" is a pseudo-key PAGES doesn't have an entry for,
-// handled specially in the render below (it always shows WelcomeUpload,
-// even once data exists — a deliberate, bookmarkable "start fresh" entry
-// point now that a new upload replaces what's there instead of adding
-// to it). "/dashboard" is unaffected and works exactly as before.
-function pageFromPath(pathname) {
-  const key = pathname.replace(/^\/+/, '')
-  if (key === '') return 'upload'
-  return PAGES[key] ? key : 'dashboard'
-}
-function pathFromPage(page) {
-  return page === 'upload' ? '/' : `/${page}`
-}
-
-// "Has a statement been parsed in THIS browser session?" — the flag that
-// separates "reloaded the page mid-use" (keep showing it) from "came
-// back later" (offer to parse again). sessionStorage, not localStorage,
-// precisely because it dies with the tab.
-//
-// Every access is guarded: sessionStorage doesn't merely return null
-// when unavailable, it THROWS on access in a browser set to block site
-// data and in some private-browsing modes. An unguarded read here would
-// take the whole app down on load for those users. Failing closed (as
-// if nothing was parsed) is the right fallback — worst case someone is
-// asked to parse again, which is this flow's normal behaviour anyway.
-const PARSED_THIS_SESSION_KEY = 'portfolioiq.parsedThisSession'
-
-function hasParsedThisSession() {
-  try {
-    return window.sessionStorage.getItem(PARSED_THIS_SESSION_KEY) === '1'
-  } catch {
-    return false
-  }
-}
-
-function markParsedThisSession() {
-  try {
-    window.sessionStorage.setItem(PARSED_THIS_SESSION_KEY, '1')
-  } catch {
-    // Non-fatal: the current render already shows the parsed statement.
-    // Only a later reload would fall back to the parse screen.
-  }
-}
-
-function clearParsedThisSession() {
-  try {
-    window.sessionStorage.removeItem(PARSED_THIS_SESSION_KEY)
-  } catch {
-    /* nothing to clear if storage is unavailable */
-  }
-}
-
-export default function App() {
-  const [page, setPage] = useState(() => pageFromPath(window.location.pathname))
+export default function App({ authRequired = true }) {
+  const [page, setPage] = useState(pageFromPath)
   const [config, setConfig] = useState(null)
   const [uploadInfo, setUploadInfo] = useState(null)
-  const [checkingInitial, setCheckingInitial] = useState(true)
+  const [checking, setChecking] = useState(true)
   const [enrichStatus, setEnrichStatus] = useState(null)
-  const [uploading, setUploading] = useState(false)
-  const [uploadError, setUploadError] = useState(null)
-  const [uploadNotice, setUploadNotice] = useState(null)
-  const [initialLoadError, setInitialLoadError] = useState(null)
+  const [job, setJob] = useState(null)
+  const [submitting, setSubmitting] = useState(false)
+  const [replacing, setReplacing] = useState(false)
+  const [error, setError] = useState(null)
+  const [pollError, setPollError] = useState(null)
   const [refreshTick, setRefreshTick] = useState(0)
   const [sidebarOpen, setSidebarOpen] = useState(false)
-
-  const [filters, setFilters] = useState({
-    includeZeroValue: false,
-    level: null,
-    groupName: null,
-    investorName: null,
-    arn: null,
-  })
-
-  const navigate = useCallback((nextPage) => {
-    if (nextPage === page) return
-    window.history.pushState({ page: nextPage }, '', pathFromPage(nextPage))
-    setPage(nextPage)
-  }, [page])
-
+  const [filters, setFilters] = useState({ includeZeroValue: false, level: null, groupName: null, investorName: null, arn: null })
+  const dataset = useRef(null)
+  const datasetRevision = useRef(0)
+  const replacementPending = useRef(false)
+  const currentJob = useRef(null)
+  const updateJob = useCallback(value => { currentJob.current = value; setJob(value) }, [])
+  const showReplacement = useCallback(value => { replacementPending.current = value; setReplacing(value) }, [])
+  const dirty = useRef(false)
+  const route = useRef(location.pathname)
+  const navigate = useCallback((next) => {
+    if (dirty.current && !window.confirm('Discard unsaved settings?')) return
+    route.current = next === 'upload' ? '/' : `/${next}`
+    history.pushState({}, '', route.current)
+    setPage(next)
+  }, [])
   useEffect(() => {
-    // Establish a proper history entry for the very first page too (so
-    // the initial load isn't a state-less entry Back can't distinguish
-    // from "leave the app"), then follow the browser's own Back/Forward.
-    window.history.replaceState({ page }, '', pathFromPage(page))
-    const onPopState = (event) => {
-      setPage(event.state?.page || pageFromPath(window.location.pathname))
+    const pop = () => {
+      if (dirty.current && !window.confirm('Discard unsaved settings?')) { history.pushState({}, '', route.current); return }
+      route.current = location.pathname; setPage(pageFromPath())
     }
-    window.addEventListener('popstate', onPopState)
-    return () => window.removeEventListener('popstate', onPopState)
-    // eslint-disable-next-line react-hooks/exhaustive-deps
+    const changed = (e) => { dirty.current = e.detail }
+    window.addEventListener('popstate', pop)
+    window.addEventListener('settings-dirty', changed)
+    return () => { window.removeEventListener('popstate', pop); window.removeEventListener('settings-dirty', changed) }
   }, [])
-
-  const loadConfig = useCallback(() => {
-    api.getConfig().then(setConfig).catch(() => {})
-  }, [])
-
-  const pollEnrichStatus = useCallback(() => {
-    let cancelled = false
-    // 180 tries * 2s = 6 minutes — generous (the largest real portfolio
-    // enriched this session took ~6 minutes), but not unbounded: if the
-    // background task itself dies outright (an exception before it
-    // writes even one EnrichmentCache row), pending would otherwise
-    // never reach 0 and this would poll forever instead of just giving
-    // up and leaving the last-known status on screen.
-    const MAX_ATTEMPTS = 180
-    let attempts = 0
-    const tick = () => {
-      api.getEnrichStatus().then((status) => {
-        if (cancelled) return
-        setEnrichStatus(status)
-        attempts += 1
-        if (status.pending > 0 && attempts < MAX_ATTEMPTS) setTimeout(tick, 2000)
-        else setRefreshTick((t) => t + 1)
-      }).catch(() => {})
-    }
-    tick()
-    return () => { cancelled = true }
-  }, [])
-
-  const [retrying, setRetrying] = useState(false)
-  const handleRetryEnrichment = useCallback(() => {
-    setRetrying(true)
-    api.retryEnrichment()
-      .then((res) => {
-        if (res.count > 0) pollEnrichStatus()
-      })
-      .catch(() => {})
-      .finally(() => setRetrying(false))
-  }, [pollEnrichStatus])
-
-  useEffect(() => {
-    loadConfig()
-
-    // This app parses a statement per visit; it is not somewhere your
-    // portfolio lives between visits. The database still holds the last
-    // parse (it has to — every page reads from it while you're using
-    // the app), but arriving fresh must never silently restore it.
-    // Previously this fetched the portfolio on mount and, if any data
-    // existed, dropped you straight into someone's dashboard without
-    // your having uploaded anything this visit.
-    //
-    // hasParsedThisSession() is the whole distinction, and sessionStorage
-    // is what makes it exactly right: it survives a refresh and in-app
-    // navigation (so reloading mid-use keeps your statement on screen —
-    // that's a normal thing to do while enrichment is still filling in),
-    // and it is dropped when the tab closes, which is precisely "the
-    // user left". A returning visitor lands on the parse screen and
-    // chooses to parse again.
-    if (!hasParsedThisSession()) {
-      // Cheap liveness check in place of the portfolio fetch: a broken
-      // backend must still be visible on load. A real incident (the
-      // server rejecting everything with 500 "API_KEY is not set")
-      // looked exactly like an empty account, with nothing on screen
-      // saying otherwise — so this failure is surfaced through the same
-      // banner WelcomeUpload renders for a failed upload, rather than
-      // being discovered only by trying to upload. Using /api/config
-      // instead of /api/portfolio also drops a multi-second query from
-      // the load path of a visitor who is about to upload anyway.
-      api.getConfig()
-        .catch((err) => setInitialLoadError(err.message || 'Could not reach the backend.'))
-        .finally(() => setCheckingInitial(false))
-      return
-    }
-
-    api.getEnrichStatus().then(setEnrichStatus).catch(() => {})
-    api.getPortfolio({ include_zero_value: true }).then((p) => {
-      // holdings_coverage_through is null until a CAS has actually been
-      // imported — the difference between "nothing uploaded" and
-      // "uploaded, but every holding filtered out". If this session
-      // thinks it parsed but the data is gone (wiped from Settings, or
-      // replaced by an upload in another tab), drop the marker so the
-      // next load correctly offers to parse instead of showing nothing.
-      if (!p.holdings_coverage_through) {
-        clearParsedThisSession()
-        return
-      }
-      setUploadInfo({
-        investor_name: (p.investor_names || []).join(', ') || undefined,
-        statement_period: { from: p.holdings_coverage_from, to: p.holdings_coverage_through },
-      })
-    }).catch((err) => {
-      setInitialLoadError(err.message || 'Could not reach the backend.')
-    }).finally(() => setCheckingInitial(false))
-  }, [loadConfig])
-
-  // The wipe+ingest itself runs in the background now (a real ~50-scheme
-  // statement is minutes of sequential mfapi.in calls — long enough that
-  // Render's own reverse proxy used to return a 502 before the ingest
-  // even finished, regardless of whether it was correct). uploadCas
-  // returns almost immediately with a job_id; this polls the same way
-  // pollEnrichStatus already does, but as a Promise handleUpload can
-  // await, since — unlike enrichment — the rest of the upload flow
-  // (landing on Dashboard, showing the imported statement) can't start
-  // until ingest has actually finished.
-  const pollUploadStatus = (jobId) => new Promise((resolve, reject) => {
-    // 200 tries * 3s = 10 minutes — generous for a large real statement's
-    // worth of sequential third-party API calls, but not unbounded.
-    const MAX_ATTEMPTS = 200
-    let attempts = 0
-    const tick = () => {
-      api.getUploadStatus(jobId).then((status) => {
-        if (status.status === 'processing') {
-          attempts += 1
-          if (attempts >= MAX_ATTEMPTS) {
-            reject(new Error('This is taking much longer than usual. It may still finish in the background — check back in a few minutes.'))
-            return
-          }
-          setTimeout(tick, 3000)
-        } else if (status.status === 'error') {
-          reject(new Error(status.message || 'Importing this statement failed.'))
-        } else {
-          resolve(status)
-        }
-      }).catch(reject)
-    }
-    tick()
-  })
-
-  const handleUpload = async (file, password = '') => {
-    setUploading(true)
-    setUploadError(null)
-    setUploadNotice(null)
+  const refresh = useCallback(() => { invalidateQueries(); setRefreshTick(t => t + 1) }, [])
+  const publishStatement = useCallback(statement => {
+    datasetRevision.current += 1
+    dataset.current = statement?.dataset_id ?? null
+    setUploadInfo(statement?.dataset_id ? statement : null)
+    refresh()
+  }, [refresh])
+  const loadConfig = useCallback(async () => {
     try {
-      const submitted = await api.uploadCas(file, password)
-      if (submitted.status === 'duplicate') {
-        // Not a failure, and no longer a dead end. Since a fresh visit
-        // always starts at the parse screen, the ordinary way to come
-        // back to your own statement is to submit it again — which
-        // lands here. The parsed data for this exact file is already in
-        // the database and correct, so the honest outcome is to show
-        // it: same as a successful parse, minus the wait. Previously
-        // this returned without setting uploadInfo, which (once page
-        // load stopped restoring state) left the user stuck on the
-        // upload screen being told their statement was already loaded
-        // while none of it was on screen.
-        setUploadNotice('Already parsed — showing your statement.')
-        markParsedThisSession()
-        setUploadInfo({
-          investor_name: submitted.investor_name,
-          statement_period: submitted.statement_period,
-        })
-        setRefreshTick((t) => t + 1)
-        pollEnrichStatus()
-        if (page === 'upload') navigate('dashboard')
-        return
-      }
-      const result = await pollUploadStatus(submitted.job_id)
-      markParsedThisSession()
-      setUploadInfo({ investor_name: result.investor_name, statement_period: result.statement_period })
-      setRefreshTick((t) => t + 1)
-      pollEnrichStatus()
-      // Uploading from the dedicated "/" drop screen is a "give me
-      // results" action — land on Dashboard rather than leaving them on
-      // the upload screen once there's something to actually show.
-      if (page === 'upload') navigate('dashboard')
-    } catch (err) {
-      setUploadError(err.message)
-    } finally {
-      setUploading(false)
+      const value = await api.getConfig(); setConfig(value)
+      setFilters(f => ({ ...f, includeZeroValue: !!value.preferences?.show_zero_value_funds }))
+      refresh()
+    } catch (e) { setError(e.message) }
+  }, [refresh])
+  useEffect(() => {
+    let live = true
+    Promise.all([api.getConfig(), api.getStatement(), api.getEnrichStatus(), api.getCurrentJob()])
+      .then(([c, statement, status, current]) => {
+        if (!live) return
+        setConfig(c); setFilters(f => ({ ...f, includeZeroValue: !!c.preferences?.show_zero_value_funds }))
+        dataset.current = statement.dataset_id
+        setUploadInfo(statement.dataset_id ? statement : null); setEnrichStatus(status); updateJob(current || status.last_job)
+        showReplacement(active(current) && current.kind === 'upload' && (!current.ready || current.dataset_id !== statement.dataset_id))
+        if (!current && status.last_job?.status === 'error') setError(status.last_job.message)
+      }).catch(e => { if (live) setError(e.message) }).finally(() => { if (live) setChecking(false) })
+    return () => { live = false }
+  }, [showReplacement, updateJob])
+  useEffect(() => {
+    let live = true
+    const sync = async () => {
+      if (document.visibilityState !== 'visible' || replacementPending.current || active(currentJob.current)) return
+      const revision = datasetRevision.current
+      try {
+        const [statement, current] = await Promise.all([api.getStatement(), api.getCurrentJob()])
+        if (!live || replacementPending.current || revision !== datasetRevision.current || active(currentJob.current)) return
+        if (active(current) && current.kind === 'upload') {
+          // The poller owns publication while another tab is importing.
+          showReplacement(!current.ready || current.dataset_id !== dataset.current)
+          updateJob(current)
+          return
+        }
+        if (statement.dataset_id !== dataset.current) {
+          publishStatement(statement)
+        }
+        if (current) updateJob(current)
+      } catch (e) { if (live) setPollError(`Could not check for portfolio updates: ${e.message}`) }
     }
+    const timer = setInterval(sync, 30000)
+    window.addEventListener('focus', sync)
+    return () => { live = false; clearInterval(timer); window.removeEventListener('focus', sync) }
+  }, [publishStatement, showReplacement, updateJob])
+  // One poller owns recovery, progressive refresh, and completion. It survives reload
+  // by discovering the durable job on mount, and cleans up on sign-out/unmount.
+  useEffect(() => {
+    if (!active(job)) return
+    let live = true, timer, failures = 0, lastStage = job.stage
+    const tick = async () => {
+      try {
+        const next = await api.getUploadStatus(job.job_id)
+        if (!live) return
+        failures = 0; setPollError(null)
+        let published = false
+        if (next.ready && dataset.current !== next.dataset_id) {
+          const [statement, status] = await Promise.all([api.getStatement(), api.getEnrichStatus()])
+          if (!live) return
+          if (statement.dataset_id !== next.dataset_id) throw new Error('Waiting for the new statement to become available.')
+          publishStatement(statement); setEnrichStatus(status); published = true
+          showReplacement(false)
+          navigate('dashboard')
+        }
+        if (next.ready && next.kind === 'upload') {
+          showReplacement(false)
+          if (pageFromPath() === 'upload') navigate('dashboard')
+        }
+        if (next.ready && !published && (next.stage !== lastStage || !active(next))) {
+          const status = await api.getEnrichStatus()
+          if (!live) return
+          setEnrichStatus(status); refresh()
+        }
+        lastStage = next.stage
+        updateJob(next)
+        if (!active(next)) showReplacement(false)
+        if (next.status === 'error') setError(next.message || 'Processing failed. Please retry.')
+        if (active(next)) timer = setTimeout(tick, 2500)
+      } catch (e) {
+        if (!live) return
+        setPollError(`Progress updates interrupted: ${e.message} Reconnecting…`)
+        timer = setTimeout(tick, Math.min(30000, 2500 * 2 ** Math.min(++failures, 4)))
+      }
+    }
+    tick()
+    return () => { live = false; clearTimeout(timer) }
+  }, [job?.job_id, navigate, refresh, publishStatement, showReplacement, updateJob])
+  const handleUpload = async (file, password = '') => {
+    if (replacementPending.current || active(currentJob.current)) return
+    datasetRevision.current += 1
+    showReplacement(true)
+    setSubmitting(true); setError(null)
+    try {
+      const result = await api.uploadCas(file, password)
+      if (result.status === 'duplicate') {
+        const statement = await api.getStatement()
+        publishStatement(statement); showReplacement(false); navigate('dashboard')
+      } else updateJob(result)
+    } catch (e) { showReplacement(false); setError(e.message) } finally { setSubmitting(false) }
   }
-
-  if (checkingInitial) {
-    return <div className="min-h-screen" />
+  const retry = async () => {
+    setSubmitting(true); setError(null)
+    try { updateJob(await api.retryEnrichment()) } catch (e) { setError(e.message) } finally { setSubmitting(false) }
   }
-
-  if (!uploadInfo) {
-    // uploadError (a failed upload attempt) takes priority once the user
-    // has actually tried something; initialLoadError (the page's own
-    // first load failing) is the fallback so a misconfigured/unreachable
-    // backend is visible even before they've touched anything.
-    return <WelcomeUpload onUpload={handleUpload} uploading={uploading} error={uploadError || initialLoadError} />
+  const cancel = async () => {
+    try { await api.cancelJob(job.job_id); updateJob({ ...currentJob.current, cancel_requested: true }) } catch (e) { setError(e.message) }
   }
-
-  // "/" is always the bare drop-box screen, full-screen and standalone —
-  // no sidebar, no topbar, no investor name/enrich badge — even once
-  // data exists. It used to sit inside the normal shell in that case
-  // (so the topbar's own already-loaded investor name stayed visible
-  // while replacing), but that read as a stray "preloaded statement"
-  // showing up unexplained the moment the app opened — reported live.
-  // "upload" isn't in PAGES for this reason: it's handled here, before
-  // the shell below, rather than as a PageComponent inside it.
-  if (page === 'upload') {
-    return <WelcomeUpload onUpload={handleUpload} uploading={uploading} error={uploadError} replacing />
+  const signOut = async () => {
+    try { await api.logout(); window.dispatchEvent(new Event('session-expired')) } catch (e) { setError(e.message) }
   }
-
+  const busy = submitting || active(job)
+  const status = <div className="px-4 py-2 text-sm" role="status" aria-live="polite">
+    {active(job) && <span>Processing: {job.stage || job.status}. {job.ready && 'Your portfolio is ready while market data refreshes.'} <button className="underline ml-2" onClick={cancel} disabled={job.cancel_requested}>{job.cancel_requested ? 'Cancelling…' : 'Cancel'}</button></span>}
+    {job?.status === 'cancelled' && <span>Processing cancelled.</span>}
+    {(uploadInfo?.warnings || []).map((warning, i) => <p key={i} className="text-warn">{warning}</p>)}
+    {(error || pollError) && <p className="text-bad">{error || pollError}</p>}
+  </div>
+  if (checking) return <div role="status" className="p-8">Loading your portfolio…</div>
+  if (replacing) return <main className="min-h-screen flex flex-col items-center justify-center p-6 text-center" aria-busy="true">
+    <h1 className="font-display text-2xl font-bold mb-3">Importing your new statement</h1>
+    <p className="text-sm text-ink-2 mb-3">Your current statement stays saved until the new one is ready.</p>
+    {submitting && <p role="status">Uploading statement…</p>}
+    {status}
+  </main>
+  if (!uploadInfo || page === 'upload') return <>{status}<WelcomeUpload onUpload={handleUpload} uploading={busy} error={error} replacing={!!uploadInfo} />{uploadInfo && <button className="fixed top-4 right-4 underline" onClick={() => navigate('dashboard')}>Back to portfolio</button>}</>
   const PageComponent = PAGES[page]
-
-  return (
-    <div className="flex min-h-screen">
-      <Sidebar active={page} open={sidebarOpen} onClose={() => setSidebarOpen(false)} onNavigate={(k) => { navigate(k); setSidebarOpen(false) }} />
-      <div className="flex-1 flex flex-col min-w-0">
-        <TopBar
-          investorName={uploadInfo?.investor_name}
-          statementPeriod={uploadInfo?.statement_period}
-          lastEnriched={enrichStatus?.last_run}
-          enrichStatus={enrichStatus}
-          onUpload={handleUpload}
-          uploading={uploading}
-          onMenuClick={() => setSidebarOpen(true)}
-          onRetryEnrichment={handleRetryEnrichment}
-          retryingEnrichment={retrying}
-        />
-        {uploadError && (
-          <div className="mx-4 md:mx-6 mt-4 rounded-lg border border-bad/20 bg-bad-tint text-bad text-sm px-4 py-2.5">
-            {uploadError}
-          </div>
-        )}
-        {uploadNotice && (
-          <div className="mx-4 md:mx-6 mt-4 rounded-lg border border-accent/20 bg-accent-tint text-accent-strong text-sm px-4 py-2.5">
-            {uploadNotice}
-          </div>
-        )}
-        <main className="flex-1 p-4 md:p-6 max-w-[1400px] w-full">
-          {!NO_FILTER_BAR.has(page) && (
-            <div className="mb-5">
-              <LevelSelector
-                config={config}
-                level={filters.level}
-                groupName={filters.groupName}
-                investorName={filters.investorName}
-                arn={filters.arn}
-                onChange={(next) => setFilters((f) => ({ ...f, ...next }))}
-              />
-            </div>
-          )}
-          <PageComponent filters={filters} setFilters={setFilters} config={config} refreshTick={refreshTick} onConfigSaved={loadConfig} />
-        </main>
-      </div>
+  return <div className="flex min-h-screen">
+    <Sidebar active={page} open={sidebarOpen} onClose={() => setSidebarOpen(false)} onNavigate={key => { navigate(key); setSidebarOpen(false) }} />
+    <div className="flex-1 flex flex-col min-w-0">
+      <TopBar investorName={uploadInfo.investor_name} statementPeriod={uploadInfo.statement_period} lastEnriched={enrichStatus?.last_run} enrichStatus={enrichStatus} onUpload={handleUpload} uploading={busy} onMenuClick={() => setSidebarOpen(true)} onRetryEnrichment={retry} retryingEnrichment={busy} />
+      {status}
+      <div className="px-4 flex gap-4 text-xs"><button onClick={retry} disabled={busy}>Refresh market data</button>{authRequired && <button onClick={signOut}>Sign out</button>}</div>
+      <main className="flex-1 p-4 md:p-6 max-w-[1400px] w-full">
+        {!NO_FILTER_BAR.has(page) && <div className="mb-5"><LevelSelector config={config} level={filters.level} groupName={filters.groupName} investorName={filters.investorName} arn={filters.arn} onChange={next => setFilters(f => ({ ...f, ...next }))} /></div>}
+        <Suspense fallback={<div role="status">Loading page…</div>}><PageComponent key={`${uploadInfo.dataset_id}:${page}`} filters={filters} setFilters={setFilters} config={config} refreshTick={refreshTick} onConfigSaved={loadConfig} /></Suspense>
+      </main>
     </div>
-  )
+  </div>
 }

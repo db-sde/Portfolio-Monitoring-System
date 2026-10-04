@@ -32,17 +32,32 @@ import httpx
 from sqlalchemy import select
 from sqlalchemy.orm import Session
 
+import ledger
 import enrichment
 import nav_service
-from fifo import DISPOSAL_TYPES, LOT_CREATING_TYPES, NON_TAXABLE_REDUCTION_TYPES, LotInput, run_fifo
+from fifo import (
+    DISPOSAL_TYPES,
+    LOT_CREATING_TYPES,
+    NON_TAXABLE_REDUCTION_TYPES,
+    LotInput,
+    run_fifo,
+)
 from models import (
-    CasUpload, DisposalAllocation, Folio, Holding, NavCache, PurchaseLot, Transaction,
+    CasUpload,
+    DisposalAllocation,
+    Folio,
+    Holding,
+    NavCache,
+    PurchaseLot,
+    Transaction,
 )
 from scheme_resolution import build_scheme_cache, prefetch_mfapi_schemes, resolve_scheme
 
 logger = logging.getLogger("portfolioiq")
 
-RECONCILIATION_TOLERANCE = Decimal("0.001")  # units; casparser's own Decimal rounding noise floor
+RECONCILIATION_TOLERANCE = Decimal(
+    "0.001"
+)  # units; casparser's own Decimal rounding noise floor
 
 
 class PhaseTimer:
@@ -78,7 +93,11 @@ class PhaseTimer:
             for name in sorted(self.totals, key=lambda n: -self.totals[n])
         ]
         accounted = sum(self.totals.values())
-        return f"total={total:.1f}s " + " ".join(parts) + f" unaccounted={total - accounted:.1f}s"
+        return (
+            f"total={total:.1f}s "
+            + " ".join(parts)
+            + f" unaccounted={total - accounted:.1f}s"
+        )
 
 
 @dataclass
@@ -102,30 +121,35 @@ def _derive_plan_option(scheme_name: str) -> tuple[str, str]:
     are embedded in the scheme name string, same as the archived
     portfolio.py's _mode_from_name did for plan alone."""
     lowered = (scheme_name or "").lower()
-    plan = "Direct" if "direct" in lowered else "Regular"
-    option = "IDCW" if any(k in lowered for k in ("idcw", "dividend")) else "Growth"
+    plan = (
+        "Direct"
+        if "direct" in lowered
+        else ("Regular" if "regular" in lowered else "Unknown")
+    )
+    option = (
+        "IDCW"
+        if any(k in lowered for k in ("idcw", "dividend"))
+        else ("Growth" if "growth" in lowered else "Unknown")
+    )
     return plan, option
 
 
 def _asset_class(scheme_type: Optional[str]) -> str:
     t = (scheme_type or "").upper()
-    return t if t in ("EQUITY", "DEBT") else "OTHER"
+    return t if t in ("EQUITY", "DEBT", "HYBRID") else "OTHER"
 
 
 def _store_prefetched_nav_history(
-    session: Session, scheme_id: int, raw: dict, stored_summary=None,
+    session: Session,
+    scheme_id: int,
+    raw: dict,
+    stored_summary=None,
 ) -> None:
-    """Persist the NAV series out of an mfapi.in response we already
-    fetched for scheme resolution (see the call site for why). Failure
-    here is deliberately swallowed: this is a pure head start for
-    enrichment, which re-fetches anything missing on its own, so a
-    problem storing it must never be able to fail an otherwise-good
-    CAS import.
+    """Persist verified prefetched history inside the atomic import transaction.
 
-    stored_summary is passed in by the caller, which loads every
-    scheme's summary in one query. It used to be looked up here, per
-    scheme — one more round trip each, and on the wipe-then-ingest path
-    every one of them returned nothing."""
+    A failed write aborts the import; it must never leave a poisoned session
+    to commit a partially imported statement.
+    """
     try:
         points = []
         for row in enrichment._extract_mfapi_nav_history(raw):
@@ -133,9 +157,14 @@ def _store_prefetched_nav_history(
             if d is not None:
                 points.append((d, Decimal(str(row["nav"]))))
         if points:
-            nav_service.store_nav_points(session, scheme_id, points, stored_summary=stored_summary)
+            nav_service.store_nav_points(
+                session, scheme_id, points, stored_summary=stored_summary
+            )
     except Exception:
-        logger.exception("Could not store prefetched NAV history for scheme_id=%s", scheme_id)
+        logger.exception(
+            "Could not store verified NAV history for scheme_id=%s", scheme_id
+        )
+        raise
 
 
 class _IngestCaches:
@@ -180,7 +209,9 @@ class _IngestCaches:
         )
 
 
-def _precreate_folios(session: Session, caches: _IngestCaches, parsed, investor_id: Optional[int]) -> None:
+def _precreate_folios(
+    session: Session, caches: _IngestCaches, parsed, investor_id: Optional[int]
+) -> None:
     """Create every folio the statement mentions in ONE flush.
 
     Each folio is an INSERT whose generated id the holdings below need,
@@ -201,7 +232,11 @@ def _precreate_folios(session: Session, caches: _IngestCaches, parsed, investor_
 
 
 def _get_or_create_folio(
-    session: Session, caches: _IngestCaches, investor_id: Optional[int], folio_number: str, amc: str,
+    session: Session,
+    caches: _IngestCaches,
+    investor_id: Optional[int],
+    folio_number: str,
+    amc: str,
 ) -> Folio:
     normalized = (folio_number or "").strip()
     key = (investor_id, normalized, amc)
@@ -219,8 +254,13 @@ def _get_or_create_folio(
 
 
 def _stage_holding(
-    session: Session, caches: _IngestCaches, folio_id: int, scheme_id: int,
-    plan: str, option: str, advisor_arn: Optional[str],
+    session: Session,
+    caches: _IngestCaches,
+    folio_id: int,
+    scheme_id: int,
+    plan: str,
+    option: str,
+    advisor_arn: Optional[str],
 ) -> Holding:
     """Return this holding, adding it to the session if it's new — but
     WITHOUT flushing. The caller flushes once for the whole statement, so
@@ -232,7 +272,11 @@ def _stage_holding(
             existing.advisor_arn = advisor_arn
         return existing
     holding = Holding(
-        folio_id=folio_id, scheme_id=scheme_id, plan=plan, option=option, advisor_arn=advisor_arn,
+        folio_id=folio_id,
+        scheme_id=scheme_id,
+        plan=plan,
+        option=option,
+        advisor_arn=advisor_arn,
     )
     session.add(holding)
     caches.holdings[key] = holding
@@ -272,7 +316,11 @@ def _transaction_fingerprint(t) -> tuple:
 
 
 def _stage_transactions(
-    session: Session, caches: _IngestCaches, holding: Holding, scheme, upload_id: int,
+    session: Session,
+    caches: _IngestCaches,
+    holding: Holding,
+    scheme,
+    upload_id: int,
 ) -> tuple[list[Transaction], list[Transaction]]:
     """Add any transaction rows not already present (by fingerprint) to
     the session, WITHOUT flushing, and return (existing, added).
@@ -294,7 +342,7 @@ def _stage_transactions(
     # (spec 6.3) — counted per (date, type, amount, units, nav) group,
     # in the order casparser itself returned them.
     seen_keys: dict[tuple, int] = {}
-    for txn in scheme.transactions:
+    for position, txn in enumerate(scheme.transactions):
         key = (_as_date(txn.date), txn.type, txn.amount, txn.units, txn.nav)
         occurrence_index = seen_keys.get(key, 0)
         seen_keys[key] = occurrence_index + 1
@@ -312,16 +360,22 @@ def _stage_transactions(
                 gift_folio=txn.gift_folio,
                 source_upload_id=upload_id,
                 occurrence_index=occurrence_index,
+                ledger_position=position,
             )
             session.add(row)
             added.append(row)
-            existing_fingerprints.add(fingerprint)  # guards against a duplicate row within this same upload
+            existing_fingerprints.add(
+                fingerprint
+            )  # guards against a duplicate row within this same upload
+    caches.transactions[holding.holding_id] = list(existing_rows) + added
     return list(existing_rows), added
 
 
 def _finalize_transactions(
-    caches: _IngestCaches, holding: Holding,
-    existing_rows: list[Transaction], added: list[Transaction],
+    caches: _IngestCaches,
+    holding: Holding,
+    existing_rows: list[Transaction],
+    added: list[Transaction],
 ) -> list[Transaction]:
     """The full ledger for this holding in FIFO order, called after the
     caller's single flush has assigned transaction_ids.
@@ -344,7 +398,7 @@ def _finalize_transactions(
     # transaction_id reflects insertion order, which is casparser's own
     # ledger order and what the previous SELECT ... ORDER BY returned in
     # practice, so this both fixes the ordering and keeps it stable.
-    combined.sort(key=lambda t: (t.date, t.occurrence_index, t.transaction_id))
+    combined = ledger.ordered(combined)
     caches.transactions[holding.holding_id] = combined
     return combined
 
@@ -364,12 +418,16 @@ def _teardown_existing_fifo(session: Session, holding_ids: list[int]) -> None:
             select(PurchaseLot.lot_id).where(PurchaseLot.holding_id.in_(holding_ids))
         )
     ).delete(synchronize_session=False)
-    session.query(PurchaseLot).filter(PurchaseLot.holding_id.in_(holding_ids)).delete(synchronize_session=False)
+    session.query(PurchaseLot).filter(PurchaseLot.holding_id.in_(holding_ids)).delete(
+        synchronize_session=False
+    )
     session.flush()
 
 
 def _stage_fifo_lots(
-    session: Session, holding: Holding, transactions: list[Transaction],
+    session: Session,
+    holding: Holding,
+    transactions: list[Transaction],
 ):
     """Run FIFO for one holding and add its PurchaseLot rows WITHOUT
     flushing. Returns (fifo_result, lot_rows, derived_closing_units) so
@@ -395,49 +453,24 @@ def _stage_fifo_lots(
     # Matched by same holding + same date, since that's how a real
     # statement pairs them; split proportionally by purchase amount on
     # the rare date with more than one lot-creating transaction.
-    stamp_duty_by_date: dict[date, Decimal] = {}
+    result = ledger.fifo_for(transactions)
     for t in transactions:
-        if t.type == "STAMP_DUTY_TAX" and t.amount:
-            stamp_duty_by_date[t.date] = stamp_duty_by_date.get(t.date, Decimal("0")) + abs(t.amount)
-
-    lot_creating_by_date: dict[date, list[Transaction]] = {}
-    for t in transactions:
-        if t.type in LOT_CREATING_TYPES:
-            lot_creating_by_date.setdefault(t.date, []).append(t)
-
-    def _stamp_duty_for(t: Transaction) -> Decimal:
-        day_total = stamp_duty_by_date.get(t.date)
-        if not day_total:
-            return Decimal("0")
-        same_day = lot_creating_by_date.get(t.date, [])
-        if len(same_day) <= 1:
-            return day_total
-        amounts_total = sum((abs(x.amount) for x in same_day if x.amount), Decimal("0"))
-        if not amounts_total or not t.amount:
-            return Decimal("0")
-        return day_total * (abs(t.amount) / amounts_total)
-
-    events = [
-        LotInput(
-            transaction_id=t.transaction_id, date=t.date, type=t.type,
-            units=abs(t.units) if t.units is not None else Decimal("0"),
-            amount=abs(t.amount) if t.amount is not None else Decimal("0"),
-            nav=t.nav,
-            stamp_duty=_stamp_duty_for(t) if t.type in LOT_CREATING_TYPES else Decimal("0"),
-        )
-        for t in transactions
-        if t.type in LOT_CREATING_TYPES or t.type in DISPOSAL_TYPES or t.type in NON_TAXABLE_REDUCTION_TYPES
-    ]
-    result = run_fifo(events)
+        if t.transaction_id in result.reversal_links:
+            t.reverses_transaction_id = result.reversal_links[t.transaction_id]
 
     lot_rows: list[PurchaseLot] = []
     for lot in result.lots:
         row = PurchaseLot(
-            holding=holding, transaction_id=lot.transaction_id,
-            acquired_date=lot.acquired_date, original_units=lot.original_units,
-            remaining_units=lot.remaining_units, purchase_nav=lot.purchase_nav,
-            purchase_amount=lot.purchase_amount, remaining_cost=lot.remaining_cost,
-            stamp_duty=lot.stamp_duty, origin_type=lot.origin_type,
+            holding=holding,
+            transaction_id=lot.transaction_id,
+            acquired_date=lot.acquired_date,
+            original_units=lot.original_units,
+            remaining_units=lot.remaining_units,
+            purchase_nav=lot.purchase_nav,
+            purchase_amount=lot.purchase_amount,
+            remaining_cost=lot.remaining_cost,
+            stamp_duty=lot.stamp_duty,
+            origin_type=lot.origin_type,
         )
         session.add(row)
         lot_rows.append(row)
@@ -446,17 +479,94 @@ def _stage_fifo_lots(
     return result, lot_rows, derived_closing_units
 
 
-def _stage_fifo_allocations(session: Session, result, lot_rows: list[PurchaseLot]) -> None:
+def _stage_fifo_allocations(
+    session: Session, result, lot_rows: list[PurchaseLot]
+) -> None:
     """Create one holding's DisposalAllocation rows. Called only after
     the caller has flushed every holding's lots, since each allocation
     needs its lot's generated lot_id."""
     for alloc in result.allocations:
-        session.add(DisposalAllocation(
-            disposal_transaction_id=alloc.disposal_transaction_id,
-            lot_id=lot_rows[alloc.lot_index].lot_id,
-            allocated_units=alloc.allocated_units, allocated_cost=alloc.allocated_cost,
-            sale_value=alloc.sale_value, realized_gain=alloc.realized_gain, sold_date=alloc.sold_date,
-        ))
+        session.add(
+            DisposalAllocation(
+                disposal_transaction_id=alloc.disposal_transaction_id,
+                lot_id=lot_rows[alloc.lot_index].lot_id,
+                allocated_units=alloc.allocated_units,
+                allocated_cost=alloc.allocated_cost,
+                sale_value=alloc.sale_value,
+                realized_gain=alloc.realized_gain,
+                sold_date=alloc.sold_date,
+            )
+        )
+
+
+def rebuild_derived_ledger(session: Session) -> dict:
+    """Repair derived lots after an engine upgrade, without changing source data.
+
+    The caller owns the transaction. The import control lock and active-job
+    check prevent this maintenance operation from racing an import/refresh.
+    """
+    from sqlalchemy import text
+    import jobs
+    from models import Scheme
+
+    session.execute(
+        text("SELECT pg_advisory_xact_lock(:key)"), {"key": jobs.CONTROL_LOCK}
+    )
+    if jobs.active_job(session):
+        raise ValueError("Wait for the active import or refresh before rebuilding.")
+    holdings = list(session.scalars(select(Holding)))
+    schemes = {s.scheme_id: s for s in session.scalars(select(Scheme))}
+    transactions = defaultdict(list)
+    for txn in session.scalars(
+        select(Transaction).order_by(
+            Transaction.date, Transaction.ledger_position, Transaction.transaction_id
+        )
+    ):
+        transactions[txn.holding_id].append(txn)
+    _teardown_existing_fifo(session, [h.holding_id for h in holdings])
+    staged = []
+    for holding in holdings:
+        result, lots, units = _stage_fifo_lots(
+            session, holding, transactions[holding.holding_id]
+        )
+        staged.append((result, lots))
+        code, detail = None, None
+        if not schemes[holding.scheme_id].identity_confirmed:
+            code, detail = "SCHEME_UNRESOLVED", "Scheme identity has not been verified."
+        elif result.reversal_errors:
+            code, detail = (
+                "REVERSAL_UNRESOLVED",
+                "A reversal could not be uniquely matched to its originating purchase.",
+            )
+        elif result.shortfalls:
+            code, detail = (
+                "FIFO_SHORTFALL",
+                "Purchase history does not cover all disposals.",
+            )
+        elif holding.opening_units:
+            code, detail = (
+                "INCOMPLETE_OPENING_HISTORY",
+                "Opening units have no acquisition history.",
+            )
+        elif (
+            holding.closing_units is not None
+            and abs(units - holding.closing_units) > RECONCILIATION_TOLERANCE
+        ):
+            code, detail = (
+                "CAS_RECONCILIATION_FAILED",
+                "Calculated units differ from the statement closing balance.",
+            )
+        holding.data_quality_code, holding.data_quality_detail = code, detail
+        holding.reconciliation_status = "review_required" if code else "reconciled"
+    session.flush()
+    for result, lots in staged:
+        _stage_fifo_allocations(session, result, lots)
+    session.flush()
+    return {
+        "holdings": len(holdings),
+        "reconciled": sum(h.reconciliation_status == "reconciled" for h in holdings),
+        "reversals_matched": sum(len(result.reversal_links) for result, _ in staged),
+    }
 
 
 async def ingest_cas(
@@ -466,9 +576,12 @@ async def ingest_cas(
     file_bytes: bytes,
     investor_id: Optional[int] = None,
     parse_warnings: Optional[list[str]] = None,
+    prepared: Optional[dict] = None,
 ) -> IngestResult:
     file_hash = hashlib.sha256(file_bytes).hexdigest()
-    existing_upload = session.execute(select(CasUpload).where(CasUpload.file_hash == file_hash)).scalar_one_or_none()
+    existing_upload = session.execute(
+        select(CasUpload).where(CasUpload.file_hash == file_hash)
+    ).scalar_one_or_none()
     if existing_upload:
         return IngestResult(upload_id=existing_upload.upload_id, duplicate=True)
 
@@ -480,12 +593,15 @@ async def ingest_cas(
         period_from=_as_date(period.from_) if getattr(period, "from_", None) else None,
         period_to=_as_date(period.to) if getattr(period, "to", None) else None,
         warnings=list(parse_warnings or getattr(parsed, "parse_warnings", []) or []),
+        parse_status="3.0.1",
         raw_parsed_json=parsed.model_dump(mode="json", by_alias=True),
     )
     session.add(upload)
     session.flush()
 
-    result = IngestResult(upload_id=upload.upload_id, duplicate=False, warnings=list(upload.warnings))
+    result = IngestResult(
+        upload_id=upload.upload_id, duplicate=False, warnings=list(upload.warnings)
+    )
 
     # Prefetch every scheme's mfapi.in data CONCURRENTLY before the main
     # loop, which resolves schemes sequentially (it has to — each
@@ -495,10 +611,16 @@ async def ingest_cas(
     # resolved sequentially took ~35s of pure network wait (mfapi.in's
     # own per-call latency, 1-15s and highly variable); prefetching
     # collapses that to roughly the single slowest call instead of their sum.
-    all_amfi_codes = [s.amfi for folio in parsed.folios for s in folio.schemes if s.amfi]
+    all_amfi_codes = [
+        s.amfi for folio in parsed.folios for s in folio.schemes if s.amfi
+    ]
     timer = PhaseTimer()
     with timer.phase("mfapi_prefetch"):
-        prefetched_mfapi = await prefetch_mfapi_schemes(client, all_amfi_codes)
+        prefetched_mfapi = (
+            prepared
+            if prepared is not None
+            else await prefetch_mfapi_schemes(client, all_amfi_codes)
+        )
     with timer.phase("preload_caches"):
         caches = _IngestCaches(session)
         # Every stored-NAV summary in one aggregate query rather than one
@@ -506,7 +628,8 @@ async def ingest_cas(
         # have NAV rows; a scheme this import creates simply misses,
         # which is correct — a brand-new scheme has no stored history.
         nav_summaries = nav_service.get_stored_nav_summary(
-            session, list(session.execute(select(NavCache.scheme_id).distinct()).scalars())
+            session,
+            list(session.execute(select(NavCache.scheme_id).distinct()).scalars()),
         )
         _precreate_folios(session, caches, parsed, investor_id)
 
@@ -523,26 +646,56 @@ async def ingest_cas(
     #
     # Pass 1: resolve schemes and stage holdings (no ids needed yet).
     work: list[dict] = []
+    seen_holding_objects = set()
     for folio in parsed.folios:
         with timer.phase("folio_upsert"):
-            folio_row = _get_or_create_folio(session, caches, investor_id, folio.folio, folio.amc)
+            folio_row = _get_or_create_folio(
+                session, caches, investor_id, folio.folio, folio.amc
+            )
         for scheme in folio.schemes:
             plan, option = _derive_plan_option(scheme.scheme)
             asset_class = _asset_class(scheme.type)
             with timer.phase("resolve_scheme"):
                 resolution = await resolve_scheme(
-                    session, client,
-                    cas_isin=scheme.isin, cas_amfi_code=scheme.amfi, cas_scheme_name=scheme.scheme,
-                    cas_rta_code=scheme.rta_code, plan=plan, option=option, asset_class=asset_class,
-                    prefetched_mfapi=prefetched_mfapi, scheme_cache=caches.schemes_by_isin,
+                    session,
+                    client,
+                    cas_isin=scheme.isin,
+                    cas_amfi_code=scheme.amfi,
+                    cas_scheme_name=scheme.scheme,
+                    cas_rta_code=scheme.rta_code,
+                    plan=plan,
+                    option=option,
+                    asset_class=asset_class,
+                    prefetched_mfapi=prefetched_mfapi,
+                    scheme_cache=caches.schemes_by_isin,
+                    offline=prepared is not None,
                 )
             with timer.phase("stage_holdings"):
                 holding = _stage_holding(
-                    session, caches, folio_row.folio_id, resolution.scheme.scheme_id, plan, option, scheme.advisor,
+                    session,
+                    caches,
+                    folio_row.folio_id,
+                    resolution.scheme.scheme_id,
+                    plan,
+                    option,
+                    scheme.advisor,
                 )
-            work.append({
-                "scheme": scheme, "resolution": resolution, "holding": holding,
-            })
+            if id(holding) in seen_holding_objects:
+                raise ValueError(
+                    "The statement repeats a holding section. Import a consolidated detailed statement to avoid ambiguous balances."
+                )
+            seen_holding_objects.add(id(holding))
+            holding.opening_units = scheme.open or Decimal("0")
+            holding.opening_date = upload.period_from
+            holding.closing_units = scheme.close
+            holding.coverage_date = upload.period_to
+            work.append(
+                {
+                    "scheme": scheme,
+                    "resolution": resolution,
+                    "holding": holding,
+                }
+            )
 
     # One flush for every holding in the statement, assigning holding_id.
     with timer.phase("flush_holdings"):
@@ -553,14 +706,21 @@ async def ingest_cas(
     for item in work:
         with timer.phase("stage_transactions"):
             item["existing_txns"], item["added_txns"] = _stage_transactions(
-                session, caches, item["holding"], item["scheme"], upload.upload_id,
+                session,
+                caches,
+                item["holding"],
+                item["scheme"],
+                upload.upload_id,
             )
     with timer.phase("flush_transactions"):
         session.flush()
 
     for item in work:
         item["transactions"] = _finalize_transactions(
-            caches, item["holding"], item["existing_txns"], item["added_txns"],
+            caches,
+            item["holding"],
+            item["existing_txns"],
+            item["added_txns"],
         )
 
     # Pass 3: rebuild FIFO. Teardown for every holding that already had
@@ -570,12 +730,18 @@ async def ingest_cas(
     with timer.phase("fifo_teardown"):
         _teardown_existing_fifo(
             session,
-            [i["holding"].holding_id for i in work if i["holding"].holding_id in caches.holdings_with_lots],
+            [
+                i["holding"].holding_id
+                for i in work
+                if i["holding"].holding_id in caches.holdings_with_lots
+            ],
         )
     for item in work:
         with timer.phase("stage_fifo_lots"):
             item["fifo"], item["lot_rows"], item["derived_units"] = _stage_fifo_lots(
-                session, item["holding"], item["transactions"],
+                session,
+                item["holding"],
+                item["transactions"],
             )
     with timer.phase("flush_lots"):
         session.flush()
@@ -591,13 +757,12 @@ async def ingest_cas(
     # verdict depends on exists.
     for item in work:
         scheme, resolution = item["scheme"], item["resolution"]
-        holding, transactions = item["holding"], item["transactions"]
+        holding = item["holding"]
         derived_closing_units = item["derived_units"]
         shortfalls = item["fifo"].shortfalls
 
         delta = (scheme.close or Decimal("0")) - derived_closing_units
-        has_lot_creating_txn = any(t.type in LOT_CREATING_TYPES for t in transactions)
-        opening_nonzero_no_history = (scheme.open or Decimal("0")) != 0 and not has_lot_creating_txn
+        opening_nonzero_no_history = (scheme.open or Decimal("0")) != 0
 
         # Distinct spec-17 error codes, not one generic "review_required"
         # bucket — SCHEME_UNRESOLVED/FIFO_SHORTFALL/
@@ -608,10 +773,18 @@ async def ingest_cas(
             holding.reconciliation_status = "review_required"
             code = "SCHEME_UNRESOLVED"
             detail = f"Scheme identity not confirmed by ISIN (method={resolution.method}) — needs manual mapping."
+        elif item["fifo"].reversal_errors:
+            holding.reconciliation_status = "review_required"
+            code = "REVERSAL_UNRESOLVED"
+            detail = (
+                "A reversal could not be uniquely matched to its originating purchase."
+            )
         elif shortfalls:
             holding.reconciliation_status = "review_required"
             code = "FIFO_SHORTFALL"
-            detail = f"Disposal(s) sold more units than known lots covered ({shortfalls})."
+            detail = (
+                f"Disposal(s) sold more units than known lots covered ({shortfalls})."
+            )
         elif opening_nonzero_no_history:
             holding.reconciliation_status = "incomplete_opening_history"
             code = "INCOMPLETE_OPENING_HISTORY"
@@ -630,10 +803,14 @@ async def ingest_cas(
         holding.data_quality_code = code
         holding.data_quality_detail = detail
 
-        result.holdings.append(HoldingIngestNote(
-            holding_id=holding.holding_id, scheme_name=scheme.scheme,
-            status=holding.reconciliation_status, detail=detail,
-        ))
+        result.holdings.append(
+            HoldingIngestNote(
+                holding_id=holding.holding_id,
+                scheme_name=scheme.scheme,
+                status=holding.reconciliation_status,
+                detail=detail,
+            )
+        )
 
         # Keep the NAV history that prefetch_mfapi_schemes ALREADY
         # downloaded for this scheme. Each of those responses carries
@@ -647,12 +824,16 @@ async def ingest_cas(
         # lockout), which is the root cause of enrichment's
         # "different schemes fail each run" behaviour. Storing it
         # here costs nothing extra — we already paid for the bytes.
-        raw = prefetched_mfapi.get(scheme.amfi) if scheme.amfi else None
+        raw = resolution.raw
         if raw:
             with timer.phase("store_nav_history"):
                 _store_prefetched_nav_history(
-                    session, resolution.scheme.scheme_id, raw,
-                    stored_summary=nav_summaries.get(resolution.scheme.scheme_id),
+                    session,
+                    resolution.scheme.scheme_id,
+                    raw,
+                    stored_summary=None
+                    if resolution.cache_reset
+                    else nav_summaries.get(resolution.scheme.scheme_id),
                 )
 
     logger.info("ingest_cas timing: %s", timer.summary())

@@ -12,15 +12,17 @@ function BenchmarkCell({ value, status, tooltip }) {
   )
 }
 
-export default function PortfolioSummary({ refreshTick }) {
+export default function PortfolioSummary({ refreshTick, config }) {
   const [data, setData] = useState(null)
   const [loading, setLoading] = useState(true)
   const [error, setError] = useState(null)
 
   useEffect(() => {
+    let live = true
     setLoading(true)
     setError(null)
-    api.getPortfolioSummary().then(setData).catch((err) => setError(err.message)).finally(() => setLoading(false))
+    api.getPortfolioSummary().then(value => { if (live) setData(value) }).catch((err) => { if (live) setError(err.message) }).finally(() => { if (live) setLoading(false) })
+    return () => { live = false }
   }, [refreshTick])
 
   if (error) return <div className="text-sm text-bad">{error}</div>
@@ -56,11 +58,11 @@ export default function PortfolioSummary({ refreshTick }) {
                       <th className="text-right px-4 py-2.5">Abs. return</th>
                       <th className="text-right px-4 py-2.5">XIRR</th>
                       <th className="text-right px-4 py-2.5">L/M/S cap</th>
-                      <th className="text-right px-4 py-2.5" title="Proxy via a Nifty 50 index fund's own NAV — not the official TRI series (expense ratio, tracking error and cash drag included).">
-                        Nifty 50 (proxy) XIRR
+                      {config?.preferences?.show_benchmark_comparison !== false && <><th className="text-right px-4 py-2.5" title="Proxy via a Nifty 50 index fund's own NAV — not the official TRI series (expense ratio, tracking error and cash drag included).">
+                        Nifty 50 (proxy) XIRR {config?.preferences?.primary_benchmark === 'Nifty 50' && '★'}
                       </th>
-                      <th className="text-right px-4 py-2.5">Nifty 500 XIRR</th>
-                      <th className="text-right px-4 py-2.5">Fund benchmark XIRR</th>
+                      <th className="text-right px-4 py-2.5">Nifty 500 XIRR {config?.preferences?.primary_benchmark === 'Nifty 500' && '★'}</th>
+                      <th className="text-right px-4 py-2.5">Fund benchmark XIRR</th></>}
                     </tr>
                   </thead>
                   <tbody>
@@ -78,9 +80,9 @@ export default function PortfolioSummary({ refreshTick }) {
                         <td className="px-4 py-2.5 text-right tabular text-ink-2">
                           {a.largecap_pct != null ? `${a.largecap_pct}/${a.midcap_pct}/${a.smallcap_pct}` : '—'}
                         </td>
-                        <BenchmarkCell value={a.nifty50_proxy_xirr} status="ok" tooltip={a.nifty50_proxy_disclosure} />
+                        {config?.preferences?.show_benchmark_comparison !== false && <><BenchmarkCell value={a.nifty50_proxy_xirr} status="ok" tooltip={a.nifty50_proxy_disclosure} />
                         <BenchmarkCell value={a.nifty500_xirr} status={a.nifty500_status} />
-                        <BenchmarkCell value={a.fund_respective_xirr} status={a.fund_respective_status} />
+                        <BenchmarkCell value={a.fund_respective_xirr} status={a.fund_respective_status} /></>}
                       </tr>
                     ))}
                   </tbody>

@@ -20,3 +20,6 @@ gains_data.json
 # publicly reachable on the production site until this rule existed.
 frontend/public/__test_*.pdf
 frontend/public/__test_*.json
+
+.venv/
+.pytest_cache/
